@@ -10,19 +10,21 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Json;
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use origin_shared::api::{
     ApiError, CommitsRequest, ErrorCode, ListedEntry, Location, ObjectsRequest, RepoInfo, RepoName,
     RepoSummary,
 };
+use origin_shared::pack::PushRequest;
 use serde::Deserialize;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::service::{OriginService, ServiceError};
+use crate::service::{OriginService, PushError, ServiceError};
 
 /// Server configuration, read from a TOML file:
 ///
@@ -112,12 +114,17 @@ impl Api {
             .routes(routes!(read_file))
             .routes(routes!(fetch_commits))
             .routes(routes!(fetch_objects))
+            .routes(routes!(push))
             .routes(routes!(openapi_document))
     }
 
+    /// The largest request accepted, which bounds pushes.
+    const MAX_REQUEST: usize = 1 << 30;
+
     /// The router serving `service`.
     pub fn router(service: OriginService) -> axum::Router {
-        Self::documented().with_state(Arc::new(service)).into()
+        axum::Router::from(Self::documented().with_state(Arc::new(service)))
+            .layer(DefaultBodyLimit::max(Self::MAX_REQUEST))
     }
 
     /// The OpenAPI document, which `docs/openapi.json` keeps a copy of.
@@ -157,9 +164,12 @@ impl IntoResponse for HttpError {
                     | ServiceError::NotInCommit { .. } => {
                         (StatusCode::NOT_FOUND, ErrorCode::NotFound)
                     }
-                    ServiceError::NotADirectory(_) | ServiceError::NotAFile(_) => {
+                    ServiceError::NotADirectory(_)
+                    | ServiceError::NotAFile(_)
+                    | ServiceError::InvalidPush(_) => {
                         (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
                     }
+                    ServiceError::Conflict(_) => (StatusCode::CONFLICT, ErrorCode::Conflict),
                     ServiceError::Repository(_)
                     | ServiceError::Store(_)
                     | ServiceError::Refs(_) => {
@@ -317,6 +327,32 @@ async fn fetch_objects(
 ) -> Result<Response, HttpError> {
     let pack = call(service, move |service| service.objects(&repo, &request)).await?;
     Ok(pack_response(&pack))
+}
+
+/// Moves branches, with the objects their new commits add, as one
+/// transaction. The body is a push (see `origin_shared::pack`).
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{repo}/push",
+    operation_id = "push",
+    params(("repo" = RepoName, Path, description = "The repository")),
+    request_body(content = Binary, content_type = "application/octet-stream"),
+    responses(
+        (status = 204, description = "Every branch moved"),
+        (status = 400, description = "The push is incomplete or malformed", body = ApiError),
+        (status = 404, description = "Something does not exist", body = ApiError),
+        (status = 409, description = "A branch moved since the pusher looked; nothing changed", body = ApiError)
+    )
+)]
+async fn push(
+    service: Service,
+    UrlPath(repo): UrlPath<RepoName>,
+    body: Bytes,
+) -> Result<StatusCode, HttpError> {
+    let push = PushRequest::decode(&body)
+        .map_err(|error| HttpError::Service(PushError::from(error).into()))?;
+    call(service, move |service| service.push(&repo, push)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The OpenAPI document of this API.

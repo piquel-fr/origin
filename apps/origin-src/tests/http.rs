@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use origin_client::{Client, Error, Repo};
 use origin_shared::api::{CommitsRequest, ErrorCode, Location, ObjectsRequest, RepoName};
+use origin_shared::pack::{Pack, PushRequest};
 use origin_shared::{
     BranchName, Commit, EncodedObject, EntryKind, EntryName, Object, ObjectId, RefUpdate, RepoPath,
     Signature, Tree, TreeEntry,
@@ -15,7 +16,7 @@ use origin_src::service::OriginService;
 /// A server hosting one repository with two commits on `main`:
 /// `README.md`, then `src/lib.rs` added.
 struct Server {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     client: Client,
     repo: Repo,
     commits: [ObjectId; 2],
@@ -31,12 +32,17 @@ impl Server {
             },
         )
         .unwrap();
-        let first = Self::commit(&repository, &[("README.md", "hello\n")], None);
-        let second = Self::commit(
-            &repository,
+        let write = |(id, objects): (ObjectId, Pack)| {
+            for object in &objects.objects {
+                repository.objects().write(object).unwrap();
+            }
+            id
+        };
+        let first = write(Self::commit(&[("README.md", "hello\n")], None));
+        let second = write(Self::commit(
             &[("README.md", "hello\n"), ("src/lib.rs", "fn lib() {}\n")],
             Some(first),
-        );
+        ));
         repository
             .branches()
             .update(&[RefUpdate {
@@ -53,24 +59,22 @@ impl Server {
         tokio::spawn(async move { axum::serve(listener, Api::router(service)).await });
         let client = Client::new(&format!("http://{address}"));
         Self {
-            _dir: dir,
+            dir,
             repo: client.repo(repo),
             client,
             commits: [first, second],
         }
     }
 
-    /// Writes a commit of `files`, which are at most one directory deep.
-    fn commit(
-        repository: &Repository,
-        files: &[(&str, &str)],
-        parent: Option<ObjectId>,
-    ) -> ObjectId {
-        let store = repository.objects();
+    /// Builds a commit of `files`, which are at most one directory deep,
+    /// returning it with every object it contains.
+    fn commit(files: &[(&str, &str)], parent: Option<ObjectId>) -> (ObjectId, Pack) {
+        let objects = std::cell::RefCell::new(Pack::default());
         let write = |object: Object| {
             let encoded = object.encode();
-            store.write(&encoded).unwrap();
-            encoded.id()
+            let id = encoded.id();
+            objects.borrow_mut().objects.push(encoded);
+            id
         };
         let mut dirs: BTreeMap<&str, Tree> = BTreeMap::new();
         for (path, content) in files {
@@ -91,12 +95,29 @@ impl Server {
             };
             root.insert(EntryName::new(dir).unwrap(), entry);
         }
-        write(Object::Commit(Commit {
+        let commit = write(Object::Commit(Commit {
             tree: write(Object::Tree(root)),
             parents: parent.into_iter().collect(),
             author: Signature::now("Ada".into(), "ada@example.com".into()),
             message: "commit".into(),
-        }))
+        }));
+        (commit, objects.into_inner())
+    }
+
+    async fn main(&self) -> ObjectId {
+        self.repo.info().await.unwrap().branches[0].commit
+    }
+
+    async fn push(&self, expected: ObjectId, new: ObjectId, pack: Pack) -> Result<(), ErrorCode> {
+        let push = PushRequest {
+            updates: vec![RefUpdate {
+                branch: BranchName::default(),
+                expected: Some(expected),
+                new: Some(new),
+            }],
+            pack,
+        };
+        self.repo.push(&push).await.map_err(code)
     }
 }
 
@@ -210,4 +231,64 @@ fn checked_in_openapi_document_is_current() {
             "docs/openapi.json is stale: run `just openapi`"
         );
     }
+}
+
+#[tokio::test]
+async fn pushes_move_branches() {
+    let server = Server::start().await;
+    let [_, second] = server.commits;
+    let files = [
+        ("README.md", "hello\n"),
+        ("src/lib.rs", "fn lib() { changed() }\n"),
+    ];
+    let (third, pack) = Server::commit(&files, Some(second));
+
+    server.push(second, third, pack).await.unwrap();
+    assert_eq!(server.main().await, third);
+    let file = server.repo.read_file(&on_main("src/lib.rs")).await.unwrap();
+    assert_eq!(file, b"fn lib() { changed() }\n");
+}
+
+#[tokio::test]
+async fn pushes_from_stale_clients_conflict() {
+    let server = Server::start().await;
+    let [first, second] = server.commits;
+    let (other, pack) = Server::commit(&[("other", "content")], Some(first));
+
+    let error = server.push(first, other, pack).await.unwrap_err();
+    assert_eq!(error, ErrorCode::Conflict);
+    assert_eq!(server.main().await, second, "the branch did not move");
+}
+
+#[tokio::test]
+async fn pushes_must_include_every_new_object() {
+    let server = Server::start().await;
+    let [_, second] = server.commits;
+    let files = [("README.md", "hello\n"), ("new.txt", "new\n")];
+    let (third, mut pack) = Server::commit(&files, Some(second));
+    // Drop the new blob: the server cannot accept a commit it cannot serve.
+    pack.objects
+        .retain(|object| object.blob_content().ok() != Some(b"new\n".as_slice()));
+
+    let error = server.push(second, third, pack).await.unwrap_err();
+    assert_eq!(error, ErrorCode::BadRequest);
+    assert_eq!(server.main().await, second, "the branch did not move");
+}
+
+#[tokio::test]
+async fn pushes_store_only_checked_objects() {
+    let server = Server::start().await;
+    let [_, second] = server.commits;
+    let files = [("README.md", "hello\n"), ("new.txt", "new\n")];
+    let (third, mut pack) = Server::commit(&files, Some(second));
+    let stray = EncodedObject::blob(b"not part of any commit");
+    pack.objects.push(stray.clone());
+
+    server.push(second, third, pack).await.unwrap();
+    let store = origin_src::store::ObjectStore::new(server.dir.path().join("demo/objects"));
+    assert!(store.contains(third));
+    assert!(
+        !store.contains(stray.id()),
+        "objects no commit refers to are dropped"
+    );
 }

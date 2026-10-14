@@ -1,6 +1,9 @@
 //! Navigating and comparing trees.
 
-use origin_shared::{EntryKind, EntryName, ObjectId, RepoPath, TreeEntry};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use origin_shared::{EntryKind, EntryName, ObjectId, RepoPath, Tree, TreeEntry};
 
 use crate::store::{ObjectStore, StoreError};
 
@@ -15,18 +18,25 @@ pub struct Change {
     pub new: Option<TreeEntry>,
 }
 
-impl ObjectStore {
+/// Something trees can be read from: a store, or a push not yet stored.
+pub trait TreeSource {
+    /// Why a tree cannot be read.
+    type Error;
+
+    /// Reads a tree.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the tree is missing or cannot be read.
+    fn read_tree(&self, id: ObjectId) -> Result<Tree, Self::Error>;
+
     /// Finds the entry at `path` under the tree `root`, or `None` if nothing
     /// is there. The root path resolves to `root` itself.
     ///
     /// # Errors
     ///
     /// Fails if a tree along the path cannot be read.
-    pub fn resolve(
-        &self,
-        root: ObjectId,
-        path: &RepoPath,
-    ) -> Result<Option<TreeEntry>, StoreError> {
+    fn resolve(&self, root: ObjectId, path: &RepoPath) -> Result<Option<TreeEntry>, Self::Error> {
         let mut entry = TreeEntry {
             kind: EntryKind::Tree,
             id: root,
@@ -35,7 +45,7 @@ impl ObjectStore {
             if !entry.kind.is_tree() {
                 return Ok(None);
             }
-            match self.tree(entry.id)?.get(name) {
+            match self.read_tree(entry.id)?.get(name) {
                 Some(child) => entry = *child,
                 None => return Ok(None),
             }
@@ -43,6 +53,102 @@ impl ObjectStore {
         Ok(Some(entry))
     }
 
+    /// Visits the tree `new` and every entry under it that differs from the
+    /// entry at the same path under `old`, parents before children. Subtrees
+    /// equal to their counterpart are skipped without being read: these are
+    /// exactly the objects `new` adds.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a changed tree cannot be read, or `visit` fails.
+    fn for_each_change(
+        &self,
+        new: ObjectId,
+        old: Option<ObjectId>,
+        visit: &mut impl FnMut(&RepoPath, TreeEntry) -> Result<(), Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let root = TreeEntry {
+            kind: EntryKind::Tree,
+            id: new,
+        };
+        self.visit_changes(&RepoPath::root(), root, old, visit)
+    }
+
+    #[doc(hidden)]
+    fn visit_changes(
+        &self,
+        path: &RepoPath,
+        new: TreeEntry,
+        old: Option<ObjectId>,
+        visit: &mut impl FnMut(&RepoPath, TreeEntry) -> Result<(), Self::Error>,
+    ) -> Result<(), Self::Error> {
+        if Some(new.id) == old {
+            return Ok(());
+        }
+        visit(path, new)?;
+        if !new.kind.is_tree() {
+            return Ok(());
+        }
+        let old = old
+            .map(|old| self.read_tree(old))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, entry) in &self.read_tree(new.id)? {
+            let old_entry = old.get(name.as_str());
+            if old_entry == Some(entry) {
+                continue;
+            }
+            // Only a tree can be compared with a tree; anything else at the
+            // same path is replaced wholesale.
+            let old_tree = old_entry
+                .filter(|old| old.kind == entry.kind)
+                .map(|old| old.id);
+            self.visit_changes(&path.join(name), *entry, old_tree, visit)?;
+        }
+        Ok(())
+    }
+}
+
+impl TreeSource for ObjectStore {
+    type Error = StoreError;
+
+    fn read_tree(&self, id: ObjectId) -> Result<Tree, StoreError> {
+        self.tree(id)
+    }
+}
+
+/// Reads trees from a store, remembering them: resolving many paths of the
+/// same tree reads each directory once.
+pub struct CachedTrees<'a> {
+    store: &'a ObjectStore,
+    trees: RefCell<HashMap<ObjectId, Tree>>,
+}
+
+impl<'a> CachedTrees<'a> {
+    /// Caches trees read from `store`.
+    #[must_use]
+    pub fn new(store: &'a ObjectStore) -> Self {
+        Self {
+            store,
+            trees: RefCell::default(),
+        }
+    }
+}
+
+impl TreeSource for CachedTrees<'_> {
+    type Error = StoreError;
+
+    fn read_tree(&self, id: ObjectId) -> Result<Tree, StoreError> {
+        if let Some(tree) = self.trees.borrow().get(&id) {
+            return Ok(tree.clone());
+        }
+        let tree = self.store.tree(id)?;
+        self.trees.borrow_mut().insert(id, tree.clone());
+        Ok(tree)
+    }
+}
+
+impl ObjectStore {
     /// Lists the files that differ between two trees, sorted by path.
     /// `None` stands for an empty tree. Subtrees with equal ids are skipped
     /// without being read, so the cost follows the size of the change.
@@ -114,7 +220,7 @@ impl ObjectStore {
 mod tests {
     use std::collections::BTreeMap;
 
-    use origin_shared::{EncodedObject, EntryKind, Object, Tree};
+    use origin_shared::{EncodedObject, Object};
 
     use super::*;
 
@@ -248,6 +354,39 @@ mod tests {
             None
         );
         assert_eq!(store.resolve(root, &path("missing")).unwrap(), None);
+    }
+
+    #[test]
+    fn visits_exactly_the_added_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        let old = build(&store, &[("same/a", "1"), ("edit/b", "2"), ("file", "3")]);
+        let new = build(
+            &store,
+            &[
+                ("same/a", "1"),
+                ("edit/b", "changed"),
+                ("file/now-dir", "4"),
+            ],
+        );
+
+        let mut visited = Vec::new();
+        store
+            .for_each_change(new, Some(old), &mut |path, _| {
+                visited.push(path.to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, ["/", "edit", "edit/b", "file", "file/now-dir"]);
+
+        let mut count = 0;
+        store
+            .for_each_change(new, None, &mut |_, _| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 7, "every object of a tree without a parent is new");
     }
 
     #[test]
