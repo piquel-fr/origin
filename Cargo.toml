@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+  "apps/origin-src",
+  "crates/origin-client",
+  "crates/origin-shared",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The minimum supported Rust version. CI builds with it; keep it in line with
+# rust-toolchain.toml until they need to differ.
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/piquel-fr/origin"
+
+[workspace.dependencies]
+# Internal
+origin-client = { version = "0.1.0", path = "crates/origin-client" }
+origin-shared = { version = "0.1.0", path = "crates/origin-shared" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Line tables keep file and line numbers in backtraces but drop the variable
+# and type info that makes up most of a debug build's output.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies build without debug info: their backtrace frames are rarely
+# needed, and it keeps debug builds smaller and faster.
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# Benchmarks measure what ships.
+[profile.bench]
+inherits = "release"
