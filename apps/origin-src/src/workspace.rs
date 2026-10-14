@@ -8,22 +8,32 @@
 //!   objects/          local objects (see `ObjectStore`): only what was
 //!                     fetched or created here, not the whole repository
 //!   state             the stat cache of the last snapshot
+//!   withheld.json     files whose content the remote withheld
+//!   access.json       what the remote lets the user do
 //! ```
+//!
+//! Withheld files are missing from the working copy, but not from
+//! snapshots: they are carried over unchanged, so commits keep them.
 
-use std::env;
 use std::fs;
 use std::io;
 use std::path::{self, Path, PathBuf};
 
-use origin_shared::{BranchName, Commit, Object, ObjectId, RefUpdate, Signature};
+use std::collections::HashSet;
+
+use origin_shared::access::{Access, Permissions, Principal};
+use origin_shared::{
+    BranchName, Commit, EntryKind, Object, ObjectId, RefUpdate, RepoPath, TreeEntry,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::output::FileDiff;
 use crate::refs::{RefError, RefStore};
-use crate::remote::Remote;
+use crate::remote::{AccessInfo, Remote};
 use crate::store::{ObjectStore, StoreError};
 use crate::sync::{Pulled, Pushed, Sync, SyncError};
-use crate::tree::Change;
+use crate::tree::{Change, TreeSource};
+use crate::user::{UserConfig, UserConfigError};
 use crate::worktree::{Checkout, Snapshot, SnapshotError, StatCache};
 
 /// A working copy and its local repository.
@@ -35,6 +45,14 @@ pub struct Workspace {
     branches: RefStore,
     remote_branches: RefStore,
     config: Config,
+}
+
+/// One entry of `.origin/withheld.json`.
+#[derive(Serialize, Deserialize)]
+struct WithheldFile {
+    path: RepoPath,
+    kind: EntryKind,
+    id: ObjectId,
 }
 
 /// `.origin/config.toml`.
@@ -189,13 +207,114 @@ impl Workspace {
         Remote::open(&url)?;
         self.config.remote = Some(url);
         self.save_config()?;
-        let path = self.meta.join("remote-branches");
-        match fs::remove_file(&path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                Err(WorkspaceError::io(&path, error).into())
+        for file in ["remote-branches", "access.json"] {
+            let path = self.meta.join(file);
+            match fs::remove_file(&path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    return Err(WorkspaceError::io(&path, error).into());
+                }
+                _ => {}
             }
-            _ => Ok(()),
         }
+        Ok(())
+    }
+
+    /// What the remote lets the user do, as of the last sync. `None` means
+    /// everything: no remote, or one the user owns.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read or is invalid.
+    pub fn access(&self) -> Result<Option<AccessInfo>, WorkspaceError> {
+        let path = self.meta.join("access.json");
+        let content = match fs::read(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(WorkspaceError::io(&path, source)),
+        };
+        serde_json::from_slice(&content)
+            .map(Some)
+            .map_err(|source| WorkspaceError::Corrupt { path, source })
+    }
+
+    /// Records what the remote lets the user do.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the access cannot be represented as JSON, which its fields
+    /// rule out.
+    pub fn set_access(&self, access: Option<&AccessInfo>) -> Result<(), WorkspaceError> {
+        let path = self.meta.join("access.json");
+        let result = match access {
+            Some(access) => fs::write(
+                &path,
+                serde_json::to_vec(access).expect("access serializes to JSON"),
+            ),
+            None => fs::remove_file(&path).or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }),
+        };
+        result.map_err(|source| WorkspaceError::io(&path, source))
+    }
+
+    /// The files whose content the remote withheld, with their entries.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read or is invalid.
+    pub fn withheld(&self) -> Result<Vec<(RepoPath, TreeEntry)>, WorkspaceError> {
+        let path = self.meta.join("withheld.json");
+        let content = match fs::read(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(WorkspaceError::io(&path, source)),
+        };
+        let files: Vec<WithheldFile> = serde_json::from_slice(&content)
+            .map_err(|source| WorkspaceError::Corrupt { path, source })?;
+        Ok(files
+            .into_iter()
+            .map(|file| {
+                (
+                    file.path,
+                    TreeEntry {
+                        kind: file.kind,
+                        id: file.id,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Records the files whose content the remote withheld.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the files cannot be represented as JSON, which their fields
+    /// rule out.
+    pub fn set_withheld(&self, withheld: &[(RepoPath, TreeEntry)]) -> Result<(), WorkspaceError> {
+        let path = self.meta.join("withheld.json");
+        let files: Vec<WithheldFile> = withheld
+            .iter()
+            .map(|(path, entry)| WithheldFile {
+                path: path.clone(),
+                kind: entry.kind,
+                id: entry.id,
+            })
+            .collect();
+        let content = serde_json::to_vec(&files).expect("withheld files serialize to JSON");
+        fs::write(&path, content).map_err(|source| WorkspaceError::io(&path, source))
     }
 
     /// Where the checked-out branch was on the remote when last synced.
@@ -250,18 +369,50 @@ impl Workspace {
                 .save(&path)
                 .map_err(|source| WorkspaceError::io(&path, source))?;
         }
-        Ok(tree)
+        let withheld = self.withheld()?;
+        if withheld.is_empty() {
+            return Ok(tree);
+        }
+        Ok(self.objects.overlay(tree, &withheld)?)
     }
 
-    /// Moves a working copy matching the tree `old` to the tree `new`.
+    /// Moves a working copy matching the tree `old` to the tree `new`,
+    /// leaving out the `withheld` files of `new`, and writes the files in
+    /// `restore`, which were withheld until now, where nothing is in their
+    /// way.
     ///
     /// # Errors
     ///
     /// Fails if an object is missing or a file cannot be written.
-    pub fn checkout(&self, old: Option<ObjectId>, new: ObjectId) -> Result<(), WorkspaceError> {
+    pub fn checkout(
+        &self,
+        old: Option<ObjectId>,
+        new: ObjectId,
+        withheld: &[(RepoPath, TreeEntry)],
+        restore: &[(RepoPath, TreeEntry)],
+    ) -> Result<(), WorkspaceError> {
         let path = self.meta.join("state");
         let mut cache = StatCache::load(&path);
-        let changes = self.objects.diff(old, Some(new))?;
+        let mut changes = self.objects.diff(old, Some(new))?;
+        // Withheld files are removed rather than written: their old content
+        // is stale, and snapshots carry them over.
+        let withheld: HashSet<&RepoPath> = withheld.iter().map(|(path, _)| path).collect();
+        for change in &mut changes {
+            if withheld.contains(&change.path) {
+                change.new = None;
+            }
+        }
+        changes.retain(|change| change.old.is_some() || change.new.is_some());
+        changes.extend(
+            restore
+                .iter()
+                .filter(|(path, _)| fs::symlink_metadata(self.root.join(path.as_str())).is_err())
+                .map(|(path, entry)| Change {
+                    path: path.clone(),
+                    old: None,
+                    new: Some(*entry),
+                }),
+        );
         let staging = self.meta.join("staging");
         Checkout::new(&self.root, &self.objects, &staging).apply(&changes, &mut cache)?;
         cache
@@ -324,15 +475,23 @@ impl Workspace {
     /// matches the head, if the user has no identity, or like
     /// [`Workspace::snapshot`].
     pub fn commit(&self, message: String) -> Result<(), WorkspaceError> {
-        let author = Identity::load()?.sign();
+        let author = UserConfig::load()?.author()?.sign();
         let tree = self.snapshot()?;
         let head = self.head()?;
-        if self
-            .objects
-            .diff(self.head_tree(head)?, Some(tree))?
-            .is_empty()
-        {
+        let changes = self.objects.diff(self.head_tree(head)?, Some(tree))?;
+        if changes.is_empty() {
             return Err(WorkspaceError::NothingToCommit);
+        }
+        if let Some(access) = self.access()? {
+            for change in changes {
+                if access
+                    .permissions
+                    .access(access.identity.as_ref(), &change.path)
+                    < Access::Write
+                {
+                    return Err(WorkspaceError::ReadOnly(change.path));
+                }
+            }
         }
         let summary = message.lines().next().unwrap_or_default().to_owned();
         let commit = Object::Commit(Commit {
@@ -405,6 +564,83 @@ impl Workspace {
         Ok(())
     }
 
+    /// `origin whoami`: prints who the remote thinks the user is.
+    ///
+    /// # Errors
+    ///
+    /// Fails if there is no remote or it cannot be reached.
+    pub async fn whoami(&self) -> Result<(), SyncError> {
+        match Sync::new(self)?.remote()?.access().await? {
+            None => println!("The owner: the remote is a local repository."),
+            Some(AccessInfo { identity: None, .. }) => println!("Anonymous."),
+            Some(AccessInfo {
+                identity: Some(identity),
+                ..
+            }) if identity.groups.is_empty() => println!("{}", identity.user),
+            Some(AccessInfo {
+                identity: Some(identity),
+                ..
+            }) => println!("{} (groups: {})", identity.user, identity.groups.join(", ")),
+        }
+        Ok(())
+    }
+
+    /// `origin permissions`: prints who may read and write what on the
+    /// remote.
+    ///
+    /// # Errors
+    ///
+    /// Fails if there is no remote or it cannot be reached.
+    pub async fn permissions(&self) -> Result<(), SyncError> {
+        Self::print_permissions(&Sync::new(self)?.remote()?.permissions().await?);
+        Ok(())
+    }
+
+    /// `origin permissions grant`: sets `principal`'s access to `path` and
+    /// everything under it, then prints the permissions.
+    ///
+    /// # Errors
+    ///
+    /// Fails if there is no remote, it cannot be reached, or it refuses.
+    pub async fn grant(
+        &self,
+        path: RepoPath,
+        principal: Principal,
+        access: Access,
+    ) -> Result<(), SyncError> {
+        let sync = Sync::new(self)?;
+        let remote = sync.remote()?;
+        let mut permissions = remote.permissions().await?;
+        permissions.rule(path).set(principal, access);
+        remote.set_permissions(&permissions).await?;
+        Self::print_permissions(&permissions);
+        Ok(())
+    }
+
+    fn print_permissions(permissions: &Permissions) {
+        if permissions.is_empty() {
+            println!("No rules: everyone may read and write everything.");
+        }
+        for (path, rule) in permissions.rules() {
+            let grants: Vec<String> = rule
+                .all
+                .map(|access| format!("all: {access}"))
+                .into_iter()
+                .chain(
+                    rule.users
+                        .iter()
+                        .map(|(user, access)| format!("user:{user}: {access}")),
+                )
+                .chain(
+                    rule.groups
+                        .iter()
+                        .map(|(group, access)| format!("group:{group}: {access}")),
+                )
+                .collect();
+            println!("{path}  {}", grants.join(", "));
+        }
+    }
+
     /// Makes a remote `url` independent of the current directory: local
     /// paths become absolute, URLs are kept.
     fn absolute_url(url: &str) -> Result<String, WorkspaceError> {
@@ -452,54 +688,6 @@ impl Workspace {
     }
 }
 
-/// Who is making changes, from `ORIGIN_USER_NAME` and `ORIGIN_USER_EMAIL`,
-/// or the `[user]` table of `~/.config/origin/config.toml`.
-#[derive(Debug, Deserialize)]
-pub struct Identity {
-    name: String,
-    email: String,
-}
-
-impl Identity {
-    /// Finds the user's identity.
-    ///
-    /// # Errors
-    ///
-    /// Fails if it is not configured.
-    pub fn load() -> Result<Self, WorkspaceError> {
-        if let (Ok(name), Ok(email)) = (env::var("ORIGIN_USER_NAME"), env::var("ORIGIN_USER_EMAIL"))
-        {
-            return Ok(Self { name, email });
-        }
-        let path = Self::config_path().ok_or(WorkspaceError::NoIdentity)?;
-        let Ok(content) = fs::read_to_string(&path) else {
-            return Err(WorkspaceError::NoIdentity);
-        };
-        let config: UserConfig =
-            toml::from_str(&content).map_err(|source| WorkspaceError::Config { path, source })?;
-        config.user.ok_or(WorkspaceError::NoIdentity)
-    }
-
-    fn config_path() -> Option<PathBuf> {
-        let base = env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| Path::new(&home).join(".config")))?;
-        Some(base.join("origin/config.toml"))
-    }
-
-    /// Signs as this identity, now.
-    #[must_use]
-    pub fn sign(self) -> Signature {
-        Signature::now(self.name, self.email)
-    }
-}
-
-/// `~/.config/origin/config.toml`.
-#[derive(Deserialize)]
-struct UserConfig {
-    user: Option<Identity>,
-}
-
 /// A failure to operate on a working copy.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -512,12 +700,17 @@ pub enum WorkspaceError {
     /// The working copy matches the head.
     #[error("nothing to commit: the working copy has no changes")]
     NothingToCommit,
-    /// The user's identity is not configured.
-    #[error(
-        "who are you? Set ORIGIN_USER_NAME and ORIGIN_USER_EMAIL, or add \
-         `[user]` with `name` and `email` to ~/.config/origin/config.toml"
-    )]
-    NoIdentity,
+    /// A change touches a file the remote does not let the user write.
+    #[error("you may not change `{0}`: the remote would reject it")]
+    ReadOnly(RepoPath),
+    /// A metadata file is invalid.
+    #[error("{} is corrupt", path.display())]
+    Corrupt {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong.
+        source: serde_json::Error,
+    },
     /// A configuration file is invalid.
     #[error("invalid configuration in {}", path.display())]
     Config {
@@ -534,6 +727,9 @@ pub enum WorkspaceError {
         /// The underlying error.
         source: io::Error,
     },
+    /// The user configuration is unusable.
+    #[error(transparent)]
+    User(#[from] UserConfigError),
     /// Objects cannot be read or written.
     #[error(transparent)]
     Store(#[from] StoreError),

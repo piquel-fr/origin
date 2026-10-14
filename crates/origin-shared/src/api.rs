@@ -182,6 +182,10 @@ pub enum ErrorCode {
     NotFound,
     /// A branch is not where a push expected it: someone else pushed first.
     Conflict,
+    /// The credentials are invalid.
+    Unauthorized,
+    /// The caller may not do this.
+    Forbidden,
     /// The server failed.
     Internal,
 }

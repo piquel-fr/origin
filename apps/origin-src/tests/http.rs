@@ -1,14 +1,17 @@
 //! The HTTP API, driven through the SDK.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use origin_client::{Client, Error, Repo};
+use origin_shared::access::{Access, Permissions};
 use origin_shared::api::{CommitsRequest, ErrorCode, Location, ObjectsRequest, RepoName};
 use origin_shared::pack::{Pack, PushRequest};
 use origin_shared::{
     BranchName, Commit, EncodedObject, EntryKind, EntryName, Object, ObjectId, RefUpdate, RepoPath,
     Signature, Tree, TreeEntry,
 };
+use origin_src::auth::Users;
 use origin_src::http::Api;
 use origin_src::repository::{RepoConfig, Repository};
 use origin_src::service::OriginService;
@@ -17,18 +20,50 @@ use origin_src::service::OriginService;
 /// `README.md`, then `src/lib.rs` added.
 struct Server {
     dir: tempfile::TempDir,
+    /// An anonymous client.
     client: Client,
+    /// The repository, for the anonymous client.
     repo: Repo,
     commits: [ObjectId; 2],
 }
 
 impl Server {
+    /// Users of [`Server::guarded`]: alice owns the repository, bob may only
+    /// read it, and `src/lib.rs` is secret.
+    const USERS: &str = "[alice]\ntoken = \"alice-token\"\n[bob]\ntoken = \"bob-token\"\n";
+
     async fn start() -> Self {
+        Self::with(Permissions::default()).await
+    }
+
+    async fn guarded() -> Self {
+        let mut permissions = Permissions::default();
+        let root = permissions.rule(RepoPath::root());
+        root.all = Some(Access::Read);
+        root.users.insert("alice".into(), Access::Write);
+        let secret = permissions.rule(path("src/lib.rs"));
+        secret.all = Some(Access::None);
+        secret.users.insert("alice".into(), Access::Write);
+        Self::with(permissions).await
+    }
+
+    /// A client authenticating with `token`.
+    fn client_as(&self, token: &str) -> Client {
+        self.client.clone().with_token(token)
+    }
+
+    /// The repository, for a client authenticating with `token`.
+    fn repo_as(&self, token: &str) -> Repo {
+        self.client_as(token).repo(self.repo.name().clone())
+    }
+
+    async fn with(permissions: Permissions) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let repository = Repository::create(
             &dir.path().join("demo"),
             &RepoConfig {
                 description: "A demo".into(),
+                permissions,
             },
         )
         .unwrap();
@@ -56,7 +91,10 @@ impl Server {
         let service = OriginService::new(BTreeMap::from([(repo.clone(), dir.path().join("demo"))]));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, Api::router(service)).await });
+        let users: Users = toml::from_str(Self::USERS).unwrap();
+        tokio::spawn(
+            async move { axum::serve(listener, Api::router(service, Arc::new(users))).await },
+        );
         let client = Client::new(&format!("http://{address}"));
         Self {
             dir,
@@ -109,6 +147,16 @@ impl Server {
     }
 
     async fn push(&self, expected: ObjectId, new: ObjectId, pack: Pack) -> Result<(), ErrorCode> {
+        self.push_as(&self.repo, expected, new, pack).await
+    }
+
+    async fn push_as(
+        &self,
+        repo: &Repo,
+        expected: ObjectId,
+        new: ObjectId,
+        pack: Pack,
+    ) -> Result<(), ErrorCode> {
         let push = PushRequest {
             updates: vec![RefUpdate {
                 branch: BranchName::default(),
@@ -117,7 +165,15 @@ impl Server {
             }],
             pack,
         };
-        self.repo.push(&push).await.map_err(code)
+        repo.push(&push).await.map_err(code)
+    }
+}
+
+/// The error code of a refused request.
+fn code(error: Error) -> ErrorCode {
+    match error {
+        Error::Api(error) => error.code,
+        error => panic!("expected an API error, got {error}"),
     }
 }
 
@@ -130,14 +186,6 @@ fn on_main(file: &str) -> Location {
     Location {
         branch: BranchName::default(),
         path: path(file),
-    }
-}
-
-/// The error code of a refused request.
-fn code(error: Error) -> ErrorCode {
-    match error {
-        Error::Api(error) => error.code,
-        error => panic!("expected an API error, got {error}"),
     }
 }
 
@@ -291,4 +339,110 @@ async fn pushes_store_only_checked_objects() {
         !store.contains(stray.id()),
         "objects no commit refers to are dropped"
     );
+}
+
+#[tokio::test]
+async fn unreadable_files_are_withheld() {
+    let server = Server::guarded().await;
+    let [_, second] = server.commits;
+    let request = ObjectsRequest {
+        commit: second,
+        paths: vec![path("README.md"), path("src/lib.rs")],
+    };
+    let fetch = |repo: Repo| {
+        let request = request.clone();
+        async move { repo.fetch_objects(&request).await.unwrap() }
+    };
+
+    let anonymous = fetch(server.repo.clone()).await;
+    assert_eq!(anonymous.objects.len(), 1, "README.md is readable");
+    assert_eq!(anonymous.withheld.len(), 1, "src/lib.rs is not");
+    let alice = fetch(server.repo_as("alice-token")).await;
+    assert_eq!((alice.objects.len(), alice.withheld.len()), (2, 0));
+
+    let bob = server.repo_as("bob-token");
+    let error = bob.read_file(&on_main("src/lib.rs")).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound, "secrets look missing");
+}
+
+#[tokio::test]
+async fn pushes_need_write_access_to_every_change() {
+    let server = Server::guarded().await;
+    let [_, second] = server.commits;
+    let files = [("README.md", "edited\n"), ("src/lib.rs", "fn lib() {}\n")];
+    let (third, pack) = Server::commit(&files, Some(second));
+
+    let bob = server.repo_as("bob-token");
+    let error = server
+        .push_as(&bob, second, third, pack.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error, ErrorCode::Forbidden);
+    let alice = server.repo_as("alice-token");
+    server.push_as(&alice, second, third, pack).await.unwrap();
+    assert_eq!(server.main().await, third);
+}
+
+#[tokio::test]
+async fn permissions_are_managed_by_root_writers() {
+    let server = Server::guarded().await;
+    let permissions = server.repo.permissions().await.unwrap();
+    assert_eq!(permissions.access(None, &path("src/lib.rs")), Access::None);
+
+    let open = Permissions::default();
+    let bob = server.repo_as("bob-token");
+    let error = bob.set_permissions(&open).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::Forbidden);
+    let alice = server.repo_as("alice-token");
+    alice.set_permissions(&open).await.unwrap();
+    assert_eq!(server.repo.permissions().await.unwrap(), open);
+}
+
+#[tokio::test]
+async fn callers_are_identified_by_token() {
+    let server = Server::guarded().await;
+    let whoami = server.client_as("alice-token").whoami().await.unwrap();
+    assert_eq!(whoami.identity.unwrap().user, "alice");
+    assert_eq!(server.client.whoami().await.unwrap().identity, None);
+    let error = server.client_as("wrong").whoami().await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn invisible_repositories_do_not_exist() {
+    let mut permissions = Permissions::default();
+    permissions.rule(RepoPath::root()).all = Some(Access::None);
+    permissions
+        .rule(RepoPath::root())
+        .users
+        .insert("alice".into(), Access::Read);
+    let server = Server::with(permissions).await;
+
+    assert_eq!(server.client.repos().await.unwrap(), []);
+    let error = server.repo.info().await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound);
+    let alice = server.client_as("alice-token");
+    assert_eq!(alice.repos().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn moving_branches_needs_write_access_to_what_changes() {
+    let server = Server::guarded().await;
+    let [first, second] = server.commits;
+    // Moving `main` back to the first commit deletes `src/lib.rs`, which
+    // bob may not even read.
+    let bob = server.repo_as("bob-token");
+    let error = server
+        .push_as(&bob, second, first, Pack::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error, ErrorCode::Forbidden);
+    // So does a new commit whose parent lacks the file.
+    let (lacking, pack) = Server::commit(&[("README.md", "hello\n")], Some(first));
+    let error = server
+        .push_as(&bob, second, lacking, pack)
+        .await
+        .unwrap_err();
+    assert_eq!(error, ErrorCode::Forbidden);
+    assert_eq!(server.main().await, second);
 }

@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use origin_shared::BranchName;
+use origin_shared::access::{Access, Principal};
+use origin_shared::{BranchName, RepoPath};
 
 use crate::http::ServerConfig;
 use crate::repository::{RepoConfig, Repository};
@@ -93,6 +94,26 @@ enum WorkspaceCommand {
     Pull,
     /// Send the current branch's new commits to the remote.
     Push,
+    /// Show who the remote thinks you are.
+    Whoami,
+    /// Show who may read and write what on the remote, or change it.
+    Permissions {
+        #[command(subcommand)]
+        change: Option<PermissionsCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PermissionsCommand {
+    /// Set someone's access to a path and everything under it.
+    Grant {
+        /// The path, `/` for the whole repository.
+        path: RepoPath,
+        /// Who: `all`, `user:<name>`, or `group:<name>`.
+        principal: Principal,
+        /// What they may do: `none`, `read`, or `write`.
+        access: Access,
+    },
 }
 
 impl Cli {
@@ -109,7 +130,11 @@ impl Cli {
             }
             Command::Serve { config } => ServerConfig::load(&config)?.serve().await?,
             Command::Repo(RepoCommand::Create { path, description }) => {
-                Repository::create(&path, &RepoConfig { description })?;
+                let config = RepoConfig {
+                    description,
+                    ..RepoConfig::default()
+                };
+                Repository::create(&path, &config)?;
             }
             Command::Workspace(command) => command.run().await?,
         }
@@ -130,6 +155,16 @@ impl WorkspaceCommand {
             Self::Remote { url: Some(url) } => workspace.set_remote(&url)?,
             Self::Pull => workspace.pull().await?,
             Self::Push => workspace.push().await?,
+            Self::Whoami => workspace.whoami().await?,
+            Self::Permissions { change: None } => workspace.permissions().await?,
+            Self::Permissions {
+                change:
+                    Some(PermissionsCommand::Grant {
+                        path,
+                        principal,
+                        access,
+                    }),
+            } => workspace.grant(path, principal, access).await?,
         }
         Ok(())
     }

@@ -2,16 +2,21 @@
 //!
 //! A remote is either a server over HTTP (`http://host:port/<repository>`)
 //! or a repository on a local path. Local repositories are served by an
-//! in-process [`OriginService`], so both behave the same.
+//! in-process [`OriginService`], so both behave the same, except that
+//! whoever can open a repository's files owns it: permissions only apply
+//! over HTTP, to the identity of the token the user configured.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use origin_client::Client;
+use origin_shared::access::{Identity, Permissions};
 use origin_shared::api::{ApiError, CommitsRequest, ErrorCode, ObjectsRequest, RepoInfo, RepoName};
 use origin_shared::pack::{Pack, PushRequest};
+use serde::{Deserialize, Serialize};
 
-use crate::service::{OriginService, ServiceError};
+use crate::service::{Caller, OriginService, ServiceError};
+use crate::user::UserConfig;
 
 /// A repository to push to and pull from.
 pub enum Remote {
@@ -28,11 +33,13 @@ pub enum Remote {
 
 impl Remote {
     /// Opens `url`: an `http://` URL whose last path segment is the
-    /// repository, or the path of a repository.
+    /// repository, or the path of a repository. HTTP requests carry the
+    /// user's token for the server, if they configured one.
     ///
     /// # Errors
     ///
-    /// Fails if the URL has no repository name.
+    /// Fails if the URL has no repository name, or the user configuration
+    /// is invalid.
     pub fn open(url: &str) -> Result<Self, RemoteError> {
         if url.starts_with("https://") {
             return Err(RemoteError::HttpsUnsupported);
@@ -45,7 +52,11 @@ impl Remote {
                 .ok_or_else(invalid)?;
             let repo = RepoName::new(name).map_err(|_| invalid())?;
             let base = &url[..url.trim_end_matches('/').len() - name.len() - 1];
-            return Ok(Self::Http(Client::new(base).repo(repo)));
+            let mut client = Client::new(base);
+            if let Some(token) = UserConfig::load()?.token(base) {
+                client = client.with_token(token);
+            }
+            return Ok(Self::Http(client.repo(repo)));
         }
         let repo = RepoName::new("local").map_err(|_| RemoteError::InvalidUrl(url.to_owned()))?;
         let service = OriginService::new(BTreeMap::from([(repo.clone(), PathBuf::from(url))]));
@@ -60,7 +71,7 @@ impl Remote {
     pub async fn info(&self) -> Result<RepoInfo, RemoteError> {
         match self {
             Self::Http(repo) => Ok(repo.info().await?),
-            Self::Local { service, repo } => Ok(service.info(repo)?),
+            Self::Local { service, repo } => Ok(service.info(&Caller::Owner, repo)?),
         }
     }
 
@@ -72,7 +83,7 @@ impl Remote {
     pub async fn commits(&self, request: &CommitsRequest) -> Result<Pack, RemoteError> {
         match self {
             Self::Http(repo) => Ok(repo.fetch_commits(request).await?),
-            Self::Local { service, repo } => Ok(service.commits(repo, request)?),
+            Self::Local { service, repo } => Ok(service.commits(&Caller::Owner, repo, request)?),
         }
     }
 
@@ -84,7 +95,7 @@ impl Remote {
     pub async fn objects(&self, request: &ObjectsRequest) -> Result<Pack, RemoteError> {
         match self {
             Self::Http(repo) => Ok(repo.fetch_objects(request).await?),
-            Self::Local { service, repo } => Ok(service.objects(repo, request)?),
+            Self::Local { service, repo } => Ok(service.objects(&Caller::Owner, repo, request)?),
         }
     }
 
@@ -97,7 +108,61 @@ impl Remote {
     pub async fn push(&self, push: PushRequest) -> Result<(), RemoteError> {
         match self {
             Self::Http(repo) => Ok(repo.push(&push).await?),
-            Self::Local { service, repo } => Ok(service.push(repo, push)?),
+            Self::Local { service, repo } => Ok(service.push(&Caller::Owner, repo, push)?),
+        }
+    }
+}
+
+/// What the user may do on a remote: who it thinks they are, and its rules.
+/// `None` stands for full access, like an owner's.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AccessInfo {
+    /// The user, or `None` when anonymous.
+    pub identity: Option<Identity>,
+    /// The repository's rules.
+    pub permissions: Permissions,
+}
+
+impl Remote {
+    /// What the user may do, or `None` if they own the repository.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote cannot be reached.
+    pub async fn access(&self) -> Result<Option<AccessInfo>, RemoteError> {
+        let Self::Http(repo) = self else {
+            return Ok(None);
+        };
+        Ok(Some(AccessInfo {
+            identity: repo.client().whoami().await?.identity,
+            permissions: repo.permissions().await?,
+        }))
+    }
+
+    /// Replaces the repository's rules.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote cannot be reached or the user may not change
+    /// them.
+    pub async fn set_permissions(&self, permissions: &Permissions) -> Result<(), RemoteError> {
+        match self {
+            Self::Http(repo) => Ok(repo.set_permissions(permissions).await?),
+            Self::Local { service, repo } => {
+                Ok(service.set_permissions(&Caller::Owner, repo, permissions.clone())?)
+            }
+        }
+    }
+
+    /// The repository's rules.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote cannot be reached.
+    pub async fn permissions(&self) -> Result<Permissions, RemoteError> {
+        match self {
+            Self::Http(repo) => Ok(repo.permissions().await?),
+            Self::Local { service, repo } => Ok(service.permissions(&Caller::Owner, repo)?),
         }
     }
 }
@@ -108,6 +173,9 @@ pub enum RemoteError {
     /// The remote URL is not usable.
     #[error("invalid remote `{0}`: expected http://host[:port]/<repository> or a path")]
     InvalidUrl(String),
+    /// The user configuration is invalid.
+    #[error(transparent)]
+    UserConfig(#[from] crate::user::UserConfigError),
     /// The client has no TLS support yet.
     #[error("HTTPS remotes are not supported yet")]
     HttpsUnsupported,

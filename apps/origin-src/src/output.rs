@@ -8,11 +8,12 @@ use similar::TextDiff;
 use crate::store::{ObjectStore, StoreError};
 use crate::tree::Change;
 
-/// The unified diff of one changed file.
+/// The unified diff of one changed file. Content is `None` when the remote
+/// withheld it.
 pub struct FileDiff<'a> {
     change: &'a Change,
-    old: Vec<u8>,
-    new: Vec<u8>,
+    old: Option<Vec<u8>>,
+    new: Option<Vec<u8>>,
 }
 
 impl<'a> FileDiff<'a> {
@@ -22,16 +23,18 @@ impl<'a> FileDiff<'a> {
     ///
     /// Fails if either side cannot be read or is not a blob.
     pub fn new(store: &ObjectStore, change: &'a Change) -> Result<Self, StoreError> {
-        let content = |entry: Option<TreeEntry>| -> Result<Vec<u8>, StoreError> {
+        let content = |entry: Option<TreeEntry>| -> Result<Option<Vec<u8>>, StoreError> {
             let Some(entry) = entry else {
-                return Ok(Vec::new());
+                return Ok(Some(Vec::new()));
             };
-            let blob = store.read(entry.id)?;
+            let Some(blob) = store.try_read(entry.id)? else {
+                return Ok(None);
+            };
             let content = blob.blob_content().map_err(|source| StoreError::Decode {
                 id: entry.id,
                 source,
             })?;
-            Ok(content.to_vec())
+            Ok(Some(content.to_vec()))
         };
         Ok(Self {
             change,
@@ -65,10 +68,13 @@ impl fmt::Display for FileDiff<'_> {
         {
             writeln!(f, "{path}: {old} -> {new}")?;
         }
-        if self.old == self.new {
+        let (Some(old), Some(new)) = (&self.old, &self.new) else {
+            return writeln!(f, "File {path} changed; its old content is withheld");
+        };
+        if old == new {
             return Ok(());
         }
-        let (Some(old), Some(new)) = (Self::text(&self.old), Self::text(&self.new)) else {
+        let (Some(old), Some(new)) = (Self::text(old), Self::text(new)) else {
             return writeln!(f, "Binary file {path} differs");
         };
         write!(

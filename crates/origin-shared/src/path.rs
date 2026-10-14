@@ -77,6 +77,37 @@ impl RepoPath {
             .map(|component| EntryName(component.to_owned()))
     }
 
+    /// The outermost component and the path below it, or `None` for the
+    /// root.
+    #[must_use]
+    pub fn split_first(&self) -> Option<(EntryName, Self)> {
+        if self.is_root() {
+            return None;
+        }
+        // Components were validated when the path was built.
+        Some(match self.0.split_once('/') {
+            Some((first, rest)) => (EntryName(first.to_owned()), Self(rest.to_owned())),
+            None => (EntryName(self.0.clone()), Self::root()),
+        })
+    }
+
+    /// The directory containing this path, or `None` for the root.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        if self.is_root() {
+            return None;
+        }
+        Some(match self.0.rsplit_once('/') {
+            Some((parent, _)) => Self(parent.to_owned()),
+            None => Self::root(),
+        })
+    }
+
+    /// The path, then each directory containing it, ending with the root.
+    pub fn ancestors(&self) -> impl Iterator<Item = Self> {
+        std::iter::successors(Some(self.clone()), Self::parent)
+    }
+
     /// Whether `self` is `ancestor` or inside it, comparing whole components:
     /// `src/lib` is inside `src` but not inside `sr`.
     #[must_use]
@@ -161,6 +192,13 @@ mod tests {
         let name = EntryName::new("lib.rs").unwrap();
         assert_eq!(RepoPath::root().join(&name), path("lib.rs"));
         assert_eq!(path("src").join(&name), path("src/lib.rs"));
+    }
+
+    #[test]
+    fn lists_ancestors_innermost_first() {
+        let ancestors: Vec<String> = path("a/b/c").ancestors().map(|a| a.to_string()).collect();
+        assert_eq!(ancestors, ["a/b/c", "a/b", "a", "/"]);
+        assert_eq!(RepoPath::root().ancestors().count(), 1);
     }
 
     #[test]

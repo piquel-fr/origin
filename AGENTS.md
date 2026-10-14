@@ -12,6 +12,12 @@ currently contains the first prototype.
 - `apps/origin-src`: the `origin` binary, both the command line and the
   server.
 
+## API changes
+
+Every server feature lives in `OriginService`; transports like HTTP only
+translate requests. A new HTTP endpoint also takes a line in the SDK's
+`endpoints!` macro, and `just openapi` to update `docs/openapi.json`.
+
 ## Testing & Benchmarks
 
 Performance is a primary goal, so benchmarks matter as much as tests. A change

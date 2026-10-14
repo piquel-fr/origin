@@ -3,7 +3,8 @@
 //! A pack is a sequence of entries, each
 //! `id:[u8; 32] len:u64 bytes:[u8; len]` with `bytes` the object's encoding.
 //! Decoding verifies every object against its id, so a pack can come from an
-//! untrusted peer.
+//! untrusted peer. A withheld object, which the receiver may not read, is
+//! `id:[u8; 32] u64::MAX`, without bytes.
 //!
 //! A push is `len:u32 updates:[u8; len] pack`, with `updates` the JSON list
 //! of branch updates.
@@ -16,10 +17,14 @@ use crate::{EncodedObject, ObjectId, RefUpdate};
 pub struct Pack {
     /// The objects, in the order they were added.
     pub objects: Vec<EncodedObject>,
+    /// Objects that were asked for but that the receiver may not read.
+    pub withheld: Vec<ObjectId>,
 }
 
 impl Pack {
     const HEADER_LEN: usize = ObjectId::LEN + 8;
+    /// The length that marks a withheld object.
+    const WITHHELD: u64 = u64::MAX;
 
     /// Encodes the pack.
     #[must_use]
@@ -28,12 +33,17 @@ impl Pack {
             .objects
             .iter()
             .map(|object| Self::HEADER_LEN + object.bytes().len())
-            .sum();
+            .sum::<usize>()
+            + self.withheld.len() * Self::HEADER_LEN;
         let mut out = Vec::with_capacity(len);
         for object in &self.objects {
             out.extend_from_slice(object.id().as_bytes());
             out.extend_from_slice(&(object.bytes().len() as u64).to_le_bytes());
             out.extend_from_slice(object.bytes());
+        }
+        for id in &self.withheld {
+            out.extend_from_slice(id.as_bytes());
+            out.extend_from_slice(&Self::WITHHELD.to_le_bytes());
         }
         out
     }
@@ -44,20 +54,26 @@ impl Pack {
     ///
     /// Fails if the pack is truncated or an object does not match its id.
     pub fn decode(mut bytes: &[u8]) -> Result<Self, PackError> {
-        let mut objects = Vec::new();
+        let mut pack = Self::default();
         while !bytes.is_empty() {
             let (id, rest) = bytes
                 .split_first_chunk::<{ ObjectId::LEN }>()
                 .ok_or(PackError::Truncated)?;
             let (len, rest) = rest.split_first_chunk::<8>().ok_or(PackError::Truncated)?;
             let id = ObjectId::from_bytes(*id);
-            let len =
-                usize::try_from(u64::from_le_bytes(*len)).map_err(|_| PackError::Truncated)?;
+            let len = u64::from_le_bytes(*len);
+            if len == Self::WITHHELD {
+                pack.withheld.push(id);
+                bytes = rest;
+                continue;
+            }
+            let len = usize::try_from(len).map_err(|_| PackError::Truncated)?;
             let (object, rest) = rest.split_at_checked(len).ok_or(PackError::Truncated)?;
-            objects.push(EncodedObject::verify(id, object.to_vec())?);
+            pack.objects
+                .push(EncodedObject::verify(id, object.to_vec())?);
             bytes = rest;
         }
-        Ok(Self { objects })
+        Ok(pack)
     }
 }
 
@@ -126,6 +142,7 @@ mod tests {
     fn round_trips() {
         let pack = Pack {
             objects: vec![EncodedObject::blob(b"a"), EncodedObject::blob(b"")],
+            withheld: vec![EncodedObject::blob(b"secret").id()],
         };
         assert_eq!(Pack::decode(&pack.encode()).unwrap(), pack);
         assert_eq!(Pack::decode(&[]).unwrap(), Pack::default());
@@ -142,6 +159,7 @@ mod tests {
             }],
             pack: Pack {
                 objects: vec![blob],
+                withheld: Vec::new(),
             },
         };
         assert_eq!(PushRequest::decode(&push.encode()).unwrap(), push);
@@ -155,6 +173,7 @@ mod tests {
     fn rejects_truncated_and_corrupt_packs() {
         let mut bytes = Pack {
             objects: vec![EncodedObject::blob(b"content")],
+            withheld: Vec::new(),
         }
         .encode();
         assert!(matches!(

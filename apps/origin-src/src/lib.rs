@@ -1,6 +1,7 @@
 //! The origin command line and server. Both share the repository logic in
 //! this library; `main.rs` only parses arguments and dispatches.
 
+pub mod auth;
 pub mod cli;
 #[cfg(feature = "fixture")]
 pub mod fixture;
@@ -14,5 +15,6 @@ pub mod service;
 pub mod store;
 pub mod sync;
 pub mod tree;
+pub mod user;
 pub mod workspace;
 pub mod worktree;
