@@ -127,6 +127,7 @@ impl Workspace {
         Ok(self.branches.get(&self.config.branch)?)
     }
 
+    /// Returns the root tree of `head`
     fn head_tree(&self, head: Option<ObjectId>) -> Result<Option<ObjectId>, WorkspaceError> {
         Ok(head
             .map(|id| self.objects.commit(id))
