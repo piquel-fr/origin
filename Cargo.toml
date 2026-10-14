@@ -20,6 +20,14 @@ repository = "https://github.com/piquel-fr/origin"
 origin-client = { version = "0.1.0", path = "crates/origin-client" }
 origin-shared = { version = "0.1.0", path = "crates/origin-shared" }
 
+# External
+blake3 = "1.8.7"
+divan = "0.1.21"
+jiff = "0.2.38"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+zstd = "0.14.2"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
