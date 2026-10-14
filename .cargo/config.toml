@@ -1,0 +1,3 @@
+# `cargo xtask <task>` runs the workspace's development tasks (tools/xtask).
+[alias]
+xtask = "run --package xtask --"
