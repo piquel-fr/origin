@@ -1,8 +1,10 @@
 //! Types shared by every origin component: the object model, the wire
 //! formats, and the API contracts.
 
+pub mod api;
 mod id;
 pub mod object;
+pub mod pack;
 mod path;
 pub mod refs;
 

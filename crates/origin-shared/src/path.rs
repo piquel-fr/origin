@@ -9,7 +9,20 @@ use crate::object::{EntryName, InvalidEntryName};
 ///
 /// Components are valid [`EntryName`]s joined by `/`. The empty path is the
 /// root directory.
-#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(try_from = "String", into = "String")]
+#[schema(value_type = String, example = "src/main.rs")]
 pub struct RepoPath(String);
 
 impl RepoPath {
@@ -80,6 +93,20 @@ impl RepoPath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for RepoPath {
+    type Error = InvalidEntryName;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        Self::new(&path)
+    }
+}
+
+impl From<RepoPath> for String {
+    fn from(path: RepoPath) -> Self {
+        path.0
     }
 }
 

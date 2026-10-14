@@ -1,6 +1,6 @@
-//! Comparing trees.
+//! Navigating and comparing trees.
 
-use origin_shared::{EntryName, ObjectId, RepoPath, TreeEntry};
+use origin_shared::{EntryKind, EntryName, ObjectId, RepoPath, TreeEntry};
 
 use crate::store::{ObjectStore, StoreError};
 
@@ -16,6 +16,33 @@ pub struct Change {
 }
 
 impl ObjectStore {
+    /// Finds the entry at `path` under the tree `root`, or `None` if nothing
+    /// is there. The root path resolves to `root` itself.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree along the path cannot be read.
+    pub fn resolve(
+        &self,
+        root: ObjectId,
+        path: &RepoPath,
+    ) -> Result<Option<TreeEntry>, StoreError> {
+        let mut entry = TreeEntry {
+            kind: EntryKind::Tree,
+            id: root,
+        };
+        for name in path.components() {
+            if !entry.kind.is_tree() {
+                return Ok(None);
+            }
+            match self.tree(entry.id)?.get(name) {
+                Some(child) => entry = *child,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(entry))
+    }
+
     /// Lists the files that differ between two trees, sorted by path.
     /// `None` stands for an empty tree. Subtrees with equal ids are skipped
     /// without being read, so the cost follows the size of the change.
@@ -192,6 +219,35 @@ mod tests {
         let src = store.tree(root.get("src").unwrap().id).unwrap();
         assert_eq!(src.get("lib.rs"), Some(&file("lib")));
         assert!(src.get("bin").unwrap().kind.is_tree());
+    }
+
+    #[test]
+    fn resolves_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        let root = build(&store, &[("src/lib.rs", "lib")]);
+
+        assert_eq!(
+            store.resolve(root, &RepoPath::root()).unwrap().unwrap().id,
+            root
+        );
+        assert!(
+            store
+                .resolve(root, &path("src"))
+                .unwrap()
+                .unwrap()
+                .kind
+                .is_tree()
+        );
+        assert_eq!(
+            store.resolve(root, &path("src/lib.rs")).unwrap(),
+            Some(file("lib"))
+        );
+        assert_eq!(
+            store.resolve(root, &path("src/lib.rs/deeper")).unwrap(),
+            None
+        );
+        assert_eq!(store.resolve(root, &path("missing")).unwrap(), None);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! The `origin` command line: argument parsing. The commands themselves are
-//! methods of [`Workspace`], which print their output.
+//! methods of [`Workspace`], [`Repository`] and [`ServerConfig`], which print
+//! their output.
 
 use std::env;
 use std::path::PathBuf;
@@ -7,6 +8,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::http::ServerConfig;
+use crate::repository::{RepoConfig, Repository};
 use crate::workspace::Workspace;
 
 /// A modern, git-compatible source control system.
@@ -19,14 +22,35 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a repository.
+    /// Create a repository with a working copy.
     Init {
         /// Where to create it.
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Serve repositories over HTTP.
+    Serve {
+        /// The server configuration file.
+        #[arg(short, long, default_value = "origin-server.toml")]
+        config: PathBuf,
+    },
+    /// Manage repositories hosted by a server.
+    #[command(subcommand)]
+    Repo(RepoCommand),
     #[command(flatten)]
     Workspace(WorkspaceCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoCommand {
+    /// Create an empty repository for a server to host.
+    Create {
+        /// Where to create it.
+        path: PathBuf,
+        /// What the repository holds.
+        #[arg(short, long, default_value = "")]
+        description: String,
+    },
 }
 
 /// Commands run in the repository containing the current directory.
@@ -56,9 +80,13 @@ impl Cli {
     /// # Errors
     ///
     /// Fails if the command fails; the error is meant for the user.
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         match self.command {
             Command::Init { path } => Workspace::init(&path)?,
+            Command::Serve { config } => ServerConfig::load(&config)?.serve().await?,
+            Command::Repo(RepoCommand::Create { path, description }) => {
+                Repository::create(&path, &RepoConfig { description })?;
+            }
             Command::Workspace(command) => command.run()?,
         }
         Ok(())
