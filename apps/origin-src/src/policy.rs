@@ -37,9 +37,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use origin_platform::Platform;
+use origin_shared::policy::{KindPattern, Principals, Requirement};
 use origin_shared::{
-    AcceptanceBody, AcceptanceId, EncodedObject, EntryKind, EntryName, Kind, NodePublicKey,
-    Principal, PrincipalName, Record, RepoPath, TargetName, Tree, TreeEntry, TreeId, Verdict,
+    AcceptanceBody, AcceptanceId, EncodedObject, EntryKind, EntryName, InvalidName, InvalidPeriod,
+    Kind, NodePublicKey, Period, Principal, PrincipalName, Record, RepoPath, TargetName, Tree,
+    TreeEntry, TreeId,
 };
 use serde::Deserialize;
 
@@ -62,28 +64,6 @@ pub struct Policy {
 struct TargetRules {
     authority: PrincipalName,
     require: Vec<Requirement>,
-}
-
-/// A statement that landing needs: of `kind`, with `verdict`, from one of
-/// `issuer`, about what lands.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Requirement {
-    /// The statement's kind.
-    pub kind: Kind,
-    /// Its verdict.
-    pub verdict: Verdict,
-    /// Who may issue it.
-    pub issuer: Principals,
-}
-
-/// One user or node, or the members of a group: `user:alice`,
-/// `node:ci-1` or `group:runners`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Principals {
-    /// A user or a node.
-    One(Principal),
-    /// The members of a group of the policy.
-    Group(PrincipalName),
 }
 
 /// A `[[paths]]` rule: what each grantee may do under a path.
@@ -390,6 +370,32 @@ impl TryFrom<PolicyFile> for Policy {
 }
 
 impl Policy {
+    /// The first `policy.toml` of a repository: `node`, whose public key is
+    /// `key`, is the authority of `policy` and `main`, and neither requires
+    /// anything, so a solo project lands instantly.
+    #[must_use]
+    pub fn initial(node: &PrincipalName, key: &NodePublicKey) -> String {
+        format!(
+            "# Who may land what. Changing it is a landing on `policy`.\n\
+             \n\
+             # Each node's public key.\n\
+             [nodes]\n\
+             \"{node}\" = \"{key}\"\n\
+             \n\
+             # Groups of users and nodes, for requirements:\n\
+             # [groups]\n\
+             # runners = [\"node:ci-1\"]\n\
+             \n\
+             # The node ordering each target, and the statements landing needs.\n\
+             [targets.policy]\n\
+             authority = \"node:{node}\"\n\
+             \n\
+             [targets.main]\n\
+             authority = \"node:{node}\"\n\
+             # require = [{{ kind = \"ci.test\", verdict = \"pass\", issuer = \"group:runners\" }}]\n"
+        )
+    }
+
     /// Checks that the group `principals` names, if any, is defined.
     fn check(&self, principals: Principals) -> Result<Principals, RuleError> {
         match &principals {
@@ -397,30 +403,6 @@ impl Policy {
                 Err(RuleError::UnknownGroup(group.clone()))
             }
             _ => Ok(principals),
-        }
-    }
-}
-
-impl FromStr for Principals {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input.strip_prefix("group:") {
-            Some(group) => PrincipalName::new(group)
-                .map(Self::Group)
-                .map_err(|error| error.to_string()),
-            None => input.parse().map(Self::One).map_err(|_| {
-                format!("`{input}` is not `user:<name>`, `node:<name>` or `group:<name>`")
-            }),
-        }
-    }
-}
-
-impl fmt::Display for Principals {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::One(principal) => principal.fmt(f),
-            Self::Group(group) => write!(f, "group:{group}"),
         }
     }
 }
@@ -449,12 +431,6 @@ impl FromStr for Access {
             "write" => Ok(Self::Write),
             _ => Err(format!("`{input}` is not `none`, `read` or `write`")),
         }
-    }
-}
-
-impl fmt::Display for Requirement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} from {}", self.kind, self.verdict, self.issuer)
     }
 }
 
@@ -521,20 +497,6 @@ impl Retention {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
-
-    /// Parses a period: a whole number of seconds (`s`), minutes (`m`),
-    /// hours (`h`) or days (`d`), such as `90d`.
-    fn parse_period(period: &str) -> Option<Duration> {
-        let unit = match period.chars().last()? {
-            's' => 1,
-            'm' => 60,
-            'h' => 60 * 60,
-            'd' => 24 * 60 * 60,
-            _ => return None,
-        };
-        let count: u64 = period[..period.len() - 1].parse().ok()?;
-        Some(Duration::from_secs(count.checked_mul(unit)?))
-    }
 }
 
 impl TryFrom<BTreeMap<String, String>> for Retention {
@@ -544,8 +506,7 @@ impl TryFrom<BTreeMap<String, String>> for Retention {
         let rules = table
             .into_iter()
             .map(|(pattern, period)| {
-                let duration = Self::parse_period(&period)
-                    .ok_or_else(|| RetentionError::Period(period.clone()))?;
+                let Period(duration) = period.parse()?;
                 Ok((pattern.parse()?, duration))
             })
             .collect::<Result<_, RetentionError>>()?;
@@ -553,62 +514,15 @@ impl TryFrom<BTreeMap<String, String>> for Retention {
     }
 }
 
-/// Statement kinds, as retention rules and `origin watch --kind` name
-/// them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KindPattern {
-    /// `*`: every kind.
-    Any,
-    /// `ci.*`: the kinds under a prefix, not the prefix itself.
-    Prefix(Kind),
-    /// `ci.test`: one kind.
-    Exact(Kind),
-}
-
-impl KindPattern {
-    /// Whether the pattern matches `kind`.
-    #[must_use]
-    pub fn matches(&self, kind: &Kind) -> bool {
-        self.specificity(kind).is_some()
-    }
-
-    /// How specifically the pattern matches `kind`, if it does: longer
-    /// prefixes beat shorter ones, and the kind itself beats them all.
-    fn specificity(&self, kind: &Kind) -> Option<(usize, bool)> {
-        match self {
-            Self::Any => Some((0, false)),
-            Self::Prefix(prefix) => kind
-                .as_str()
-                .strip_prefix(prefix.as_str())
-                .is_some_and(|rest| rest.starts_with('.'))
-                .then_some((prefix.as_str().len(), false)),
-            Self::Exact(exact) => (exact == kind).then_some((exact.as_str().len(), true)),
-        }
-    }
-}
-
-impl FromStr for KindPattern {
-    type Err = RetentionError;
-
-    fn from_str(pattern: &str) -> Result<Self, Self::Err> {
-        let invalid = || RetentionError::Pattern(pattern.to_owned());
-        match pattern.strip_suffix(".*") {
-            _ if pattern == "*" => Ok(Self::Any),
-            Some(prefix) => Kind::new(prefix).map(Self::Prefix).map_err(|_| invalid()),
-            None => Kind::new(pattern).map(Self::Exact).map_err(|_| invalid()),
-        }
-    }
-}
-
 /// An invalid `[retention]` rule.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RetentionError {
     /// The key is not a kind, a prefix ending in `.*`, or `*`.
-    #[error("`{0}` is not a statement kind, a prefix like `ci.*`, or `*`")]
-    Pattern(String),
+    #[error(transparent)]
+    Pattern(#[from] InvalidName),
     /// The value is not a period.
-    #[error("`{0}` is not a period like `90d`, `12h`, `30m` or `45s`")]
-    Period(String),
+    #[error(transparent)]
+    Period(#[from] InvalidPeriod),
 }
 
 /// A failure to read the policy.

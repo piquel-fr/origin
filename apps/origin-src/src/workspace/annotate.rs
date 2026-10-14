@@ -14,6 +14,7 @@ use super::{WorkingCopy, Workspace, WorkspaceError};
 use crate::annotations::Annotations;
 use crate::index::FindError;
 use crate::policy::Policy;
+use crate::service::Caller;
 use crate::tree::Snapshots;
 
 impl WorkingCopy {
@@ -119,8 +120,9 @@ impl Workspace {
     pub fn statements(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
         let revision = working_copy.find_revision(rev)?;
-        let annotations = Annotations::new(&self.store, working_copy.index);
-        let found = annotations.about(RecordId::Revision(revision))?;
+        let found = self
+            .service(Some(working_copy.index))?
+            .statements(&Caller::Owner, RecordId::Revision(revision))?;
         if found.is_empty() {
             println!("No statements about revision {}", revision.short());
         }

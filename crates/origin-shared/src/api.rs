@@ -1,0 +1,341 @@
+//! Contracts of the HTTP API, shared by the server and the SDK: requests,
+//! responses and errors that aren't records or events themselves.
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
+
+use crate::landing::{Landing, Proposal};
+use crate::policy::{KindPattern, Requirement};
+use crate::text::Period;
+use crate::{
+    Acceptance, AcceptanceId, Head, ObjectId, PrincipalName, RecordId, Revision, RevisionId,
+    Statement, StatementId, TargetName,
+};
+
+/// The name of a repository on a server: ASCII letters, digits, `.`, `_`
+/// and `-`, not starting with `.`.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(try_from = "String", into = "String")]
+#[schema(value_type = String, example = "origin")]
+pub struct RepoName(String);
+
+impl RepoName {
+    /// Validates a repository name.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the name breaks the rules above.
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidRepoName> {
+        let name = name.into();
+        let valid = !name.is_empty()
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+        if valid {
+            Ok(Self(name))
+        } else {
+            Err(InvalidRepoName(name))
+        }
+    }
+
+    /// The name as a string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RepoName {
+    type Error = InvalidRepoName;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
+
+impl From<RepoName> for String {
+    fn from(name: RepoName) -> Self {
+        name.0
+    }
+}
+
+impl FromStr for RepoName {
+    type Err = InvalidRepoName;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::new(name)
+    }
+}
+
+impl fmt::Display for RepoName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for RepoName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// A repository name that [`RepoName::new`] rejected.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid repository name {0:?}")]
+pub struct InvalidRepoName(pub String);
+
+/// A repository, as listed by the server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RepoSummary {
+    /// The repository's name.
+    pub name: RepoName,
+}
+
+/// Asks for records, and any other objects, by id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct FetchRecords {
+    /// The objects, returned in this order.
+    pub ids: Vec<ObjectId>,
+}
+
+/// What putting a batch of records did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Stored {
+    /// How many of the objects the repository didn't have yet.
+    pub new: u64,
+}
+
+/// Asks for the statements about a record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct StatementsQuery {
+    /// The record, such as `revision:<id>`.
+    #[param(value_type = String)]
+    pub subject: RecordId,
+}
+
+/// A statement, and whether its issuer superseded it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Annotation {
+    /// The statement's id.
+    pub id: StatementId,
+    /// The statement.
+    pub statement: Statement,
+    /// The first statement from the same issuer that supersedes it.
+    pub superseded_by: Option<StatementId>,
+}
+
+/// The revisions of a change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Revisions {
+    /// Every revision, in the order the repository received them.
+    pub revisions: Vec<RevisionEntry>,
+    /// Those that no other revision of the change evolves from: more than
+    /// one is divergence.
+    pub heads: Vec<RevisionId>,
+}
+
+/// A revision and its id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RevisionEntry {
+    /// The revision's id.
+    pub id: RevisionId,
+    /// The revision.
+    pub revision: Revision,
+}
+
+/// A target, where it is, and who orders it under the policy in force.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TargetInfo {
+    /// The target's name.
+    pub name: TargetName,
+    /// Its latest acceptance.
+    pub head: Head,
+    /// The node that orders it, if the policy names one.
+    pub authority: Option<PrincipalName>,
+    /// The statements landing on it needs.
+    pub requirements: Vec<Requirement>,
+}
+
+/// Asks for the acceptances of a target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LogQuery {
+    /// The target.
+    #[param(value_type = String)]
+    pub target: TargetName,
+    /// The position of the first acceptance to return: 0, the first, by
+    /// default.
+    #[serde(default)]
+    pub since: u64,
+}
+
+/// One acceptance of a target's log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LogEntry {
+    /// Its id.
+    pub id: AcceptanceId,
+    /// The acceptance, whose `seq` is its position in the log.
+    pub acceptance: Acceptance,
+}
+
+/// Asks the queue to land something.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LandRequest {
+    /// What to land.
+    pub proposal: Proposal,
+    /// The target to land on. For a change, the target its stack is on by
+    /// default; a target needs one.
+    pub onto: Option<TargetName>,
+}
+
+/// How a landing went.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Landings {
+    /// The target landed on.
+    pub onto: TargetName,
+    /// How each landing went: one for each change of a stack that the
+    /// target didn't have, from the bottom, up to the first that waits.
+    pub landings: Vec<Landing>,
+}
+
+/// Asks for a new target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NewTarget {
+    /// Its name.
+    pub name: TargetName,
+    /// The target whose tip it starts at.
+    pub from: TargetName,
+}
+
+/// Asks for the events after a cursor, waiting for some if there are none
+/// yet: a long-poll.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EventsQuery {
+    /// The cursor to read after: the `next` of the previous page. By
+    /// default, the end of the stream, so only new events come.
+    pub cursor: Option<u64>,
+    /// How long to wait for events, such as `30s`. Without it, the answer
+    /// comes at once, possibly empty.
+    #[param(value_type = Option<String>)]
+    pub wait: Option<Period>,
+    /// Stop after about this many events: an entry's events are delivered
+    /// whole.
+    pub limit: Option<u32>,
+    /// Only events of these names or statement kinds, comma-separated, such
+    /// as `check.requested,ci.*`.
+    #[serde(default, skip_serializing_if = "List::is_empty")]
+    #[param(value_type = Option<String>)]
+    pub kind: List<KindPattern>,
+    /// Only events whose subject starts with one of these, comma-separated,
+    /// such as a revision id prefix, `change:3fa2` or `main`.
+    #[serde(default, skip_serializing_if = "List::is_empty")]
+    #[param(value_type = Option<String>)]
+    pub subject: List<String>,
+}
+
+/// Values written as one comma-separated string, as query parameters take
+/// lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct List<T>(pub Vec<T>);
+
+impl<T> Default for List<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> List<T> {
+    /// Whether the list has no values.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<T: fmt::Display> Serialize for List<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let values: Vec<_> = self.0.iter().map(ToString::to_string).collect();
+        serializer.serialize_str(&values.join(","))
+    }
+}
+
+impl<'de, T> Deserialize<'de> for List<T>
+where
+    T: FromStr<Err: fmt::Display>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.split(',')
+            .filter(|value| !value.is_empty())
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// What went wrong with a request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApiError {
+    /// The kind of failure.
+    pub code: ErrorCode,
+    /// A human-readable explanation.
+    pub message: String,
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// The kind of an [`ApiError`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// The request is malformed, or names records the repository can't
+    /// take.
+    BadRequest,
+    /// A repository, target, change or record does not exist.
+    NotFound,
+    /// The request is valid, but the repository's state refuses it: a
+    /// change that diverged, a target that exists, another node's target.
+    Conflict,
+    /// The event cursor is older than anything the server still keeps.
+    Expired,
+    /// The server failed.
+    Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_names_are_validated() {
+        for valid in ["origin", "my-repo.v2", "a_b"] {
+            assert!(RepoName::new(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in ["", ".hidden", "a/b", "sp ace"] {
+            assert!(RepoName::new(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn lists_are_comma_separated() {
+        let list: List<KindPattern> = serde_json::from_str("\"ci.*,review\"").unwrap();
+        assert_eq!(list.0.len(), 2);
+        assert_eq!(serde_json::to_string(&list).unwrap(), "\"ci.*,review\"");
+        let empty: List<String> = serde_json::from_str("\"\"").unwrap();
+        assert!(empty.is_empty());
+        assert!(serde_json::from_str::<List<KindPattern>>("\"CI\"").is_err());
+    }
+}

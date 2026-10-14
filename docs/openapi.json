@@ -1,0 +1,1714 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "origin API",
+    "description": "The repositories an origin server hosts: their records, targets, landing queues and events.",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "v1"
+  },
+  "paths": {
+    "/api/v1/openapi.json": {
+      "get": {
+        "summary": "The OpenAPI document of this API.",
+        "operationId": "openapi_document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos": {
+      "get": {
+        "summary": "Lists the repositories on the server.",
+        "operationId": "list_repos",
+        "responses": {
+          "200": {
+            "description": "The repositories, by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RepoSummary"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/changes/{change}/revisions": {
+      "get": {
+        "summary": "Lists the revisions of a change, and its heads.",
+        "operationId": "revisions",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "change",
+            "in": "path",
+            "description": "The change's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The revisions, in the order the repository received them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Revisions"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or the change does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/events": {
+      "get": {
+        "summary": "Reads the events after a cursor, waiting up to `wait` for some: a\nlong-poll. Pass the page's `next` as the next request's cursor.",
+        "operationId": "events",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The cursor to read after: the `next` of the previous page. By\ndefault, the end of the stream, so only new events come.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "How long to wait for events, such as `30s`. Without it, the answer\ncomes at once, possibly empty.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Stop after about this many events: an entry's events are delivered\nwhole.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Only events of these names or statement kinds, comma-separated, such\nas `check.requested,ci.*`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "description": "Only events whose subject starts with one of these, comma-separated,\nsuch as a revision id prefix, `change:3fa2` or `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The events, oldest first, and the next cursor: empty if none came in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The server no longer keeps the events after the cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/land": {
+      "post": {
+        "summary": "Submits a change, or a target's tip, to a target's landing queue, run\nby this server.",
+        "operationId": "land",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How each landing went: landed, unchanged, or waiting for evidence or a conflict's resolution",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Landings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A target was proposed without a target to land on",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository, the change or a target does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The change diverged or was abandoned, or this server doesn't order the target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/landings": {
+      "get": {
+        "summary": "Lists the landings that wait, and why.",
+        "operationId": "landings",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The waiting landings, by target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Pending"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/log": {
+      "get": {
+        "summary": "Lists the acceptances of a target, oldest first.",
+        "operationId": "log",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "The target.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "The position of the first acceptance to return: 0, the first, by\ndefault.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The acceptances from `since` on",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LogEntry"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or the target does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/records": {
+      "put": {
+        "summary": "Puts a batch of objects, as a pack: snapshots, revisions and\nstatements, each needing only objects the batch or the repository has.",
+        "operationId": "put_records",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The objects, as a pack",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "$ref": "#/components/schemas/Binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The objects are durable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stored"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The pack is invalid, holds an acceptance, or needs objects the repository doesn't have",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/records/fetch": {
+      "post": {
+        "summary": "Fetches objects by id, as a pack.",
+        "operationId": "fetch_records",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchRecords"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The objects, in the order asked, as a pack: each a 32-byte id, a little-endian u64 length and the object's encoding",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or an object does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/statements": {
+      "get": {
+        "summary": "Lists the statements about a record, in the order the repository\nreceived them.",
+        "operationId": "statements",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "description": "The record, such as `revision:<id>`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The statements",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Annotation"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/targets": {
+      "get": {
+        "summary": "Lists the targets, with their tips, authorities and requirements.",
+        "operationId": "targets",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The targets, by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TargetInfo"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Creates a target at the tip of another, ordered by this server.",
+        "operationId": "create_target",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTarget"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The new target's first acceptance",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Head"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or the target to start from does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The name is taken, or this server wouldn't order the target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Acceptance": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AcceptanceBody"
+          },
+          {
+            "type": "object",
+            "required": [
+              "signature"
+            ],
+            "properties": {
+              "signature": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "One landing on a target, signed by the target's authority.\n\nAcceptances form a hash chain per target: each names the one before it,\nand its sequence number is its position in the target's log.\n\nIn JSON, the body's fields and the signature, in hex."
+      },
+      "AcceptanceBody": {
+        "type": "object",
+        "description": "An acceptance without its signature.",
+        "required": [
+          "target",
+          "seq",
+          "state",
+          "landed",
+          "evidence"
+        ],
+        "properties": {
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatementId"
+            },
+            "description": "The statements the policy relied on."
+          },
+          "landed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Source"
+            },
+            "description": "What landed."
+          },
+          "policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AcceptanceId",
+                "description": "The acceptance of the `policy` target in force when this one landed.\nAbsent only for the first acceptance of `policy`, which nothing\nprecedes."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "prev": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AcceptanceId",
+                "description": "The acceptance before this one, absent only for the first."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The position in the target's log, from 0.",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/TreeId",
+            "description": "The target's snapshot after this landing."
+          },
+          "target": {
+            "$ref": "#/components/schemas/TargetId",
+            "description": "The target landed on."
+          }
+        }
+      },
+      "AcceptanceId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "Annotation": {
+        "type": "object",
+        "description": "A statement, and whether its issuer superseded it.",
+        "required": [
+          "id",
+          "statement"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/StatementId",
+            "description": "The statement's id."
+          },
+          "statement": {
+            "$ref": "#/components/schemas/Statement",
+            "description": "The statement."
+          },
+          "superseded_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StatementId",
+                "description": "The first statement from the same issuer that supersedes it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "description": "What went wrong with a request.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "The kind of failure."
+          },
+          "message": {
+            "type": "string",
+            "description": "A human-readable explanation."
+          }
+        }
+      },
+      "Base": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The state of a target after one of its acceptances.",
+            "required": [
+              "acceptance"
+            ],
+            "properties": {
+              "acceptance": {
+                "$ref": "#/components/schemas/AcceptanceId",
+                "description": "The state of a target after one of its acceptances."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Another revision, such as the one below in a stack.",
+            "required": [
+              "revision"
+            ],
+            "properties": {
+              "revision": {
+                "$ref": "#/components/schemas/RevisionId",
+                "description": "Another revision, such as the one below in a stack."
+              }
+            }
+          }
+        ],
+        "description": "What a revision was made on top of."
+      },
+      "Binary": {
+        "type": "string",
+        "contentMediaType": "application/octet-stream"
+      },
+      "BlobId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "Blocked": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The target requires these statements about the subject.",
+            "required": [
+              "evidence"
+            ],
+            "properties": {
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Requirement"
+                },
+                "description": "The target requires these statements about the subject."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Both sides changed these paths. The `core.conflict` statement lists\nthem too.",
+            "required": [
+              "conflict"
+            ],
+            "properties": {
+              "conflict": {
+                "type": "object",
+                "description": "Both sides changed these paths. The `core.conflict` statement lists\nthem too.",
+                "required": [
+                  "statement",
+                  "paths"
+                ],
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/RepoPath"
+                    },
+                    "description": "The paths, sorted."
+                  },
+                  "statement": {
+                    "$ref": "#/components/schemas/StatementId",
+                    "description": "The statement."
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "description": "Why a landing waits."
+      },
+      "ChangeId": {
+        "type": "string",
+        "examples": [
+          "3fa2c1d0e9b84f6a7c5d2e1f0a9b8c7d"
+        ]
+      },
+      "Digest": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "The kind of an [`ApiError`].",
+        "enum": [
+          "bad_request",
+          "not_found",
+          "conflict",
+          "expired",
+          "internal"
+        ]
+      },
+      "Event": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/EventKind",
+            "description": "What happened."
+          },
+          {
+            "type": "object",
+            "required": [
+              "cursor"
+            ],
+            "properties": {
+              "cursor": {
+                "type": "integer",
+                "format": "int64",
+                "description": "The sequence number of the op log entry it comes from. Reading from\nit delivers the events of the entries after it.",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "Something that happened, and where it is in the op log."
+      },
+      "EventKind": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A statement was issued.",
+            "required": [
+              "statement",
+              "subject",
+              "kind",
+              "issuer",
+              "event"
+            ],
+            "properties": {
+              "event": {
+                "type": "string",
+                "enum": [
+                  "statement.issued"
+                ]
+              },
+              "issuer": {
+                "$ref": "#/components/schemas/Principal",
+                "description": "Who issued it."
+              },
+              "kind": {
+                "$ref": "#/components/schemas/Kind",
+                "description": "Its kind."
+              },
+              "statement": {
+                "$ref": "#/components/schemas/StatementId",
+                "description": "The statement."
+              },
+              "subject": {
+                "$ref": "#/components/schemas/RecordId",
+                "description": "What it's about."
+              },
+              "verdict": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Verdict",
+                    "description": "Its verdict."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A revision was created.",
+            "required": [
+              "revision",
+              "change",
+              "author",
+              "event"
+            ],
+            "properties": {
+              "author": {
+                "$ref": "#/components/schemas/Principal",
+                "description": "Who made it."
+              },
+              "change": {
+                "$ref": "#/components/schemas/ChangeId",
+                "description": "Its change."
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "revision.created"
+                ]
+              },
+              "revision": {
+                "$ref": "#/components/schemas/RevisionId",
+                "description": "The revision."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A target advanced.",
+            "required": [
+              "target",
+              "seq",
+              "acceptance",
+              "event"
+            ],
+            "properties": {
+              "acceptance": {
+                "$ref": "#/components/schemas/AcceptanceId",
+                "description": "The acceptance."
+              },
+              "event": {
+                "type": "string",
+                "enum": [
+                  "target.advanced"
+                ]
+              },
+              "seq": {
+                "type": "integer",
+                "format": "int64",
+                "description": "The acceptance's position in its log.",
+                "minimum": 0
+              },
+              "target": {
+                "$ref": "#/components/schemas/TargetName",
+                "description": "The target."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A landing waits for a statement it requires.",
+            "required": [
+              "onto",
+              "subject",
+              "requirement",
+              "event"
+            ],
+            "properties": {
+              "event": {
+                "type": "string",
+                "enum": [
+                  "check.requested"
+                ]
+              },
+              "onto": {
+                "$ref": "#/components/schemas/TargetName",
+                "description": "The target it lands on."
+              },
+              "requirement": {
+                "$ref": "#/components/schemas/Requirement",
+                "description": "The statement required."
+              },
+              "subject": {
+                "$ref": "#/components/schemas/RecordId",
+                "description": "What the statement must be about."
+              }
+            }
+          }
+        ],
+        "description": "What happened. In JSON, the `event` field names it, as\n[`EventKind::name`] does."
+      },
+      "FetchRecords": {
+        "type": "object",
+        "description": "Asks for records, and any other objects, by id.",
+        "required": [
+          "ids"
+        ],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectId"
+            },
+            "description": "The objects, returned in this order."
+          }
+        }
+      },
+      "Head": {
+        "type": "object",
+        "description": "The latest acceptance of a target.",
+        "required": [
+          "seq",
+          "acceptance"
+        ],
+        "properties": {
+          "acceptance": {
+            "$ref": "#/components/schemas/AcceptanceId",
+            "description": "The acceptance."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its position in the log, from 0.",
+            "minimum": 0
+          }
+        }
+      },
+      "Inputs": {
+        "type": "object",
+        "description": "What a statement depended on.\n\nThe input digest of a snapshot hashes the ids it stores at `paths`, with\n`definition` and `toolchain`. A statement that declares inputs and isn't\n`external` is promoted to every revision with the same input digest.",
+        "required": [
+          "paths",
+          "definition",
+          "toolchain",
+          "external"
+        ],
+        "properties": {
+          "definition": {
+            "$ref": "#/components/schemas/Digest",
+            "description": "The check's command and configuration."
+          },
+          "external": {
+            "type": "boolean",
+            "description": "Whether the claim also depended on things outside the snapshot, such\nas the network, which makes it never promotable."
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoPath"
+            },
+            "description": "The files and directories read, each covering everything under it."
+          },
+          "toolchain": {
+            "$ref": "#/components/schemas/Digest",
+            "description": "The tools that ran it, such as the hash of `rustc -V`."
+          }
+        }
+      },
+      "Kind": {
+        "type": "string",
+        "examples": [
+          "ci.test"
+        ]
+      },
+      "LandRequest": {
+        "type": "object",
+        "description": "Asks the queue to land something.",
+        "required": [
+          "proposal"
+        ],
+        "properties": {
+          "onto": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TargetName",
+                "description": "The target to land on. For a change, the target its stack is on by\ndefault; a target needs one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/Proposal",
+            "description": "What to land."
+          }
+        }
+      },
+      "Landing": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "It landed.",
+            "required": [
+              "landed"
+            ],
+            "properties": {
+              "landed": {
+                "type": "object",
+                "description": "It landed.",
+                "required": [
+                  "proposal",
+                  "source",
+                  "acceptance"
+                ],
+                "properties": {
+                  "acceptance": {
+                    "$ref": "#/components/schemas/Head",
+                    "description": "The acceptance."
+                  },
+                  "proposal": {
+                    "$ref": "#/components/schemas/Proposal",
+                    "description": "What landed."
+                  },
+                  "source": {
+                    "$ref": "#/components/schemas/Source",
+                    "description": "The revision or acceptance the acceptance names."
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The target already has it, so nothing landed.",
+            "required": [
+              "unchanged"
+            ],
+            "properties": {
+              "unchanged": {
+                "$ref": "#/components/schemas/Proposal",
+                "description": "The target already has it, so nothing landed."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "It waits, and the queue keeps it.",
+            "required": [
+              "pending"
+            ],
+            "properties": {
+              "pending": {
+                "$ref": "#/components/schemas/Pending",
+                "description": "It waits, and the queue keeps it."
+              }
+            }
+          }
+        ],
+        "description": "How a landing went."
+      },
+      "Landings": {
+        "type": "object",
+        "description": "How a landing went.",
+        "required": [
+          "onto",
+          "landings"
+        ],
+        "properties": {
+          "landings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Landing"
+            },
+            "description": "How each landing went: one for each change of a stack that the\ntarget didn't have, from the bottom, up to the first that waits."
+          },
+          "onto": {
+            "$ref": "#/components/schemas/TargetName",
+            "description": "The target landed on."
+          }
+        }
+      },
+      "LogEntry": {
+        "type": "object",
+        "description": "One acceptance of a target's log.",
+        "required": [
+          "id",
+          "acceptance"
+        ],
+        "properties": {
+          "acceptance": {
+            "$ref": "#/components/schemas/Acceptance",
+            "description": "The acceptance, whose `seq` is its position in the log."
+          },
+          "id": {
+            "$ref": "#/components/schemas/AcceptanceId",
+            "description": "Its id."
+          }
+        }
+      },
+      "NewTarget": {
+        "type": "object",
+        "description": "Asks for a new target.",
+        "required": [
+          "name",
+          "from"
+        ],
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/TargetName",
+            "description": "The target whose tip it starts at."
+          },
+          "name": {
+            "$ref": "#/components/schemas/TargetName",
+            "description": "Its name."
+          }
+        }
+      },
+      "ObjectId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "Page": {
+        "type": "object",
+        "description": "A batch of events, and the cursor to read the next batch from.",
+        "required": [
+          "events",
+          "next"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Event"
+            },
+            "description": "The events, oldest first."
+          },
+          "next": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The cursor after the entries read: pass it to the next read.",
+            "minimum": 0
+          }
+        }
+      },
+      "Pending": {
+        "type": "object",
+        "description": "A landing that waits, kept in the queue to be listed and retried.",
+        "required": [
+          "onto",
+          "proposal",
+          "subject",
+          "blocked"
+        ],
+        "properties": {
+          "blocked": {
+            "$ref": "#/components/schemas/Blocked",
+            "description": "Why it waits."
+          },
+          "onto": {
+            "$ref": "#/components/schemas/TargetName",
+            "description": "The target it lands on."
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/Proposal",
+            "description": "What lands."
+          },
+          "subject": {
+            "$ref": "#/components/schemas/RecordId",
+            "description": "What the evidence must be about: the revision that would land, or\nthe merged snapshot of a target. A conflict is about the revision,\nor the acceptance, that didn't merge."
+          }
+        }
+      },
+      "Principal": {
+        "type": "string",
+        "examples": [
+          "user:alice"
+        ]
+      },
+      "PrincipalName": {
+        "type": "string",
+        "examples": [
+          "alice"
+        ]
+      },
+      "Principals": {
+        "type": "string",
+        "examples": [
+          "group:runners"
+        ]
+      },
+      "Proposal": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A change, as of its head.",
+            "required": [
+              "change"
+            ],
+            "properties": {
+              "change": {
+                "$ref": "#/components/schemas/ChangeId",
+                "description": "A change, as of its head."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Another target, as of its tip.",
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/TargetName",
+                "description": "Another target, as of its tip."
+              }
+            }
+          }
+        ],
+        "description": "What a landing lands."
+      },
+      "RecordId": {
+        "type": "string",
+        "examples": [
+          "revision:48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "RepoName": {
+        "type": "string",
+        "description": "The name of a repository on a server: ASCII letters, digits, `.`, `_`\nand `-`, not starting with `.`.",
+        "example": "origin"
+      },
+      "RepoPath": {
+        "type": "string",
+        "examples": [
+          "src/main.rs"
+        ]
+      },
+      "RepoSummary": {
+        "type": "object",
+        "description": "A repository, as listed by the server.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/RepoName",
+            "description": "The repository's name."
+          }
+        }
+      },
+      "Requirement": {
+        "type": "object",
+        "description": "A statement that landing needs: of `kind`, with `verdict`, from one of\n`issuer`, about what lands.",
+        "required": [
+          "kind",
+          "verdict",
+          "issuer"
+        ],
+        "properties": {
+          "issuer": {
+            "$ref": "#/components/schemas/Principals",
+            "description": "Who may issue it."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Kind",
+            "description": "The statement's kind."
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/Verdict",
+            "description": "Its verdict."
+          }
+        }
+      },
+      "Revision": {
+        "type": "object",
+        "description": "One immutable version of a change.\n\nEditing, rebasing or handing a change to someone else creates a new\nrevision of the same change, whose predecessors are the revisions it\nevolves from.",
+        "required": [
+          "change",
+          "predecessors",
+          "base",
+          "deps",
+          "snapshot",
+          "description",
+          "author"
+        ],
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/Principal",
+            "description": "Who wrote the revision."
+          },
+          "base": {
+            "$ref": "#/components/schemas/Base",
+            "description": "What the revision was made on top of."
+          },
+          "change": {
+            "$ref": "#/components/schemas/ChangeId",
+            "description": "The change this is a version of."
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RevisionId"
+            },
+            "description": "The exact revisions this one requires: the changes below it in a\nstack."
+          },
+          "description": {
+            "$ref": "#/components/schemas/BlobId",
+            "description": "The intent, written for humans and agents."
+          },
+          "predecessors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RevisionId"
+            },
+            "description": "The revisions this one evolves from. Two make it a convergence of\ndivergent heads."
+          },
+          "snapshot": {
+            "$ref": "#/components/schemas/TreeId",
+            "description": "The root tree of the files."
+          }
+        }
+      },
+      "RevisionEntry": {
+        "type": "object",
+        "description": "A revision and its id.",
+        "required": [
+          "id",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RevisionId",
+            "description": "The revision's id."
+          },
+          "revision": {
+            "$ref": "#/components/schemas/Revision",
+            "description": "The revision."
+          }
+        }
+      },
+      "RevisionId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "Revisions": {
+        "type": "object",
+        "description": "The revisions of a change.",
+        "required": [
+          "revisions",
+          "heads"
+        ],
+        "properties": {
+          "heads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RevisionId"
+            },
+            "description": "Those that no other revision of the change evolves from: more than\none is divergence."
+          },
+          "revisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RevisionEntry"
+            },
+            "description": "Every revision, in the order the repository received them."
+          }
+        }
+      },
+      "Source": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A revision of a change.",
+            "required": [
+              "revision"
+            ],
+            "properties": {
+              "revision": {
+                "$ref": "#/components/schemas/RevisionId",
+                "description": "A revision of a change."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Another target, as of one of its acceptances.",
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/AcceptanceId",
+                "description": "Another target, as of one of its acceptances."
+              }
+            }
+          }
+        ],
+        "description": "What an acceptance landed."
+      },
+      "Statement": {
+        "type": "object",
+        "description": "An attributable claim about another record: a check result, a review, a\nconflict, an abandonment.\n\nStatements are permanent. An issuer revises one by issuing another that\nsupersedes it. A promoted statement carries another one over to a record\nwith the same input digest, pointing at it instead of copying its issuer.",
+        "required": [
+          "subject",
+          "kind",
+          "issuer"
+        ],
+        "properties": {
+          "inputs": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Inputs",
+                "description": "What the claim depended on, which lets it be promoted to revisions\nwith the same inputs."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "issuer": {
+            "$ref": "#/components/schemas/Principal",
+            "description": "Who makes the claim."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Kind",
+            "description": "What kind of claim it is."
+          },
+          "payload": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BlobId",
+                "description": "Free-form details, defined by whoever owns the kind."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "promoted_from": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StatementId",
+                "description": "The statement this one promotes: its kind, verdict, inputs and\npayload hold here too, because the input digests are equal. The\nissuer is whoever promoted it, the original's stays on the original."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subject": {
+            "$ref": "#/components/schemas/RecordId",
+            "description": "The record the claim is about."
+          },
+          "supersedes": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StatementId",
+                "description": "A statement from the same issuer that this one replaces."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verdict": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Verdict",
+                "description": "The outcome, the only field core interprets."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "StatementId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "Stored": {
+        "type": "object",
+        "description": "What putting a batch of records did.",
+        "required": [
+          "new"
+        ],
+        "properties": {
+          "new": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of the objects the repository didn't have yet.",
+            "minimum": 0
+          }
+        }
+      },
+      "TargetId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "TargetInfo": {
+        "type": "object",
+        "description": "A target, where it is, and who orders it under the policy in force.",
+        "required": [
+          "name",
+          "head",
+          "requirements"
+        ],
+        "properties": {
+          "authority": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalName",
+                "description": "The node that orders it, if the policy names one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "head": {
+            "$ref": "#/components/schemas/Head",
+            "description": "Its latest acceptance."
+          },
+          "name": {
+            "$ref": "#/components/schemas/TargetName",
+            "description": "The target's name."
+          },
+          "requirements": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            },
+            "description": "The statements landing on it needs."
+          }
+        }
+      },
+      "TargetName": {
+        "type": "string",
+        "examples": [
+          "main"
+        ]
+      },
+      "TreeId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
+      "Verdict": {
+        "type": "string",
+        "examples": [
+          "pass"
+        ]
+      }
+    }
+  }
+}

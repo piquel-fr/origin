@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::time::SystemTime;
 
 use origin_platform::{Native, Platform};
+use origin_shared::api::Annotation;
 use origin_shared::{
     ChangeId, EncodedObject, Kind, ObjectId, Principal, Record, RecordId, RevisionId, Statement,
     StatementId, TreeId,
@@ -40,17 +41,6 @@ use crate::tree::Snapshots;
 pub struct Annotations<'a, P = Native> {
     store: &'a Store<P>,
     index: Index,
-}
-
-/// A statement, and whether its issuer superseded it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Annotation {
-    /// The statement's id.
-    pub id: StatementId,
-    /// The statement.
-    pub statement: Statement,
-    /// The first statement from the same issuer that supersedes it.
-    pub superseded_by: Option<StatementId>,
 }
 
 /// The claim a statement makes, checked: only [`Store::claim`] makes one.
@@ -122,6 +112,22 @@ impl<'a, P: Platform> Annotations<'a, P> {
     #[must_use]
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Gives the index back, for the next to use it.
+    #[must_use]
+    pub fn into_index(self) -> Index {
+        self.index
+    }
+
+    /// Catches the index up with the records written since it was read,
+    /// see [`Index::refresh`].
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Index::refresh`].
+    pub fn refresh(&mut self) -> Result<(), StoreError> {
+        self.index.refresh(self.store)
     }
 
     /// Writes a statement and its payload. Issuing a statement the store

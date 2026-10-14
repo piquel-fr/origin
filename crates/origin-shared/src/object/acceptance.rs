@@ -13,9 +13,14 @@ pub use ed25519_dalek::Signature;
 ///
 /// Acceptances form a hash chain per target: each names the one before it,
 /// and its sequence number is its position in the target's log.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// In JSON, the body's fields and the signature, in hex.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Acceptance {
+    #[serde(flatten)]
     body: AcceptanceBody,
+    #[serde(with = "signature_hex")]
+    #[schema(value_type = String)]
     signature: Signature,
 }
 
@@ -52,7 +57,7 @@ impl Acceptance {
 }
 
 /// An acceptance without its signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct AcceptanceBody {
     /// The target landed on.
     pub target: TargetId,
@@ -104,7 +109,10 @@ impl AcceptanceBody {
 }
 
 /// What an acceptance landed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Source {
     /// A revision of a change.
     Revision(RevisionId),
@@ -124,6 +132,27 @@ impl Field for Signature {
 
     fn read(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         reader.array().map(|bytes| Self::from_bytes(&bytes))
+    }
+}
+
+/// Signatures as lowercase hex, in JSON.
+mod signature_hex {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    use super::{Signature, hex};
+
+    pub fn serialize<S: Serializer>(
+        signature: &Signature,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::string(&signature.to_bytes()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Signature, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        hex::decode::<{ ed25519_dalek::SIGNATURE_LENGTH }>(&text)
+            .map(|bytes| Signature::from_bytes(&bytes))
+            .ok_or_else(|| de::Error::custom(format!("invalid signature `{text}`")))
     }
 }
 

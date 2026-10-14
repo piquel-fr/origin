@@ -28,6 +28,15 @@ doc-test:
 deny:
     @cargo deny check
 
+# Rewrite docs/openapi.json after changing the API. `just test` fails while
+# it is stale.
+openapi:
+    @UPDATE_OPENAPI=1 cargo nextest run --locked --package origin-src --test http openapi
+
+# Serve repositories over HTTP (see `origin serve --help`).
+serve *ARGS:
+    @cargo run --package origin-src --bin origin -- serve {{ARGS}}
+
 # Micro-benchmarks of the hot paths (hashing, storage, snapshots).
 bench *ARGS:
     @cargo bench --locked --workspace -- {{ARGS}}

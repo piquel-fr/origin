@@ -8,12 +8,13 @@ use std::thread;
 use divan::Bencher;
 use divan::counter::ItemsCount;
 use origin_platform::Native;
+use origin_shared::landing::Landing;
 use origin_shared::{
     AcceptanceId, Base, ChangeId, EncodedObject, EntryKind, EntryName, Kind, NodeKey,
     PrincipalName, Record, RecordId, Revision, Statement, TargetName, Tree, TreeEntry, Verdict,
 };
 use origin_src::annotations::Annotations;
-use origin_src::queue::{Landing, Queue};
+use origin_src::queue::Queue;
 use origin_src::store::Store;
 
 fn main() {
@@ -97,7 +98,11 @@ impl Repo {
     }
 
     fn land(&self, change: ChangeId) {
-        let landings = self.queue().land_change(change, &TargetName::MAIN).unwrap();
+        let mut annotations = Annotations::open(&self.store).unwrap();
+        let landings = self
+            .queue()
+            .land_change(&mut annotations, change, &TargetName::MAIN)
+            .unwrap();
         assert!(
             matches!(landings[..], [Landing::Landed { .. }]),
             "{landings:?}"
