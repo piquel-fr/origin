@@ -7,7 +7,7 @@ use std::fmt;
 
 /// The name of an entry in a tree: one path component.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EntryName(String);
+pub struct EntryName(pub(crate) String);
 
 impl EntryName {
     /// Names reserved for repository metadata, compared case-insensitively so
@@ -26,14 +26,21 @@ impl EntryName {
             && name != "."
             && name != ".."
             && !name.contains(['/', '\0'])
-            && !Self::RESERVED
-                .iter()
-                .any(|reserved| name.eq_ignore_ascii_case(reserved));
+            && !Self::is_reserved(&name);
         if valid {
             Ok(Self(name))
         } else {
             Err(InvalidEntryName(name))
         }
+    }
+
+    /// Whether a name belongs to repository metadata, which working copies
+    /// skip and trees cannot contain.
+    #[must_use]
+    pub fn is_reserved(name: &str) -> bool {
+        Self::RESERVED
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
 
     /// The name as a string.
@@ -93,6 +100,17 @@ impl EntryKind {
     }
 }
 
+impl fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Executable => "executable",
+            Self::Symlink => "symlink",
+            Self::Tree => "directory",
+        })
+    }
+}
+
 /// One entry of a tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TreeEntry {
@@ -100,6 +118,20 @@ pub struct TreeEntry {
     pub kind: EntryKind,
     /// The object it points to.
     pub id: ObjectId,
+}
+
+impl TreeEntry {
+    /// The entry, if it is a file (regular, executable or symlink).
+    #[must_use]
+    pub fn file(self) -> Option<Self> {
+        (!self.kind.is_tree()).then_some(self)
+    }
+
+    /// The tree the entry points to, if it is a directory.
+    #[must_use]
+    pub fn subtree(self) -> Option<ObjectId> {
+        self.kind.is_tree().then_some(self.id)
+    }
 }
 
 /// A directory listing, sorted by name.

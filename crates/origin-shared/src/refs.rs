@@ -10,7 +10,8 @@ use crate::ObjectId;
 /// Names are `/`-separated segments of ASCII letters, digits, `.`, `_` and
 /// `-`. No segment is empty or starts with `.`, which keeps names usable as
 /// file paths and git ref names.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct BranchName(String);
 
 impl BranchName {
@@ -42,11 +43,32 @@ impl BranchName {
     }
 }
 
+/// The branch new repositories start on: `main`.
+impl Default for BranchName {
+    fn default() -> Self {
+        Self("main".to_owned())
+    }
+}
+
 impl FromStr for BranchName {
     type Err = InvalidBranchName;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         Self::new(name)
+    }
+}
+
+impl TryFrom<String> for BranchName {
+    type Error = InvalidBranchName;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
+
+impl From<BranchName> for String {
+    fn from(name: BranchName) -> Self {
+        name.0
     }
 }
 
