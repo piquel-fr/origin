@@ -35,6 +35,10 @@ origin land --status                # the landings waiting for evidence or a con
 origin targets                      # every target, its tip, authority and requirements
 origin target new <name> --from <target>
 origin new [description] --on <target>     # start a change on a target's tip
+origin pull                         # follow your change where it went, or onto its target's tip
+
+origin workspace new [--change <change>] [<path>]  # another working copy, sharing the repository
+origin workspace list | rm <path>
 ```
 
 Landing rebases a change onto the target's tip, file by file, checks the
@@ -43,6 +47,20 @@ change), and appends an acceptance signed by your node, which must be the
 target's authority. A landing that conflicts or lacks evidence waits: issue
 the statements, or a new revision, and run `origin land` again. Policy is a
 target too: edit it with `origin new --on policy`, then `origin land`.
+
+Workspaces work like git worktrees: each has its own current change and
+shares the repository's records, so agents can work side by side. A new
+workspace clones its files from the other working copies where the file
+system can (Btrfs, XFS, APFS), and copies them otherwise. Landing moves
+only the working copy of the workspace it runs in, and no other command
+moves your files on its own. When your change lands from another
+workspace, or the landing queue rebases it, `origin status` says so, and
+`origin pull` follows it: onto a new change on the target's tip once it
+landed, or onto the queue's rebase, with your edits since. Until then those
+edits aren't recorded, and the commands that build on the working copy
+refuse. `pull` also rebases the working copy onto its target's tip once it
+moved. Where your edits conflict, both versions are kept between conflict
+markers (see `converge` below).
 
 Changes are named by a unique prefix of their id, or `@` for the working
 copy's. A revision is `@`, a change (for its head), or a unique prefix of

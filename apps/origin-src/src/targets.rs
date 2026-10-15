@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::slice;
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Platform};
-use origin_shared::{Acceptance, AcceptanceId, Record, TargetId, TargetName};
+use origin_shared::{
+    Acceptance, AcceptanceId, Base, Record, Revision, RevisionId, Source, TargetId, TargetName,
+};
 
 use crate::store::{Store, StoreError};
 
@@ -186,10 +188,10 @@ impl<P: Platform> Store<P> {
     /// Fails if the target's files cannot be read or are malformed.
     pub fn acceptance_at(
         &self,
-        target: &TargetName,
+        target: TargetId,
         seq: u64,
     ) -> Result<Option<AcceptanceId>, StoreError> {
-        let files = self.target_files(target.id());
+        let files = self.target_files(target);
         let Some(head) = files.read_head()? else {
             return Ok(None);
         };
@@ -202,6 +204,33 @@ impl<P: Platform> Store<P> {
             .and_then(|log| log.read_exact_at(&mut line, seq * TargetFiles::LINE as u64))
             .map_err(|source| StoreError::io(&path, source))?;
         Ok(files.parse_log(&line)?.first().copied())
+    }
+
+    /// The acceptance that landed `revision`, `id`, if one did. A revision
+    /// only lands on the tip it's based on, so the acceptance after that tip
+    /// tells.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the acceptances or the target's files cannot be read.
+    pub fn landing(
+        &self,
+        id: RevisionId,
+        revision: &Revision,
+    ) -> Result<Option<Acceptance>, StoreError> {
+        let Base::Acceptance(base) = revision.base else {
+            return Ok(None);
+        };
+        let base = self.get(base)?;
+        let Some(next) = self.acceptance_at(base.body().target, base.body().seq + 1)? else {
+            return Ok(None);
+        };
+        let next = self.get(next)?;
+        Ok(next
+            .body()
+            .landed
+            .contains(&Source::Revision(id))
+            .then_some(next))
     }
 
     /// The names of every target, in no particular order.
@@ -391,9 +420,9 @@ mod tests {
         );
         assert_eq!(store.log(&main).unwrap(), ids);
         for (seq, &id) in (0..).zip(&ids) {
-            assert_eq!(store.acceptance_at(&main, seq).unwrap(), Some(id));
+            assert_eq!(store.acceptance_at(main.id(), seq).unwrap(), Some(id));
         }
-        assert_eq!(store.acceptance_at(&main, 3).unwrap(), None);
+        assert_eq!(store.acceptance_at(main.id(), 3).unwrap(), None);
         let last = store.get(ids[2]).unwrap();
         assert_eq!(last.body().prev, Some(ids[1]));
         last.verify(&key().public()).unwrap();
