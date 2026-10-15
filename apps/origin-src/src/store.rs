@@ -19,13 +19,16 @@
 //!
 //! [`Store::compact`] moves small loose objects into [`packs`], and reads
 //! look in the loose objects first, then in the packs.
+//!
+//! Committing a batch also indexes its new records, see
+//! [`index`](crate::index).
 
 use std::fs;
 use std::io;
 use std::num::NonZero;
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -33,6 +36,7 @@ use origin_platform::{DurableWrite, Native, Platform, WritableError};
 use origin_shared::object::{DecodeError, IdMismatch};
 use origin_shared::{EncodedObject, ObjectId, TargetName, TypedId};
 
+use crate::index::Entry;
 use crate::targets::Head;
 
 pub use packs::Compaction;
@@ -135,10 +139,10 @@ impl<P: Platform> Store<P> {
         Ok(())
     }
 
-    /// Creates the directories of an empty store, durably, refusing a
-    /// network file system. Creating every object shard up front means
-    /// batches only ever sync the shards they write to, never a directory
-    /// they had to create.
+    /// Creates the directories of an empty store and its empty index,
+    /// durably, refusing a network file system. Creating every object shard
+    /// up front means batches only ever sync the shards they write to, never
+    /// a directory they had to create.
     ///
     /// # Errors
     ///
@@ -160,7 +164,7 @@ impl<P: Platform> Store<P> {
         for dir in [&loose, &objects, &self.root, parent] {
             self.sync_dir(dir)?;
         }
-        Ok(())
+        self.write_index(&[])
     }
 
     pub(crate) fn sync_dir(&self, dir: &Path) -> Result<(), StoreError> {
@@ -177,6 +181,10 @@ impl<P: Platform> Store<P> {
         self.root.join("targets")
     }
 
+    pub(crate) fn index_dir(&self) -> PathBuf {
+        self.root.join("index")
+    }
+
     fn path(&self, id: ObjectId) -> PathBuf {
         let hex = id.to_hex();
         let mut path = self.loose();
@@ -190,6 +198,7 @@ impl<P: Platform> Store<P> {
         Batch {
             store: self,
             write: self.durable_write(),
+            entries: Mutex::default(),
         }
     }
 
@@ -215,13 +224,16 @@ impl<P: Platform> Store<P> {
         Ok(written)
     }
 
-    /// Runs `f` on `items` split into one chunk per core, returning each
-    /// chunk's result in order.
-    fn on_every_core<T: Sync, R: Send>(items: &[T], f: impl Fn(&[T]) -> R + Sync) -> Vec<R> {
+    /// Splits `items` into a chunk per core, and maps each on its own
+    /// thread, returning each chunk's result in order.
+    pub(crate) fn on_every_core<T: Sync, R: Send>(
+        items: &[T],
+        map: impl Fn(&[T]) -> R + Sync,
+    ) -> Vec<R> {
         // Asking for the cores reads the cgroup's quota, which costs more than
         // handling a lone item, such as writing one object.
         if items.len() <= 1 {
-            return vec![f(items)];
+            return vec![map(items)];
         }
         let threads = thread::available_parallelism()
             .map_or(1, NonZero::get)
@@ -229,7 +241,7 @@ impl<P: Platform> Store<P> {
         thread::scope(|scope| {
             items
                 .chunks(items.len().div_ceil(threads))
-                .map(|chunk| scope.spawn(|| f(chunk)))
+                .map(|chunk| scope.spawn(|| map(chunk)))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|thread| {
@@ -239,6 +251,37 @@ impl<P: Platform> Store<P> {
                 })
                 .collect()
         })
+    }
+
+    /// The id of every object in the store, loose or packed, in no
+    /// particular order.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the store's directories cannot be listed or its packs
+    /// loaded.
+    pub fn ids(&self) -> Result<Vec<ObjectId>, StoreError> {
+        let loose = self.loose();
+        let list = |dir: &Path| {
+            fs::read_dir(dir)
+                .and_then(Iterator::collect::<io::Result<Vec<_>>>)
+                .map_err(|source| StoreError::io(dir, source))
+        };
+        let mut ids = self.packed_ids()?;
+        for shard in list(&loose)? {
+            let prefix = shard.file_name();
+            for object in list(&shard.path())? {
+                // Anything else, such as temporary files, isn't an object.
+                let mut hex = prefix.clone();
+                hex.push(object.file_name());
+                ids.extend(hex.to_str().and_then(|hex| hex.parse::<ObjectId>().ok()));
+            }
+        }
+        // A compaction in progress, or a writer unaware of a pack, leaves
+        // objects both loose and packed.
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Whether the store has the object.
@@ -317,6 +360,8 @@ impl<P: Platform> Store<P> {
 pub struct Batch<'a, P> {
     store: &'a Store<P>,
     write: DurableWrite<'a, P>,
+    /// What the index keeps of each new record staged.
+    entries: Mutex<Vec<Entry>>,
 }
 
 impl<P: Platform> Batch<'_, P> {
@@ -327,9 +372,11 @@ impl<P: Platform> Batch<'_, P> {
     ///
     /// # Errors
     ///
-    /// Fails if the object cannot be compressed or written.
+    /// Fails if the object is a record that doesn't decode, or if it cannot
+    /// be compressed or written.
     pub fn write(&self, object: &EncodedObject) -> Result<bool, StoreError> {
-        let path = self.store.path(object.id());
+        let id = object.id();
+        let path = self.store.path(id);
         if path.exists() {
             // Its writer may not have synced its directory yet, and the
             // batch's objects may refer to it.
@@ -338,14 +385,21 @@ impl<P: Platform> Batch<'_, P> {
             self.write.sync_dir_with(shard);
             return Ok(false);
         }
-        if self.store.packs.find(object.id()).is_some() {
+        if self.store.packs.find(id).is_some() {
             // The manifest naming its pack may not be durable yet.
             self.write.sync_dir_with(self.store.packs_dir());
             return Ok(false);
         }
+        let entry = Entry::of(object).map_err(|source| StoreError::Decode { id, source })?;
         let compressed = zstd::bulk::compress(object.bytes(), Store::<P>::COMPRESSION_LEVEL)
             .map_err(|source| StoreError::io(&path, source))?;
         self.write.stage(path, &compressed)?;
+        if let Some(entry) = entry {
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(entry);
+        }
         Ok(true)
     }
 
@@ -356,14 +410,22 @@ impl<P: Platform> Batch<'_, P> {
         })
     }
 
-    /// Publishes every object staged, durably.
+    /// Publishes every object staged, durably, and adds the new records to
+    /// the [`Index`](crate::index::Index).
     ///
     /// # Errors
     ///
-    /// Fails if an object cannot be renamed into place or a directory
-    /// cannot be synced.
+    /// Fails if an object cannot be renamed into place, a directory cannot
+    /// be synced, or the index cannot be appended to.
     pub fn commit(self) -> Result<(), StoreError> {
-        Ok(self.write.commit()?)
+        let entries = self
+            .entries
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        if entries.is_empty() {
+            return Ok(self.write.commit()?);
+        }
+        self.store.commit_indexed(self.write, &entries)
     }
 }
 

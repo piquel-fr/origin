@@ -1,10 +1,12 @@
-//! Linux: `fdatasync` and `fsync`, `syncfs` for batches, `flock`, clones with
-//! the `FICLONE` ioctl (Btrfs, XFS, bcachefs), `pread`, and file systems told
-//! apart by their `statfs` magic number.
+//! Linux: `fdatasync` and `fsync`, `syncfs` for large batches, `flock`,
+//! clones with the `FICLONE` ioctl (Btrfs, XFS, bcachefs), `pread`, and file
+//! systems told apart by their `statfs` magic number.
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
+use std::panic;
 use std::path::Path;
+use std::thread;
 
 use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, ReadAt};
 
@@ -13,6 +15,10 @@ use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, Read
 pub struct Linux;
 
 impl Linux {
+    /// The most files a batch syncs each on its own, rather than with
+    /// `syncfs`.
+    const SYNC_EACH: usize = 2;
+
     /// The file system has no clone ioctl at all.
     const ENOTTY: i32 = 25;
 
@@ -35,6 +41,12 @@ impl Linux {
         (0x4750_4653, "GPFS"),
     ];
 
+    /// Opens `path` and syncs it with `sync`.
+    fn sync_path(path: &Path, sync: impl FnOnce(&File) -> io::Result<()>) -> Result<(), Error> {
+        let file = File::open(path).map_err(|source| Error::new(Op::Open, path, source))?;
+        sync(&file).map_err(|source| Error::new(Op::Sync, path, source))
+    }
+
     /// Classifies a file system by its magic number. Any file system not
     /// known to be networked is local, except FUSE: sshfs and local disks
     /// served through it share one magic number.
@@ -51,23 +63,38 @@ impl Linux {
 
 impl Durability for Linux {
     /// One `syncfs` of the file system holding the files, which costs about
-    /// as much as two `fdatasync`s however many files there are. A single
-    /// file is synced on its own, which is cheaper.
+    /// as much as two `fdatasync`s however many files there are.
     ///
     /// `syncfs` also waits for every other process's unwritten data on that
-    /// file system, so a busy disk slows it down.
+    /// file system, so a busy disk slows it down. Batches of up to two
+    /// files, such as a record and the index log, sync each on its own
+    /// instead, all at once: a journaling file system commits them together,
+    /// for about the cost of one `fdatasync`.
     fn sync_batch<'f>(&self, files: impl IntoIterator<Item = &'f Path>) -> Result<(), Error> {
-        let mut files = files.into_iter();
-        let Some(path) = files.next() else {
+        let first: Vec<_> = files.into_iter().take(Self::SYNC_EACH + 1).collect();
+        let Some((&one, others)) = first.split_first() else {
             return Ok(());
         };
-        let file = File::open(path).map_err(|source| Error::new(Op::Open, path, source))?;
-        let synced = if files.next().is_none() {
-            self.sync_file(&file)
-        } else {
-            rustix::fs::syncfs(&file).map_err(io::Error::from)
-        };
-        synced.map_err(|source| Error::new(Op::Sync, path, source))
+        if others.len() >= Self::SYNC_EACH {
+            return Self::sync_path(one, |file| {
+                rustix::fs::syncfs(file).map_err(io::Error::from)
+            });
+        }
+        thread::scope(|scope| {
+            let others: Vec<_> = others
+                .iter()
+                .map(|&other| {
+                    scope.spawn(move || Self::sync_path(other, |file| self.sync_file(file)))
+                })
+                .collect();
+            let one = Self::sync_path(one, |file| self.sync_file(file));
+            for other in others {
+                other
+                    .join()
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic))?;
+            }
+            one
+        })
     }
 }
 

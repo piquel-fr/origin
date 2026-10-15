@@ -312,6 +312,17 @@ impl<P: Platform> Store<P> {
         Ok(self.packs.find(id))
     }
 
+    /// The id of every packed object, as of the current manifest.
+    pub(super) fn packed_ids(&self) -> Result<Vec<ObjectId>, StoreError> {
+        self.reload_packs()?;
+        Ok(self
+            .packs
+            .loaded()
+            .iter()
+            .flat_map(|pack| pack.entries().map(|(id, _)| id))
+            .collect())
+    }
+
     /// Loads the manifest's packs, unless they're already loaded.
     fn reload_packs(&self) -> Result<(), StoreError> {
         let dir = self.packs_dir();
