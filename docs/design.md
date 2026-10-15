@@ -63,10 +63,9 @@ struct Statement {
     kind: Kind,                     // namespaced: "ci.test", "review", "core.conflict", ...
     verdict: Option<Verdict>,       // Pass | Fail | Neutral: the only field core interprets
     issuer: Principal,
-    inputs: Option<Inputs>,         // what a check depended on (see promotion)
+    inputs: Option<Inputs>,         // what the claim depended on (see promotion)
     payload: Option<BlobId>,        // free-form, defined by whoever owns the kind
     supersedes: Option<StatementId>,// only a statement from the same issuer
-    expires: Option<Timestamp>,
 }
 
 /// One landing on a target.
@@ -86,8 +85,7 @@ Snapshots (blobs and trees) are the fourth kind and work as they do today.
 
 **Why no global log.** A single ordered log of every operation needs one
 sequencer that offline nodes cannot reach. It breaks partial replication,
-because a filtered log no longer verifies. It also makes a leaked secret
-permanent. Logs per actor fork whenever one key is used on two devices or a
+because a filtered log no longer verifies. Logs per actor fork whenever one key is used on two devices or a
 crashed agent restarts. Unordered records avoid both problems. Writers never
 contend, offline work is free, and a node can hold just the part of the
 repository it needs.
@@ -133,7 +131,6 @@ about kinds beyond a few reserved ones:
 | `core.abandon` | the author | The change was given up; the payload says why. |
 | `core.conflict` | the landing queue | A landing could not rebase; the payload lists the conflicting paths. |
 | `core.divergent` | the index | The change has more than one head. |
-| `core.redact` | the policy authority | A blob must be withheld everywhere (a leaked secret). |
 
 Every other kind (`ci.test`, `review`, `semantic.diff`, `flaky`) belongs to
 whoever issues it. Statements compose: a human can mark a failed `ci.test`
@@ -145,8 +142,12 @@ Rules:
 - **Supersession.** An issuer may only supersede its own statements.
   Statements from different issuers never overwrite each other. A review
   from Alice and one from Bob both stand.
-- **Expiry.** A statement can carry an expiry time, after which it is
-  ignored and can be garbage-collected.
+- **Statements are permanent.** Reviews, check results and conflicts are
+  history, and history is never deleted. Only bulky payloads, such as CI
+  logs and build artifacts, can have a retention period, set per kind in
+  the policy (`[retention] "ci.*" = "90d"`). When it ends the payload is
+  dropped, while the statement itself (subject, kind, verdict, issuer,
+  inputs) stays.
 - **Every statement fires an event** with its subject, kind, verdict and
   issuer (see [Events](#events)).
 
@@ -156,27 +157,31 @@ A statement is always pinned to an exact record. Carrying a check result over
 to a new revision never mutates the result. Instead, Origin issues a new
 statement that points at the original.
 
-A check declares what it depends on:
+A statement can declare what it depended on:
 
 ```rust
 struct Inputs {
     paths: Vec<Glob>,      // e.g. ["src/**", "Cargo.toml", "Cargo.lock"]
     definition: Digest,    // the check's command and configuration
     toolchain: Digest,     // e.g. the hash of `rustc -V` output
+    external: bool,        // also depended on things outside the snapshot
 }
 ```
 
 The input digest is the hash of the matching subtrees of the snapshot, plus
-`definition` and `toolchain`. When a new revision's input digest equals the
-digest of an existing result, the result is promoted automatically.
+`definition` and `toolchain`. A statement is **promotable** when it declares
+inputs and `external` is false. When a new revision's input digest equals
+the digest of an existing promotable result, the result is promoted
+automatically.
 
 So a docs-only change keeps its `lint` and `build` results, because neither
 reads `docs/**`. `docs-test` runs again, because it does read `docs/**`. Nobody
 writes rules about which changes are "docs-only".
 
-Promotion is only as safe as the declared inputs. A check that might read
-files it can't list (the network, the environment) declares no inputs, and
-then it always runs again. Human reviews don't declare inputs, so they never promote
+Promotion is only as safe as the declared inputs. A check that also reads
+the network or the environment still declares its paths, which remain
+useful information, but sets `external`. It then runs again on every
+revision. Human reviews usually declare no inputs, so they never promote
 automatically.
 
 ## Targets and policy
@@ -305,6 +310,11 @@ toolchain = "rustc -V"
 command   = "cargo test --doc"
 inputs    = ["src/**", "docs/**"]
 toolchain = "rustc -V"
+
+[checks.links]
+command  = "lychee docs"
+inputs   = ["docs/**"]
+external = true          # reads the network: never promoted
 ```
 
 ## Permissions and credentials
@@ -326,6 +336,10 @@ Static tokens in the server configuration keep working.
 `origin token issue --scope ... --ttl ...` issues short-lived tokens with
 narrower scopes for agents and CI runners. A typical agent token carries
 `write src/**` and nothing else.
+
+Origin has no way to erase content from history. A secret that leaks into a
+revision is rotated. Once anyone has fetched it, deleting it would change
+nothing.
 
 ## Signing
 
@@ -415,7 +429,7 @@ origin edit <change>                # switch the working copy
 origin status | diff | log | evolog <change>
 origin converge <change>            # resolve divergence
 origin abandon --reason "..."       # record a failed approach
-origin annotate <rev> <kind> --pass|--fail|--neutral [--inputs ...] [--payload f]
+origin annotate <rev> <kind> --pass|--fail|--neutral [--inputs ...] [--external] [--payload f]
 origin statements <rev>
 origin target new <name> --from <target>
 origin land [<change>] [--onto <target>]
