@@ -20,7 +20,7 @@ use origin_shared::{InvalidName, NodeKey, Principal, PrincipalName};
 use serde::Deserialize;
 
 /// The user's configuration.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UserConfig {
     dir: PathBuf,
     user: PrincipalName,

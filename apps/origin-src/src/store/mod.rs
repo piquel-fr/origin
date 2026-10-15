@@ -169,6 +169,12 @@ impl<P: Platform> Store<P> {
         self.write_index(&[], &[])
     }
 
+    /// The directory holding the store: a repository's `.origin`.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn sync_dir(&self, dir: &Path) -> Result<(), StoreError> {
         self.platform
             .sync_dir(dir)
