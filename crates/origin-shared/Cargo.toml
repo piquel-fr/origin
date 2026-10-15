@@ -8,6 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "object"
+harness = false
 
 [lints]
 workspace = true
