@@ -28,6 +28,12 @@ doc-test:
 deny:
     @cargo deny check
 
-# Micro-benchmarks of the hot paths (hashing, storage).
+# Micro-benchmarks of the hot paths (hashing, storage, snapshots).
 bench *ARGS:
     @cargo bench --locked --workspace -- {{ARGS}}
+
+# Times origin against git with hyperfine, which must be installed, and
+# rewrites docs/benchmarks.md.
+# Pass `--tree PATH` to benchmark a copy of a real working tree.
+bench-git *ARGS:
+    @cargo xtask bench-git {{ARGS}}
