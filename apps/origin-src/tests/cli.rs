@@ -1,4 +1,5 @@
-//! End-to-end tests of the change workflow, driving the real `origin` binary.
+//! End-to-end tests of the change workflow and workspaces, driving the real
+//! `origin` binary.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -35,7 +36,12 @@ impl Repo {
 
     /// Runs a command that must succeed, returning its output.
     fn ok(&self, args: &[&str]) -> String {
-        let output = self.run(self.dir.path(), args);
+        self.ok_in(self.dir.path(), args)
+    }
+
+    /// Runs a command in `cwd` that must succeed, returning its output.
+    fn ok_in(&self, cwd: &Path, args: &[&str]) -> String {
+        let output = self.run(cwd, args);
         assert!(
             output.status.success(),
             "`origin {}` failed: {}",
@@ -74,6 +80,15 @@ impl Repo {
     fn change(&self) -> String {
         let status = self.ok(&["status"]);
         let line = status.lines().next().unwrap();
+        let headline = line.strip_prefix("Working copy: ").unwrap();
+        headline.split(' ').next().unwrap().to_owned()
+    }
+
+    /// Creates a workspace at `path`, returning its change.
+    fn workspace(&self, path: &Path, args: &[&str]) -> String {
+        let path = path.to_str().unwrap();
+        let output = self.ok(&[&["workspace", "new", path], args].concat());
+        let line = output.lines().nth(1).unwrap();
         let headline = line.strip_prefix("Working copy: ").unwrap();
         headline.split(' ').next().unwrap().to_owned()
     }
@@ -461,6 +476,85 @@ fn statements_are_promoted_where_their_inputs_are_unchanged() {
 }
 
 #[test]
+fn workspaces_share_the_repository_with_changes_of_their_own() {
+    let repo = Repo::new();
+    repo.write("shared", "base\n");
+    repo.write("dir/run.sh", "#!/bin/sh\n");
+    fs::set_permissions(repo.path("dir/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    repo.ok(&["describe", "Base"]);
+    repo.ok(&["new", "Main work"]);
+    let others = tempfile::tempdir().unwrap();
+    let ws = others.path().join("ws");
+
+    // A new change beside the working copy's, on the same base.
+    let change = repo.workspace(&ws, &[]);
+    assert_eq!(fs::read_to_string(ws.join("shared")).unwrap(), "base\n");
+    let mode = fs::metadata(ws.join("dir/run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "still executable");
+    fs::write(ws.join("shared"), "agent\n").unwrap();
+    repo.ok_in(&ws.join("dir"), &["describe", "Agent work"]);
+    let status = repo.ok_in(&ws, &["status"]);
+    assert!(
+        status.starts_with(&format!("Working copy: {change} Agent work\nOn top of: ")),
+        "{status}"
+    );
+    assert!(status.ends_with("M shared\n"), "{status}");
+
+    // Main sees the workspace's records, and keeps its own files.
+    assert_eq!(repo.read("shared"), "base\n");
+    assert!(repo.ok(&["show", &change]).contains("+agent\n"));
+    let list = repo.ok(&["workspace", "list"]);
+    let lines: Vec<_> = list.lines().collect();
+    assert_eq!(lines.len(), 2, "{list}");
+    assert!(lines[0].starts_with("@ ") && lines[0].ends_with(" Main work"));
+    assert!(lines[1].starts_with("  ") && lines[1].ends_with(" Agent work"));
+
+    // Another workspace on the same change.
+    let same = others.path().join("same");
+    assert_eq!(repo.workspace(&same, &["--change", &change]), change);
+    assert_eq!(fs::read_to_string(same.join("shared")).unwrap(), "agent\n");
+}
+
+#[test]
+fn removing_a_workspace_keeps_its_work() {
+    let repo = Repo::new();
+    let others = tempfile::tempdir().unwrap();
+    let ws = others.path().join("ws");
+    let change = repo.workspace(&ws, &[]);
+    fs::write(ws.join("unsaved"), "not snapshotted yet\n").unwrap();
+
+    let removed = repo.ok(&["workspace", "rm", ws.to_str().unwrap()]);
+    assert!(removed.starts_with(&format!("Kept its working copy: {change} ")));
+    assert!(!ws.exists());
+    assert_eq!(repo.ok(&["workspace", "list"]).lines().count(), 1);
+    assert!(
+        repo.ok(&["show", &change])
+            .contains("+not snapshotted yet\n")
+    );
+
+    assert!(
+        repo.fails(&["workspace", "rm", "."])
+            .contains("is the main working copy")
+    );
+    assert!(
+        repo.fails(&["workspace", "rm", ws.to_str().unwrap()])
+            .contains("is not a workspace of this repository")
+    );
+    assert!(
+        repo.fails(&["workspace", "new", "nested"])
+            .contains("is inside a working copy")
+    );
+    fs::write(others.path().join("file"), "").unwrap();
+    assert!(
+        repo.fails(&["workspace", "new", others.path().to_str().unwrap()])
+            .contains("is not empty")
+    );
+}
+
+#[test]
 fn landing_moves_the_working_copy_onto_the_target() {
     let repo = Repo::new();
     repo.write("a", "a\n");
@@ -650,4 +744,145 @@ fn converge_merges_the_files_of_every_head() {
     for path in ["a", "b", "c"] {
         assert_eq!(repo.read(path), "changed\n", "{path}");
     }
+}
+
+#[test]
+fn commands_in_different_workspaces_run_concurrently() {
+    const WORKSPACES: usize = 4;
+    const EDITS: usize = 5;
+    let repo = Repo::new();
+    let others = tempfile::tempdir().unwrap();
+    let workspaces: Vec<_> = (0..WORKSPACES)
+        .map(|i| {
+            let root = others.path().join(format!("ws{i}"));
+            let change = repo.workspace(&root, &[]);
+            (root, change)
+        })
+        .collect();
+
+    std::thread::scope(|scope| {
+        for (root, _) in &workspaces {
+            let repo = &repo;
+            scope.spawn(move || {
+                for edit in 0..EDITS {
+                    fs::write(root.join("file"), edit.to_string()).unwrap();
+                    repo.ok_in(root, &["status"]);
+                }
+            });
+        }
+    });
+
+    // Each change has its first revision, then one per edit, whichever
+    // order the index received them in.
+    let revisions = |change: &str| repo.ok(&["evolog", change]).lines().count() - 1;
+    for (_, change) in &workspaces {
+        assert_eq!(revisions(change), 1 + EDITS);
+    }
+    repo.ok(&["index", "rebuild"]);
+    for (_, change) in &workspaces {
+        assert_eq!(revisions(change), 1 + EDITS);
+    }
+}
+
+#[test]
+fn workspaces_land_their_own_changes() {
+    let repo = Repo::new();
+    repo.write("unlanded", "main's own work\n");
+    let others = tempfile::tempdir().unwrap();
+    let (one, two) = (others.path().join("one"), others.path().join("two"));
+    let first = repo.workspace(&one, &[]);
+    let second = repo.workspace(&two, &[]);
+    fs::write(one.join("a"), "a\n").unwrap();
+    fs::write(two.join("b"), "b\n").unwrap();
+
+    let land = repo.ok_in(&one, &["land"]);
+    assert!(
+        land.starts_with(&format!("Landed change {first}, revision ")),
+        "{land}"
+    );
+    assert!(land.contains(" on main #1\nWorking copy: "), "{land}");
+    // Made on main #0, the second change lands rebased onto main #1: a new
+    // revision of it, by the queue.
+    let land = repo.ok_in(&two, &["land"]);
+    assert!(land.contains(" on main #2\nWorking copy: "), "{land}");
+    assert!(repo.ok(&["show", &first]).contains(" by user:ada\n"));
+    assert!(repo.ok(&["show", &second]).contains(" by node:ada\n"));
+
+    // Each landing moved its own workspace onto the tip it made.
+    let status = repo.ok_in(&two, &["status"]);
+    assert!(
+        status.ends_with("On top of: main #2\nNo changes.\n"),
+        "{status}"
+    );
+    assert_eq!(fs::read_to_string(two.join("a")).unwrap(), "a\n");
+    let status = repo.ok_in(&one, &["status"]);
+    assert!(
+        status.ends_with("On top of: main #1\nNo changes.\n"),
+        "{status}"
+    );
+    assert!(!one.join("b").exists());
+    // The main working copy's change didn't land, so it stays.
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.ends_with("On top of: main #0\nA unlanded\n"),
+        "{status}"
+    );
+    assert!(!repo.path("a").exists());
+}
+
+#[test]
+fn a_workspace_follows_its_change_once_it_lands_elsewhere() {
+    let repo = Repo::new();
+    repo.write("shared", "base\n");
+    repo.ok(&["describe", "Shared"]);
+    let change = repo.change();
+    let others = tempfile::tempdir().unwrap();
+    let (clean, conflicting) = (
+        others.path().join("clean"),
+        others.path().join("conflicting"),
+    );
+    repo.workspace(&clean, &["--change", &change]);
+    repo.workspace(&conflicting, &["--change", &change]);
+    let pointer = clean.join(".origin/workspace");
+    let before = fs::read_to_string(&pointer).unwrap();
+
+    // The change lands from the main working copy, then main moves on.
+    assert!(repo.ok(&["land"]).contains(" on main #1\n"));
+    repo.write("shared", "main\n");
+    assert!(repo.ok(&["land"]).contains(" on main #2\n"));
+    assert_eq!(fs::read_to_string(&pointer).unwrap(), before, "left alone");
+
+    // Its next command starts a new change on the tip, with its edits.
+    fs::write(clean.join("notes"), "mine\n").unwrap();
+    let status = repo.ok_in(&clean, &["status"]);
+    assert!(
+        status.starts_with(&format!(
+            "Change {change} landed on main #1\nWorking copy: "
+        )),
+        "{status}"
+    );
+    assert!(
+        status.ends_with("On top of: main #2\nA notes\n"),
+        "{status}"
+    );
+    assert_eq!(fs::read_to_string(clean.join("shared")).unwrap(), "main\n");
+
+    // Edits that conflict with the tip stay a revision of the change.
+    fs::write(conflicting.join("shared"), "mine\n").unwrap();
+    let status = repo.ok_in(&conflicting, &["status"]);
+    assert!(
+        status.contains(
+            "The working copy stays on it: its edits conflict with `main` in shared\n\
+             Working copy: "
+        ),
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!("Working copy: {change} Shared\n")),
+        "{status}"
+    );
+    assert_eq!(
+        fs::read_to_string(conflicting.join("shared")).unwrap(),
+        "mine\n"
+    );
 }

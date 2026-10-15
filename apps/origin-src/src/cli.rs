@@ -126,6 +126,9 @@ enum WorkspaceCommand {
     Target(TargetCommand),
     /// List the targets, with their tips, authorities and requirements.
     Targets,
+    /// Manage workspaces: working copies sharing this repository.
+    #[command(subcommand)]
+    Workspace(WorkspacesCommand),
 }
 
 #[derive(Debug, Args)]
@@ -244,6 +247,26 @@ enum IndexCommand {
     Rebuild,
 }
 
+#[derive(Debug, Subcommand)]
+enum WorkspacesCommand {
+    /// Create a workspace, with a new change beside the working copy's.
+    New {
+        /// Check out this change's head instead.
+        #[arg(long)]
+        change: Option<String>,
+        /// Where: by default beside the main working copy, named after the
+        /// change.
+        path: Option<PathBuf>,
+    },
+    /// List the workspaces and their changes.
+    List,
+    /// Remove a workspace, keeping its work as a revision of its change.
+    Rm {
+        /// The workspace.
+        path: PathBuf,
+    },
+}
+
 impl Cli {
     /// Runs the command, printing its output.
     ///
@@ -300,6 +323,11 @@ impl WorkspaceCommand {
                 workspace.target_new(&name, &from)?;
             }
             Self::Targets => workspace.targets()?,
+            Self::Workspace(WorkspacesCommand::New { change, path }) => {
+                workspace.add_workspace(change.as_deref(), path.as_deref())?;
+            }
+            Self::Workspace(WorkspacesCommand::List) => workspace.list_workspaces()?,
+            Self::Workspace(WorkspacesCommand::Rm { path }) => workspace.remove_workspace(&path)?,
         }
         Ok(())
     }

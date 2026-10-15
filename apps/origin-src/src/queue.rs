@@ -466,7 +466,8 @@ impl<P: Platform> Session<'_, '_, P> {
                 }
             };
             let revision: Revision = self.store().get(head)?;
-            if self.has_landed(head, &revision)? {
+            let landing = self.store().landing(head, &revision)?;
+            if landing.is_some_and(|landing| landing.body().target == self.onto.id()) {
                 break;
             }
             let claims = self.annotations.claims(RecordId::Revision(head))?;
@@ -489,30 +490,6 @@ impl<P: Platform> Session<'_, '_, P> {
         }
         stack.reverse();
         Ok(stack)
-    }
-
-    /// Whether `revision`, `id`, landed on the target. A revision only lands
-    /// on the tip it's based on, so the acceptance after that tip tells.
-    fn has_landed(&self, id: RevisionId, revision: &Revision) -> Result<bool, StoreError> {
-        let Base::Acceptance(base) = revision.base else {
-            return Ok(false);
-        };
-        let base = self.store().get(base)?;
-        if base.body().target != self.onto.id() {
-            return Ok(false);
-        }
-        let Some(next) = self
-            .store()
-            .acceptance_at(&self.onto, base.body().seq + 1)?
-        else {
-            return Ok(false);
-        };
-        Ok(self
-            .store()
-            .get(next)?
-            .body()
-            .landed
-            .contains(&Source::Revision(id)))
     }
 
     /// Rebases the revision `id` onto the tip and lands it, as part of the
