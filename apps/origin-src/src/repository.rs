@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! <repository>/
-//!   repo.toml   metadata: the description
+//!   repo.toml   the description and permissions
 //!   branches    branches (see `RefStore`)
 //!   objects/    objects (see `ObjectStore`)
 //! ```
@@ -13,11 +13,16 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use origin_shared::access::Permissions;
 use serde::{Deserialize, Serialize};
 
 use crate::refs::RefStore;
 use crate::store::ObjectStore;
+
+/// Distinguishes temporary configuration files written concurrently.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A repository on disk.
 #[derive(Debug)]
@@ -33,6 +38,9 @@ pub struct RepoConfig {
     /// What the repository holds.
     #[serde(default)]
     pub description: String,
+    /// Who may read and write what (see [`Permissions`]).
+    #[serde(default, skip_serializing_if = "Permissions::is_empty")]
+    pub permissions: Permissions,
 }
 
 impl Repository {
@@ -58,11 +66,37 @@ impl Repository {
         if fs::read_dir(root).map_err(io_error)?.next().is_some() {
             return Err(RepositoryError::NotEmpty(root.to_owned()));
         }
-        let content = toml::to_string(config).expect("the config serializes to TOML");
-        let path = root.join(Self::CONFIG);
-        fs::write(&path, content).map_err(|source| RepositoryError::Io { path, source })?;
+        Self::write_config(root, config)?;
         println!("Created a repository in {}", root.display());
         Self::open(root)
+    }
+
+    /// Replaces `repo.toml` atomically.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration cannot be represented as TOML, which its
+    /// fields rule out.
+    pub fn save_config(&self, config: &RepoConfig) -> Result<(), RepositoryError> {
+        Self::write_config(&self.root, config)
+    }
+
+    fn write_config(root: &Path, config: &RepoConfig) -> Result<(), RepositoryError> {
+        let content = toml::to_string(config).expect("the config serializes to TOML");
+        let path = root.join(Self::CONFIG);
+        // Unique per writer, so concurrent saves never share a file.
+        let temp = root.join(format!(
+            ".repo.toml.{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&temp, content)
+            .and_then(|()| fs::rename(&temp, &path))
+            .map_err(|source| RepositoryError::Io { path, source })
     }
 
     /// Opens the repository in `root`.

@@ -1,9 +1,9 @@
 //! Navigating and comparing trees.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use origin_shared::{EntryKind, EntryName, ObjectId, RepoPath, Tree, TreeEntry};
+use origin_shared::{EntryKind, EntryName, Object, ObjectId, RepoPath, Tree, TreeEntry};
 
 use crate::store::{ObjectStore, StoreError};
 
@@ -72,6 +72,73 @@ pub trait TreeSource {
             id: new,
         };
         self.visit_changes(&RepoPath::root(), root, old, visit)
+    }
+
+    /// Lists the files that differ between two trees, sorted by path.
+    /// `None` stands for an empty tree. Subtrees with equal ids are skipped
+    /// without being read, so the cost follows the size of the change.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree that differs cannot be read.
+    fn diff(
+        &self,
+        old: Option<ObjectId>,
+        new: Option<ObjectId>,
+    ) -> Result<Vec<Change>, Self::Error> {
+        let mut changes = Vec::new();
+        self.diff_dir(&RepoPath::root(), old, new, &mut changes)?;
+        Ok(changes)
+    }
+
+    #[doc(hidden)]
+    fn diff_dir(
+        &self,
+        dir: &RepoPath,
+        old: Option<ObjectId>,
+        new: Option<ObjectId>,
+        changes: &mut Vec<Change>,
+    ) -> Result<(), Self::Error> {
+        if old == new {
+            return Ok(());
+        }
+        let read = |id: Option<ObjectId>| id.map(|id| self.read_tree(id)).transpose();
+        let (old, new) = (
+            read(old)?.unwrap_or_default(),
+            read(new)?.unwrap_or_default(),
+        );
+        let mut names: Vec<&EntryName> =
+            old.iter().chain(new.iter()).map(|(name, _)| name).collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            let (old, new) = (
+                old.get(name.as_str()).copied(),
+                new.get(name.as_str()).copied(),
+            );
+            if old == new {
+                continue;
+            }
+            let path = dir.join(name);
+            // A name can hold a file on one side and a directory on the
+            // other: the file part is a change, the directory part is
+            // diffed against an empty tree.
+            let old_file = old.and_then(TreeEntry::file);
+            let new_file = new.and_then(TreeEntry::file);
+
+            if old_file.is_some() || new_file.is_some() {
+                changes.push(Change {
+                    path: path.clone(),
+                    old: old_file,
+                    new: new_file,
+                });
+            }
+
+            let old_tree = old.and_then(TreeEntry::subtree);
+            let new_tree = new.and_then(TreeEntry::subtree);
+            self.diff_dir(&path, old_tree, new_tree, changes)?;
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -149,78 +216,66 @@ impl TreeSource for CachedTrees<'_> {
 }
 
 impl ObjectStore {
-    /// Lists the files that differ between two trees, sorted by path.
-    /// `None` stands for an empty tree. Subtrees with equal ids are skipped
-    /// without being read, so the cost follows the size of the change.
+    /// Inserts `entries` into the tree `root` where nothing is at their
+    /// path, and returns the new root. Snapshots use it to keep files the
+    /// working copy cannot have, like withheld ones.
     ///
     /// # Errors
     ///
-    /// Fails if a tree that differs cannot be read.
-    pub fn diff(
+    /// Fails if a tree along a path cannot be read or written.
+    pub fn overlay(
         &self,
-        old: Option<ObjectId>,
-        new: Option<ObjectId>,
-    ) -> Result<Vec<Change>, StoreError> {
-        let mut changes = Vec::new();
-        self.diff_dir(&RepoPath::root(), old, new, &mut changes)?;
-        Ok(changes)
+        root: ObjectId,
+        entries: &[(RepoPath, TreeEntry)],
+    ) -> Result<ObjectId, StoreError> {
+        let mut tree = self.tree(root)?;
+        let mut changed = false;
+        let mut nested: BTreeMap<EntryName, Vec<(RepoPath, TreeEntry)>> = BTreeMap::new();
+        for (path, entry) in entries {
+            let Some((first, rest)) = path.split_first() else {
+                continue;
+            };
+            if !rest.is_root() {
+                nested.entry(first).or_default().push((rest, *entry));
+            } else if tree.get(first.as_str()).is_none() {
+                tree.insert(first, *entry);
+                changed = true;
+            }
+        }
+        for (name, entries) in nested {
+            let child = match tree.get(name.as_str()) {
+                Some(child) if child.kind.is_tree() => child.id,
+                Some(_) => continue,
+                None => self.write_tree(Tree::default())?,
+            };
+            let id = self.overlay(child, &entries)?;
+            if id != child {
+                tree.insert(
+                    name,
+                    TreeEntry {
+                        kind: EntryKind::Tree,
+                        id,
+                    },
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(root);
+        }
+        self.write_tree(tree)
     }
 
-    fn diff_dir(
-        &self,
-        dir: &RepoPath,
-        old: Option<ObjectId>,
-        new: Option<ObjectId>,
-        changes: &mut Vec<Change>,
-    ) -> Result<(), StoreError> {
-        if old == new {
-            return Ok(());
-        }
-        let read = |id: Option<ObjectId>| id.map(|id| self.tree(id)).transpose();
-        let (old, new) = (
-            read(old)?.unwrap_or_default(),
-            read(new)?.unwrap_or_default(),
-        );
-        let mut names: Vec<&EntryName> =
-            old.iter().chain(new.iter()).map(|(name, _)| name).collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            let (old, new) = (
-                old.get(name.as_str()).copied(),
-                new.get(name.as_str()).copied(),
-            );
-            if old == new {
-                continue;
-            }
-            let path = dir.join(name);
-            // A name can hold a file on one side and a directory on the
-            // other: the file part is a change, the directory part is
-            // diffed against an empty tree.
-            let old_file = old.and_then(TreeEntry::file);
-            let new_file = new.and_then(TreeEntry::file);
-
-            if old_file.is_some() || new_file.is_some() {
-                changes.push(Change {
-                    path: path.clone(),
-                    old: old_file,
-                    new: new_file,
-                });
-            }
-
-            let old_tree = old.and_then(TreeEntry::subtree);
-            let new_tree = new.and_then(TreeEntry::subtree);
-            self.diff_dir(&path, old_tree, new_tree, changes)?;
-        }
-        Ok(())
+    fn write_tree(&self, tree: Tree) -> Result<ObjectId, StoreError> {
+        let encoded = Object::Tree(tree).encode();
+        self.write(&encoded)?;
+        Ok(encoded.id())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use origin_shared::{EncodedObject, Object};
+    use origin_shared::EncodedObject;
 
     use super::*;
 
@@ -387,6 +442,39 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 7, "every object of a tree without a parent is new");
+    }
+
+    #[test]
+    fn overlays_fill_only_empty_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        let root = build(&store, &[("kept", "mine"), ("src/lib.rs", "lib")]);
+        let overlaid = store
+            .overlay(
+                root,
+                &[
+                    (path("kept"), file("theirs")),
+                    (path("src/secret.rs"), file("secret")),
+                    (path("new/deep/file"), file("deep")),
+                ],
+            )
+            .unwrap();
+        let expected = build(
+            &store,
+            &[
+                ("kept", "mine"),
+                ("src/lib.rs", "lib"),
+                ("src/secret.rs", "secret"),
+                ("new/deep/file", "deep"),
+            ],
+        );
+        assert_eq!(overlaid, expected);
+        assert_eq!(
+            store
+                .overlay(root, &[(path("kept"), file("theirs"))])
+                .unwrap(),
+            root
+        );
     }
 
     #[test]

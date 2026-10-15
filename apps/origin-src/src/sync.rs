@@ -3,6 +3,10 @@
 //! Workspaces fetch lazily: a clone downloads one branch's latest commit and
 //! the files it checks out, not the history. Older commits are fetched when
 //! something, like `origin log`, needs them.
+//!
+//! Every sync also records what the remote lets the user do, so commits
+//! touching files the user may not write fail right away instead of at push
+//! time, and which files the remote withheld.
 
 use std::collections::HashSet;
 use std::fs;
@@ -66,7 +70,12 @@ impl<'a> Sync<'a> {
         Ok(Self { workspace, remote })
     }
 
-    fn remote(&self) -> Result<&Remote, SyncError> {
+    /// The remote.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the workspace has no remote.
+    pub fn remote(&self) -> Result<&Remote, SyncError> {
         self.remote.as_ref().ok_or(SyncError::NoRemote)
     }
 
@@ -108,8 +117,7 @@ impl<'a> Sync<'a> {
                 remote: Some(remote),
             };
             let tree = sync.commit(head).await?.tree;
-            sync.fetch_tree(head, tree, None).await?;
-            workspace.checkout(None, tree)?;
+            sync.update(head, None, tree).await?;
             workspace.move_head(None, head)?;
             workspace.set_tracking(None, head)?;
         }
@@ -132,6 +140,9 @@ impl<'a> Sync<'a> {
             if tracking != head {
                 self.workspace.set_tracking(tracking, remote_head)?;
             }
+            // Access may have changed even if the branch did not.
+            let tree = self.commit(remote_head).await?.tree;
+            self.update(remote_head, Some(tree), tree).await?;
             return Ok(Pulled::UpToDate);
         }
         if head != tracking {
@@ -147,13 +158,7 @@ impl<'a> Sync<'a> {
         }
         let old_tree = self.workspace.head_tree(head)?;
         let new_tree = self.commit(remote_head).await?.tree;
-        self.fetch_tree(remote_head, new_tree, old_tree).await?;
-        let files = self
-            .workspace
-            .objects()
-            .diff(old_tree, Some(new_tree))?
-            .len();
-        self.workspace.checkout(old_tree, new_tree)?;
+        let files = self.update(remote_head, old_tree, new_tree).await?;
         self.workspace.move_head(head, remote_head)?;
         self.workspace.set_tracking(tracking, remote_head)?;
         Ok(Pulled::FastForwarded {
@@ -206,7 +211,53 @@ impl<'a> Sync<'a> {
             })
             .await?;
         self.workspace.set_tracking(tracking, head)?;
+        self.workspace.set_access(remote.access().await?.as_ref())?;
         Ok(Pushed::Pushed { to: head, commits })
+    }
+
+    /// Moves the working copy from the tree `old` to the tree `new` of
+    /// `commit`, fetching what it needs, and refreshes what the user may do.
+    /// Returns how many files changed.
+    async fn update(
+        &self,
+        commit: ObjectId,
+        old: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<usize, SyncError> {
+        let store = self.workspace.objects();
+        let mut withheld = self.fetch_tree(commit, new, old).await?;
+        // Files withheld before and unchanged since are asked for again, in
+        // case the user may read them now.
+        let mut unchanged = Vec::new();
+        for (path, entry) in self.workspace.withheld()? {
+            if store.resolve(new, &path)? == Some(entry) {
+                unchanged.push((path, entry));
+            }
+        }
+        let mut restored = Vec::new();
+        if !unchanged.is_empty() {
+            let paths = unchanged.iter().map(|(path, _)| path.clone()).collect();
+            let pack = self
+                .remote()?
+                .objects(&ObjectsRequest { commit, paths })
+                .await?;
+            par_map(&pack.objects, |object| store.write(object))?;
+            for (path, entry) in unchanged {
+                if store.contains(entry.id) {
+                    restored.push((path, entry));
+                } else {
+                    withheld.push((path, entry));
+                }
+            }
+        }
+        self.workspace
+            .set_access(self.remote()?.access().await?.as_ref())?;
+        let files = store.diff(old, Some(new))?.len() + restored.len();
+        // Only recorded once the working copy matches it, so a failed
+        // checkout is retried in full by the next pull.
+        self.workspace.checkout(old, new, &withheld, &restored)?;
+        self.workspace.set_withheld(&withheld)?;
+        Ok(files)
     }
 
     /// Reads a commit, fetching it and a page of its ancestors from the
@@ -255,30 +306,40 @@ impl<'a> Sync<'a> {
     }
 
     /// Fetches the objects the tree `new` of `commit` adds to the tree
-    /// `old`, which must be complete locally. Each request fetches one depth
-    /// of the tree, so a fetch takes as many round trips as the tree is deep.
+    /// `old`, which must be complete locally, and returns the files the
+    /// remote withheld. Each request fetches one depth of the tree, so a
+    /// fetch takes as many round trips as the tree is deep.
     async fn fetch_tree(
         &self,
         commit: ObjectId,
         new: ObjectId,
         old: Option<ObjectId>,
-    ) -> Result<(), SyncError> {
+    ) -> Result<Vec<(RepoPath, TreeEntry)>, SyncError> {
         let store = self.workspace.objects();
         let root = TreeEntry {
             kind: EntryKind::Tree,
             id: new,
         };
         let mut depth = vec![(RepoPath::root(), root, old)];
+        let mut withheld = Vec::new();
         while !depth.is_empty() {
-            let paths: Vec<RepoPath> = depth
+            let missing: Vec<&(RepoPath, TreeEntry, Option<ObjectId>)> = depth
                 .iter()
                 .filter(|(_, entry, _)| !store.contains(entry.id))
-                .map(|(path, ..)| path.clone())
                 .collect();
-            if !paths.is_empty() {
+            if !missing.is_empty() {
+                let paths = missing.iter().map(|(path, ..)| path.clone()).collect();
                 let request = ObjectsRequest { commit, paths };
                 let pack = self.remote()?.objects(&request).await?;
                 par_map(&pack.objects, |object| store.write(object))?;
+                // A file is withheld only if its content did not arrive: the
+                // same content may be readable at another path.
+                withheld.extend(
+                    missing
+                        .iter()
+                        .filter(|(_, entry, _)| !store.contains(entry.id))
+                        .map(|(path, entry, _)| (path.clone(), *entry)),
+                );
             }
             let mut next = Vec::new();
             for (path, entry, old) in depth {
@@ -302,7 +363,7 @@ impl<'a> Sync<'a> {
             }
             depth = next;
         }
-        Ok(())
+        Ok(withheld)
     }
 }
 

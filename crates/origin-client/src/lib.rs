@@ -18,6 +18,7 @@
 //! the two cannot disagree on a contract. The server also describes its API
 //! in `docs/openapi.json`, for other languages.
 
+use origin_shared::access::{Permissions, Whoami};
 use origin_shared::api::{
     ApiError, CommitsRequest, ListedEntry, Location, ObjectsRequest, RepoInfo, RepoName,
     RepoSummary,
@@ -54,7 +55,9 @@ macro_rules! endpoints {
 
 endpoints! {
     impl Client {
-        /// Lists the repositories on the server.
+        /// Who the server thinks the caller is.
+        fn whoami() -> Whoami = GET "whoami" => json;
+        /// Lists the repositories on the server the caller may see.
         fn repos() -> Vec<RepoSummary> = GET "repos" => json;
         /// The server's OpenAPI document.
         fn openapi() -> serde_json::Value = GET "openapi.json" => json;
@@ -77,6 +80,12 @@ endpoints! {
         /// Moves branches, with the objects their new commits add, as one
         /// transaction: every branch moves, or none does.
         fn push(push: &PushRequest) -> () = POST "push", body(push.encode()) => empty;
+        /// The repository's permissions.
+        fn permissions() -> Permissions = GET "permissions" => json;
+        /// Replaces the repository's permissions. Takes write access to the
+        /// root.
+        fn set_permissions(permissions: &Permissions) -> () =
+            PUT "permissions", json(permissions) => empty;
     }
 }
 
@@ -87,6 +96,8 @@ pub struct Client {
     http: reqwest::Client,
     /// The API's base URL, ending with a `/`.
     api: String,
+    /// Sent as a bearer token, if set; requests are anonymous otherwise.
+    token: Option<String>,
 }
 
 impl Client {
@@ -96,7 +107,15 @@ impl Client {
         Self {
             http: reqwest::Client::new(),
             api: format!("{}/api/v1/", url.trim_end_matches('/')),
+            token: None,
         }
+    }
+
+    /// Authenticates every request with `token`.
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
     }
 
     /// A repository on the server. Sends no request.
@@ -110,7 +129,11 @@ impl Client {
 
     /// Starts a request to `path`, relative to the API's base URL.
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        self.http.request(method, format!("{}{path}", self.api))
+        let request = self.http.request(method, format!("{}{path}", self.api));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 }
 
@@ -126,6 +149,12 @@ impl Repo {
     #[must_use]
     pub fn name(&self) -> &RepoName {
         &self.name
+    }
+
+    /// The client of the repository's server.
+    #[must_use]
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// Starts a request to `path`, relative to the repository's URL.

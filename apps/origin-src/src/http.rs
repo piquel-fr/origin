@@ -11,9 +11,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path as UrlPath, Query, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use origin_shared::access::{Permissions, Whoami};
 use origin_shared::api::{
     ApiError, CommitsRequest, ErrorCode, ListedEntry, Location, ObjectsRequest, RepoInfo, RepoName,
     RepoSummary,
@@ -24,7 +26,8 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::service::{OriginService, PushError, ServiceError};
+use crate::auth::{Authenticator, Users};
+use crate::service::{Caller, OriginService, PushError, ServiceError};
 
 /// Server configuration, read from a TOML file:
 ///
@@ -33,6 +36,9 @@ use crate::service::{OriginService, PushError, ServiceError};
 ///
 /// [repos]
 /// origin = "/srv/origin/origin" # name = path, relative to this file
+///
+/// [users.alice] # see `Users`
+/// token = "a long random secret"
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
@@ -41,6 +47,9 @@ pub struct ServerConfig {
     /// The repositories to serve, by name.
     #[serde(default)]
     pub repos: BTreeMap<RepoName, PathBuf>,
+    /// Who can authenticate. Everyone else is anonymous.
+    #[serde(default)]
+    pub users: Users,
 }
 
 impl ServerConfig {
@@ -80,7 +89,7 @@ impl ServerConfig {
             .await
             .with_context(|| format!("cannot listen on {}", self.listen))?;
         println!("Listening on http://{}", listener.local_addr()?);
-        let router = Api::router(OriginService::new(self.repos));
+        let router = Api::router(OriginService::new(self.repos), Arc::new(self.users));
         axum::serve(listener, router)
             .with_graceful_shutdown(async {
                 // If the signal handler cannot be installed, run until killed.
@@ -100,15 +109,23 @@ impl ServerConfig {
 ))]
 struct ApiDoc;
 
-type Service = State<Arc<OriginService>>;
+/// What every request can reach.
+struct AppState {
+    service: OriginService,
+    authenticator: Arc<dyn Authenticator>,
+}
+
+type Service = State<Arc<AppState>>;
 
 /// The HTTP API.
 pub struct Api;
 
 impl Api {
-    fn documented() -> OpenApiRouter<Arc<OriginService>> {
+    fn documented() -> OpenApiRouter<Arc<AppState>> {
         OpenApiRouter::with_openapi(ApiDoc::openapi())
+            .routes(routes!(whoami))
             .routes(routes!(list_repos))
+            .routes(routes!(permissions, set_permissions))
             .routes(routes!(repo_info))
             .routes(routes!(list_tree))
             .routes(routes!(read_file))
@@ -121,9 +138,14 @@ impl Api {
     /// The largest request accepted, which bounds pushes.
     const MAX_REQUEST: usize = 1 << 30;
 
-    /// The router serving `service`.
-    pub fn router(service: OriginService) -> axum::Router {
-        axum::Router::from(Self::documented().with_state(Arc::new(service)))
+    /// The router serving `service`, authenticating bearer tokens with
+    /// `authenticator`.
+    pub fn router(service: OriginService, authenticator: Arc<dyn Authenticator>) -> axum::Router {
+        let state = AppState {
+            service,
+            authenticator,
+        };
+        axum::Router::from(Self::documented().with_state(Arc::new(state)))
             .layer(DefaultBodyLimit::max(Self::MAX_REQUEST))
     }
 
@@ -134,13 +156,37 @@ impl Api {
     }
 }
 
+/// Callers are anonymous without an `Authorization: Bearer <token>`
+/// header, and rejected with an invalid one.
+impl FromRequestParts<Arc<AppState>> for Caller {
+    type Rejection = HttpError;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> impl Future<Output = Result<Self, HttpError>> + Send {
+        let caller = match parts.headers.get(header::AUTHORIZATION) {
+            None => Ok(Self::Client(None)),
+            Some(header) => header
+                .to_str()
+                .ok()
+                .and_then(|header| header.strip_prefix("Bearer "))
+                .and_then(|token| state.authenticator.authenticate(token))
+                .map(|identity| Self::Client(Some(identity)))
+                .ok_or(HttpError::Unauthorized),
+        };
+        std::future::ready(caller)
+    }
+}
+
 /// Runs a service call on the blocking thread pool: service calls do
 /// synchronous filesystem work.
 async fn call<T: Send + 'static>(
-    State(service): Service,
-    call: impl FnOnce(&OriginService) -> Result<T, ServiceError> + Send + 'static,
+    State(state): Service,
+    caller: Caller,
+    call: impl FnOnce(&OriginService, &Caller) -> Result<T, ServiceError> + Send + 'static,
 ) -> Result<T, HttpError> {
-    tokio::task::spawn_blocking(move || call(&service))
+    tokio::task::spawn_blocking(move || call(&state.service, &caller))
         .await
         .map_err(|error| HttpError::Internal(error.to_string()))?
         .map_err(HttpError::Service)
@@ -149,6 +195,7 @@ async fn call<T: Send + 'static>(
 /// A failed request, rendered as an [`ApiError`].
 enum HttpError {
     Service(ServiceError),
+    Unauthorized,
     Internal(String),
 }
 
@@ -170,6 +217,7 @@ impl IntoResponse for HttpError {
                         (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
                     }
                     ServiceError::Conflict(_) => (StatusCode::CONFLICT, ErrorCode::Conflict),
+                    ServiceError::Forbidden(_) => (StatusCode::FORBIDDEN, ErrorCode::Forbidden),
                     ServiceError::Repository(_)
                     | ServiceError::Store(_)
                     | ServiceError::Refs(_) => {
@@ -179,6 +227,11 @@ impl IntoResponse for HttpError {
                 };
                 (status, code, error.to_string())
             }
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::Unauthorized,
+                "invalid credentials".into(),
+            ),
             Self::Internal(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::Internal,
@@ -219,8 +272,8 @@ fn pack_response(pack: &origin_shared::pack::Pack) -> Response {
     operation_id = "list_repos",
     responses((status = 200, description = "The repositories", body = Vec<RepoSummary>), (status = 500, description = "The server failed", body = ApiError))
 )]
-async fn list_repos(service: Service) -> Result<Json<Vec<RepoSummary>>, HttpError> {
-    call(service, OriginService::list).await.map(Json)
+async fn list_repos(service: Service, caller: Caller) -> Result<Json<Vec<RepoSummary>>, HttpError> {
+    call(service, caller, OriginService::list).await.map(Json)
 }
 
 /// Describes a repository and its branches.
@@ -233,11 +286,14 @@ async fn list_repos(service: Service) -> Result<Json<Vec<RepoSummary>>, HttpErro
 )]
 async fn repo_info(
     service: Service,
+    caller: Caller,
     UrlPath(repo): UrlPath<RepoName>,
 ) -> Result<Json<RepoInfo>, HttpError> {
-    call(service, move |service| service.info(&repo))
-        .await
-        .map(Json)
+    call(service, caller, move |service, caller| {
+        service.info(caller, &repo)
+    })
+    .await
+    .map(Json)
 }
 
 /// Lists a directory on a branch.
@@ -254,12 +310,15 @@ async fn repo_info(
 )]
 async fn list_tree(
     service: Service,
+    caller: Caller,
     UrlPath(repo): UrlPath<RepoName>,
     Query(location): Query<Location>,
 ) -> Result<Json<Vec<ListedEntry>>, HttpError> {
-    call(service, move |service| service.tree(&repo, &location))
-        .await
-        .map(Json)
+    call(service, caller, move |service, caller| {
+        service.tree(caller, &repo, &location)
+    })
+    .await
+    .map(Json)
 }
 
 /// Reads a file on a branch.
@@ -276,10 +335,14 @@ async fn list_tree(
 )]
 async fn read_file(
     service: Service,
+    caller: Caller,
     UrlPath(repo): UrlPath<RepoName>,
     Query(location): Query<Location>,
 ) -> Result<Response, HttpError> {
-    let content = call(service, move |service| service.file(&repo, &location)).await?;
+    let content = call(service, caller, move |service, caller| {
+        service.file(caller, &repo, &location)
+    })
+    .await?;
     Ok((
         [(header::CONTENT_TYPE, "application/octet-stream")],
         content,
@@ -301,10 +364,14 @@ async fn read_file(
 )]
 async fn fetch_commits(
     service: Service,
+    caller: Caller,
     UrlPath(repo): UrlPath<RepoName>,
     Json(request): Json<CommitsRequest>,
 ) -> Result<Response, HttpError> {
-    let pack = call(service, move |service| service.commits(&repo, &request)).await?;
+    let pack = call(service, caller, move |service, caller| {
+        service.commits(caller, &repo, &request)
+    })
+    .await?;
     Ok(pack_response(&pack))
 }
 
@@ -322,10 +389,14 @@ async fn fetch_commits(
 )]
 async fn fetch_objects(
     service: Service,
+    caller: Caller,
     UrlPath(repo): UrlPath<RepoName>,
     Json(request): Json<ObjectsRequest>,
 ) -> Result<Response, HttpError> {
-    let pack = call(service, move |service| service.objects(&repo, &request)).await?;
+    let pack = call(service, caller, move |service, caller| {
+        service.objects(caller, &repo, &request)
+    })
+    .await?;
     Ok(pack_response(&pack))
 }
 
@@ -341,17 +412,89 @@ async fn fetch_objects(
         (status = 204, description = "Every branch moved"),
         (status = 400, description = "The push is incomplete or malformed", body = ApiError),
         (status = 404, description = "Something does not exist", body = ApiError),
+        (status = 403, description = "The caller may not write a changed path", body = ApiError),
         (status = 409, description = "A branch moved since the pusher looked; nothing changed", body = ApiError)
     )
 )]
 async fn push(
     service: Service,
+    caller: Caller,
     UrlPath(repo): UrlPath<RepoName>,
     body: Bytes,
 ) -> Result<StatusCode, HttpError> {
     let push = PushRequest::decode(&body)
         .map_err(|error| HttpError::Service(PushError::from(error).into()))?;
-    call(service, move |service| service.push(&repo, push)).await?;
+    call(service, caller, move |service, caller| {
+        service.push(caller, &repo, push)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Who the server thinks the caller is.
+#[utoipa::path(
+    get,
+    path = "/api/v1/whoami",
+    operation_id = "whoami",
+    responses(
+        (status = 200, description = "The caller", body = Whoami),
+        (status = 401, description = "The credentials are invalid", body = ApiError)
+    )
+)]
+async fn whoami(caller: Caller) -> Json<Whoami> {
+    let identity = match caller {
+        Caller::Client(identity) => identity,
+        Caller::Owner => None,
+    };
+    Json(Whoami { identity })
+}
+
+/// The repository's permissions.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{repo}/permissions",
+    operation_id = "permissions",
+    params(("repo" = RepoName, Path, description = "The repository")),
+    responses(
+        (status = 200, description = "The rules, by path", body = Permissions),
+        (status = 404, description = "Something does not exist", body = ApiError)
+    )
+)]
+async fn permissions(
+    service: Service,
+    caller: Caller,
+    UrlPath(repo): UrlPath<RepoName>,
+) -> Result<Json<Permissions>, HttpError> {
+    call(service, caller, move |service, caller| {
+        service.permissions(caller, &repo)
+    })
+    .await
+    .map(Json)
+}
+
+/// Replaces the repository's permissions. Takes write access to the root.
+#[utoipa::path(
+    put,
+    path = "/api/v1/repos/{repo}/permissions",
+    operation_id = "set_permissions",
+    params(("repo" = RepoName, Path, description = "The repository")),
+    request_body = Permissions,
+    responses(
+        (status = 204, description = "The permissions were replaced"),
+        (status = 403, description = "The caller may not write the root", body = ApiError),
+        (status = 404, description = "Something does not exist", body = ApiError)
+    )
+)]
+async fn set_permissions(
+    service: Service,
+    caller: Caller,
+    UrlPath(repo): UrlPath<RepoName>,
+    Json(permissions): Json<Permissions>,
+) -> Result<StatusCode, HttpError> {
+    call(service, caller, move |service, caller| {
+        service.set_permissions(caller, &repo, permissions)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

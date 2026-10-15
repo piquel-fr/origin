@@ -10,25 +10,44 @@ use std::process::{Child, Command, Output, Stdio};
 
 /// Runs `origin` in `cwd` as a configured user.
 pub fn origin(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_origin"))
+    origin_as(cwd, None, args)
+}
+
+/// Runs `origin` in `cwd` as a configured user, authenticating to servers
+/// with `token`.
+pub fn origin_as(cwd: &Path, token: Option<&str>, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_origin"));
+    command
         .args(args)
         .current_dir(cwd)
         .env("ORIGIN_USER_NAME", "Ada Lovelace")
         .env("ORIGIN_USER_EMAIL", "ada@example.com")
-        .output()
-        .unwrap()
+        // Keep the user's own configuration and tokens out of tests.
+        .env("XDG_CONFIG_HOME", cwd)
+        .env_remove("ORIGIN_TOKEN");
+    if let Some(token) = token {
+        command.env("ORIGIN_TOKEN", token);
+    }
+    command.output().unwrap()
 }
 
 /// A temporary working copy.
 pub struct Repo {
     dir: tempfile::TempDir,
+    token: Option<String>,
 }
 
 impl Repo {
     /// A new, empty repository.
     pub fn init() -> Self {
+        Self::init_as(None)
+    }
+
+    /// A new, empty repository whose user authenticates with `token`.
+    pub fn init_as(token: Option<&str>) -> Self {
         let repo = Self {
             dir: tempfile::tempdir().unwrap(),
+            token: token.map(str::to_owned),
         };
         fs::create_dir(repo.path()).unwrap();
         repo.ok(&["init"]);
@@ -37,10 +56,16 @@ impl Repo {
 
     /// A clone of `url`.
     pub fn clone(url: &str) -> Self {
+        Self::clone_as(url, None)
+    }
+
+    /// A clone of `url` by a user authenticating with `token`.
+    pub fn clone_as(url: &str, token: Option<&str>) -> Self {
         let repo = Self {
             dir: tempfile::tempdir().unwrap(),
+            token: token.map(str::to_owned),
         };
-        let output = origin(repo.dir.path(), &["clone", url, "work"]);
+        let output = origin_as(repo.dir.path(), token, &["clone", url, "work"]);
         assert!(
             output.status.success(),
             "clone failed: {}",
@@ -56,7 +81,7 @@ impl Repo {
 
     /// Runs a command that must succeed, returning its output.
     pub fn ok(&self, args: &[&str]) -> String {
-        let output = origin(&self.path(), args);
+        let output = origin_as(&self.path(), self.token.as_deref(), args);
         assert!(
             output.status.success(),
             "`origin {}` failed: {}",
@@ -68,7 +93,7 @@ impl Repo {
 
     /// Runs a command that must fail, returning its error.
     pub fn fails(&self, args: &[&str]) -> String {
-        let output = origin(&self.path(), args);
+        let output = origin_as(&self.path(), self.token.as_deref(), args);
         assert!(
             !output.status.success(),
             "`origin {}` succeeded",
@@ -85,6 +110,10 @@ impl Repo {
 
     pub fn read(&self, path: &str) -> String {
         fs::read_to_string(self.path().join(path)).unwrap()
+    }
+
+    pub fn exists(&self, path: &str) -> bool {
+        self.path().join(path).exists()
     }
 
     pub fn remove(&self, path: &str) {
@@ -131,10 +160,20 @@ impl Remote {
 
     /// A repository served over HTTP by a running `origin serve`.
     pub fn http() -> Self {
+        Self::guarded("", "")
+    }
+
+    /// A repository served over HTTP to `users` (the `[users]` tables of
+    /// the server configuration), with `permissions` (the `[permissions]`
+    /// tables of `repo.toml`).
+    pub fn guarded(users: &str, permissions: &str) -> Self {
         let dir = Self::create();
+        let config = dir.path().join("demo/repo.toml");
+        let repo = fs::read_to_string(&config).unwrap();
+        fs::write(config, format!("{repo}\n{permissions}")).unwrap();
         fs::write(
             dir.path().join("server.toml"),
-            "listen = \"127.0.0.1:0\"\n[repos]\ndemo = \"demo\"\n",
+            format!("listen = \"127.0.0.1:0\"\n[repos]\ndemo = \"demo\"\n{users}"),
         )
         .unwrap();
         let mut server = Command::new(env!("CARGO_BIN_EXE_origin"))

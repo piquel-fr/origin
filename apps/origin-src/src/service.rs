@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
+use origin_shared::access::{Access, Identity, Permissions};
 use origin_shared::api::{
     Branch, CommitsRequest, ListedEntry, Location, ObjectsRequest, RepoInfo, RepoName, RepoSummary,
 };
@@ -17,14 +18,66 @@ use origin_shared::{
 
 use crate::parallel::par_map;
 use crate::refs::RefError;
-use crate::repository::{Repository, RepositoryError};
+use crate::repository::{RepoConfig, Repository, RepositoryError};
 use crate::store::{ObjectStore, StoreError};
 use crate::tree::{CachedTrees, TreeSource};
+
+/// Who is calling the service.
+#[derive(Clone, Debug)]
+pub enum Caller {
+    /// Someone with access to the repositories' files, like the CLI on a
+    /// local path: permissions do not apply.
+    Owner,
+    /// A client, authenticated or anonymous.
+    Client(Option<Identity>),
+}
+
+impl Caller {
+    fn access(&self, permissions: &Permissions, path: &RepoPath) -> Access {
+        match self {
+            Self::Owner => Access::Write,
+            Self::Client(identity) => permissions.access(identity.as_ref(), path),
+        }
+    }
+
+    fn can_see(&self, permissions: &Permissions) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Client(identity) => permissions.can_see(identity.as_ref()),
+        }
+    }
+}
+
+/// A repository opened for a caller allowed to see it.
+struct Opened<'a> {
+    repository: Repository,
+    config: RepoConfig,
+    caller: &'a Caller,
+}
+
+impl Opened<'_> {
+    fn access(&self, path: &RepoPath) -> Access {
+        self.caller.access(&self.config.permissions, path)
+    }
+
+    /// Fails unless the caller may write `path`.
+    fn require_write(&self, path: &RepoPath) -> Result<(), ServiceError> {
+        if self.access(path) < Access::Write {
+            return Err(ServiceError::Forbidden(path.clone()));
+        }
+        Ok(())
+    }
+}
 
 /// The repositories a server hosts, and what can be done with them.
 ///
 /// It holds no state besides where each repository is: every call reads
-/// from disk, so repositories can be edited while the server runs.
+/// from disk, so repositories and their permissions can be edited while the
+/// server runs.
+///
+/// Repositories a caller may not see do not exist for them, and files they
+/// may not read are withheld: their names and ids are visible, their
+/// content is not.
 #[derive(Clone, Debug)]
 pub struct OriginService {
     repos: BTreeMap<RepoName, PathBuf>,
@@ -37,29 +90,38 @@ impl OriginService {
         Self { repos }
     }
 
-    fn open(&self, repo: &RepoName) -> Result<Repository, ServiceError> {
-        let path = self
-            .repos
-            .get(repo)
-            .ok_or_else(|| ServiceError::RepoNotFound(repo.clone()))?;
-        Ok(Repository::open(path)?)
+    fn open<'a>(&self, caller: &'a Caller, repo: &RepoName) -> Result<Opened<'a>, ServiceError> {
+        let not_found = || ServiceError::RepoNotFound(repo.clone());
+        let repository = Repository::open(self.repos.get(repo).ok_or_else(not_found)?)?;
+        let config = repository.config()?;
+        if !caller.can_see(&config.permissions) {
+            return Err(not_found());
+        }
+        Ok(Opened {
+            repository,
+            config,
+            caller,
+        })
     }
 
-    /// Lists every repository.
+    /// Lists the repositories the caller may see.
     ///
     /// # Errors
     ///
     /// Fails if a repository cannot be read.
-    pub fn list(&self) -> Result<Vec<RepoSummary>, ServiceError> {
-        self.repos
-            .keys()
-            .map(|name| {
-                Ok(RepoSummary {
+    pub fn list(&self, caller: &Caller) -> Result<Vec<RepoSummary>, ServiceError> {
+        let mut repos = Vec::new();
+        for name in self.repos.keys() {
+            match self.open(caller, name) {
+                Ok(opened) => repos.push(RepoSummary {
                     name: name.clone(),
-                    description: self.open(name)?.config()?.description,
-                })
-            })
-            .collect()
+                    description: opened.config.description,
+                }),
+                Err(ServiceError::RepoNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(repos)
     }
 
     /// Describes a repository and its branches.
@@ -67,18 +129,51 @@ impl OriginService {
     /// # Errors
     ///
     /// Fails if the repository does not exist or cannot be read.
-    pub fn info(&self, repo: &RepoName) -> Result<RepoInfo, ServiceError> {
-        let repository = self.open(repo)?;
+    pub fn info(&self, caller: &Caller, repo: &RepoName) -> Result<RepoInfo, ServiceError> {
+        let opened = self.open(caller, repo)?;
         Ok(RepoInfo {
             name: repo.clone(),
-            description: repository.config()?.description,
-            branches: repository
+            branches: opened
+                .repository
                 .branches()
                 .list()?
                 .into_iter()
                 .map(|(name, commit)| Branch { name, commit })
                 .collect(),
+            description: opened.config.description,
         })
+    }
+
+    /// The repository's permissions.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the repository does not exist or cannot be read.
+    pub fn permissions(
+        &self,
+        caller: &Caller,
+        repo: &RepoName,
+    ) -> Result<Permissions, ServiceError> {
+        Ok(self.open(caller, repo)?.config.permissions)
+    }
+
+    /// Replaces the repository's permissions. Takes write access to the
+    /// root.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`ServiceError::Forbidden`] if the caller may not write the
+    /// root.
+    pub fn set_permissions(
+        &self,
+        caller: &Caller,
+        repo: &RepoName,
+        permissions: Permissions,
+    ) -> Result<(), ServiceError> {
+        let mut opened = self.open(caller, repo)?;
+        opened.require_write(&RepoPath::root())?;
+        opened.config.permissions = permissions;
+        Ok(opened.repository.save_config(&opened.config)?)
     }
 
     /// Finds what is at a location.
@@ -96,22 +191,25 @@ impl OriginService {
             .ok_or_else(not_found)
     }
 
-    /// Lists a directory.
+    /// Lists a directory. Every name is visible, even of files the caller
+    /// may not read.
     ///
     /// # Errors
     ///
     /// Fails if the branch or directory does not exist.
     pub fn tree(
         &self,
+        caller: &Caller,
         repo: &RepoName,
         location: &Location,
     ) -> Result<Vec<ListedEntry>, ServiceError> {
-        let repository = self.open(repo)?;
-        let entry = Self::resolve(&repository, location)?;
+        let opened = self.open(caller, repo)?;
+        let entry = Self::resolve(&opened.repository, location)?;
         if !entry.kind.is_tree() {
             return Err(ServiceError::NotADirectory(location.path.clone()));
         }
-        Ok(repository
+        Ok(opened
+            .repository
             .objects()
             .tree(entry.id)?
             .iter()
@@ -127,14 +225,26 @@ impl OriginService {
     ///
     /// # Errors
     ///
-    /// Fails if the branch or file does not exist.
-    pub fn file(&self, repo: &RepoName, location: &Location) -> Result<Vec<u8>, ServiceError> {
-        let repository = self.open(repo)?;
-        let entry = Self::resolve(&repository, location)?;
+    /// Fails if the branch or file does not exist, or the caller may not
+    /// read the file, which looks the same.
+    pub fn file(
+        &self,
+        caller: &Caller,
+        repo: &RepoName,
+        location: &Location,
+    ) -> Result<Vec<u8>, ServiceError> {
+        let opened = self.open(caller, repo)?;
+        let entry = Self::resolve(&opened.repository, location)?;
         if entry.kind == EntryKind::Tree {
             return Err(ServiceError::NotAFile(location.path.clone()));
         }
-        let blob = repository.objects().read(entry.id)?;
+        if opened.access(&location.path) < Access::Read {
+            return Err(ServiceError::PathNotFound(
+                location.branch.clone(),
+                location.path.clone(),
+            ));
+        }
+        let blob = opened.repository.objects().read(entry.id)?;
         Ok(blob
             .blob_content()
             .map_err(|source| StoreError::Decode {
@@ -149,8 +259,14 @@ impl OriginService {
     /// # Errors
     ///
     /// Fails if a commit does not exist.
-    pub fn commits(&self, repo: &RepoName, request: &CommitsRequest) -> Result<Pack, ServiceError> {
-        let repository = self.open(repo)?;
+    pub fn commits(
+        &self,
+        caller: &Caller,
+        repo: &RepoName,
+        request: &CommitsRequest,
+    ) -> Result<Pack, ServiceError> {
+        let opened = self.open(caller, repo)?;
+        let objects = opened.repository.objects();
         let mut seen = BTreeSet::new();
         let mut queue: VecDeque<(ObjectId, u32)> = request.ids.iter().map(|&id| (id, 1)).collect();
         let mut pack = Pack::default();
@@ -158,8 +274,7 @@ impl OriginService {
             if depth > request.depth || !seen.insert(id) {
                 continue;
             }
-            let object = repository
-                .objects()
+            let object = objects
                 .try_read(id)?
                 .ok_or(ServiceError::ObjectNotFound(id))?;
             let commit = object
@@ -171,14 +286,20 @@ impl OriginService {
         Ok(pack)
     }
 
-    /// Returns the object at each path of a commit, in order.
+    /// Returns the object at each path of a commit. Files the caller may
+    /// not read are withheld.
     ///
     /// # Errors
     ///
     /// Fails if the commit or a path does not exist.
-    pub fn objects(&self, repo: &RepoName, request: &ObjectsRequest) -> Result<Pack, ServiceError> {
-        let repository = self.open(repo)?;
-        let objects = repository.objects();
+    pub fn objects(
+        &self,
+        caller: &Caller,
+        repo: &RepoName,
+        request: &ObjectsRequest,
+    ) -> Result<Pack, ServiceError> {
+        let opened = self.open(caller, repo)?;
+        let objects = opened.repository.objects();
         let root = objects
             .try_read(request.commit)?
             .ok_or(ServiceError::ObjectNotFound(request.commit))?
@@ -189,38 +310,50 @@ impl OriginService {
             })?
             .tree;
         let trees = CachedTrees::new(objects);
-        let ids = request
-            .paths
-            .iter()
-            .map(|path| {
-                let entry =
-                    trees
-                        .resolve(root, path)?
-                        .ok_or_else(|| ServiceError::NotInCommit {
-                            commit: request.commit,
-                            path: path.clone(),
-                        })?;
-                Ok(entry.id)
-            })
-            .collect::<Result<Vec<_>, ServiceError>>()?;
+        let mut ids = Vec::new();
+        let mut withheld = Vec::new();
+        for path in &request.paths {
+            let entry = trees
+                .resolve(root, path)?
+                .ok_or_else(|| ServiceError::NotInCommit {
+                    commit: request.commit,
+                    path: path.clone(),
+                })?;
+            if entry.kind.is_tree() || opened.access(path) >= Access::Read {
+                ids.push(entry.id);
+            } else {
+                withheld.push(entry.id);
+            }
+        }
         let objects = par_map(&ids, |&id| objects.read(id))?;
-        Ok(Pack { objects })
+        Ok(Pack { objects, withheld })
     }
 
     /// Applies a push as one transaction: validates it, stores its objects,
     /// and moves every branch, or none if any moved since the pusher looked.
     ///
     /// Each new commit must come with every object it adds relative to its
-    /// first parent, even ones the server already has. Pushing an object
-    /// proves the pusher knows its content, which permission checks will
-    /// rely on.
+    /// first parent, even ones the server already has: pushing an object
+    /// proves the pusher knows its content, so nobody can copy a file they
+    /// may not read by referring to its id. The caller must be allowed to
+    /// write every path the new commits change and every path that differs
+    /// between a branch's old and new commit, and the root to delete a
+    /// branch.
     ///
     /// # Errors
     ///
-    /// Fails with [`ServiceError::Conflict`] if a branch moved, or
-    /// [`ServiceError::InvalidPush`] if the push is incomplete or malformed.
-    pub fn push(&self, repo: &RepoName, push: PushRequest) -> Result<(), ServiceError> {
-        let repository = self.open(repo)?;
+    /// Fails with [`ServiceError::Conflict`] if a branch moved,
+    /// [`ServiceError::Forbidden`] if the caller may not write a changed
+    /// path, or [`ServiceError::InvalidPush`] if the push is incomplete or
+    /// malformed.
+    pub fn push(
+        &self,
+        caller: &Caller,
+        repo: &RepoName,
+        push: PushRequest,
+    ) -> Result<(), ServiceError> {
+        let opened = self.open(caller, repo)?;
+        let store = opened.repository.objects();
         let pushed = push
             .pack
             .objects
@@ -228,29 +361,47 @@ impl OriginService {
             .map(|object| (object.id(), object))
             .collect();
         let trees = PushedTrees {
-            store: repository.objects(),
+            store,
             pushed: &pushed,
+            opened: &opened,
         };
         let mut queue = Vec::new();
         for update in &push.updates {
-            if let Some(new) = update.new {
-                trees.commit(new)?;
-                queue.push(new);
+            match update.new {
+                Some(new) => {
+                    trees.commit(new)?;
+                    queue.push(new);
+                }
+                None => opened.require_write(&RepoPath::root())?,
             }
         }
         // Only objects of checked commits are stored: anything else in the
         // pack is ignored, so the store never holds unchecked objects.
         let mut accepted = HashSet::new();
         while let Some(id) = queue.pop() {
-            if repository.objects().contains(id) || accepted.contains(&id) {
+            if store.contains(id) || accepted.contains(&id) {
                 continue;
             }
             queue.extend(trees.check_commit(id, &mut accepted)?);
         }
+        // What readers of a branch see change is what the caller must be
+        // allowed to write, whichever commits get there.
+        for update in &push.updates {
+            let Some(new) = update.new else { continue };
+            let old_tree = update
+                .expected
+                .map(|old| trees.commit(old))
+                .transpose()?
+                .map(|old| old.tree);
+            for change in trees.diff(old_tree, Some(trees.commit(new)?.tree))? {
+                opened.require_write(&change.path)?;
+            }
+        }
         let accepted: Vec<&EncodedObject> =
             accepted.iter().filter_map(|id| pushed.get(id)).collect();
-        par_map(&accepted, |object| repository.objects().write(object))?;
-        repository
+        par_map(&accepted, |object| store.write(object))?;
+        opened
+            .repository
             .branches()
             .update(&push.updates)
             .map_err(|error| match error {
@@ -264,6 +415,7 @@ impl OriginService {
 struct PushedTrees<'a> {
     store: &'a ObjectStore,
     pushed: &'a HashMap<ObjectId, EncodedObject>,
+    opened: &'a Opened<'a>,
 }
 
 impl PushedTrees<'_> {
@@ -288,8 +440,9 @@ impl PushedTrees<'_> {
             .map_err(|source| StoreError::Decode { id, source })?)
     }
 
-    /// Checks that a pushed commit comes with every object it adds, adds
-    /// them and the commit to `accepted`, and returns its parents.
+    /// Checks that a pushed commit comes with every object it adds and only
+    /// changes paths the caller may write, adds its objects and itself to
+    /// `accepted`, and returns its parents.
     fn check_commit(
         &self,
         id: ObjectId,
@@ -336,6 +489,9 @@ impl PushedTrees<'_> {
             accepted.insert(entry.id);
             Ok(())
         })?;
+        for change in self.diff(old_tree, Some(commit.tree))? {
+            self.opened.require_write(&change.path)?;
+        }
         accepted.insert(id);
         Ok(commit.parents)
     }
@@ -415,6 +571,9 @@ pub enum ServiceError {
         /// The path.
         path: RepoPath,
     },
+    /// The caller may not change a path.
+    #[error("you may not write `{0}`")]
+    Forbidden(RepoPath),
     /// A branch moved since the pusher last looked.
     #[error("push rejected: {0}")]
     Conflict(RefError),

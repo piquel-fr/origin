@@ -262,6 +262,95 @@
         }
       }
     },
+    "/api/v1/repos/{repo}/permissions": {
+      "get": {
+        "summary": "The repository's permissions.",
+        "operationId": "permissions",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The rules, by path",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Permissions"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Replaces the repository's permissions. Takes write access to the root.",
+        "operationId": "set_permissions",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Permissions"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The permissions were replaced"
+          },
+          "403": {
+            "description": "The caller may not write the root",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/repos/{repo}/push": {
       "post": {
         "summary": "Moves branches, with the objects their new commits add, as one\ntransaction. The body is a push (see `origin_shared::pack`).",
@@ -293,6 +382,16 @@
           },
           "400": {
             "description": "The push is incomplete or malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not write a changed path",
             "content": {
               "application/json": {
                 "schema": {
@@ -393,10 +492,47 @@
           }
         }
       }
+    },
+    "/api/v1/whoami": {
+      "get": {
+        "summary": "Who the server thinks the caller is.",
+        "operationId": "whoami",
+        "responses": {
+          "200": {
+            "description": "The caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Whoami"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The credentials are invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "Access": {
+        "type": "string",
+        "description": "What someone may do with a path.",
+        "enum": [
+          "none",
+          "read",
+          "write"
+        ]
+      },
       "ApiError": {
         "type": "object",
         "description": "What went wrong with a request.",
@@ -482,8 +618,30 @@
           "bad_request",
           "not_found",
           "conflict",
+          "unauthorized",
+          "forbidden",
           "internal"
         ]
+      },
+      "Identity": {
+        "type": "object",
+        "description": "An authenticated user.",
+        "required": [
+          "user"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The groups the user belongs to."
+          },
+          "user": {
+            "type": "string",
+            "description": "The user's name."
+          }
+        }
       },
       "ListedEntry": {
         "type": "object",
@@ -532,6 +690,16 @@
             },
             "description": "The paths to read. The empty path is the root tree."
           }
+        }
+      },
+      "Permissions": {
+        "type": "object",
+        "description": "A repository's rules, by path.",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/Rule"
+        },
+        "propertyNames": {
+          "type": "string"
         }
       },
       "RepoInfo": {
@@ -585,6 +753,60 @@
           "name": {
             "$ref": "#/components/schemas/RepoName",
             "description": "The repository's name."
+          }
+        }
+      },
+      "Rule": {
+        "type": "object",
+        "description": "The grants of one path.",
+        "properties": {
+          "all": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Access",
+                "description": "Everyone's access, including anonymous callers."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "groups": {
+            "type": "object",
+            "description": "Access of groups' members, by group.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Access"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "users": {
+            "type": "object",
+            "description": "Access of users, by name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Access"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Whoami": {
+        "type": "object",
+        "description": "Who a server thinks the caller is.",
+        "properties": {
+          "identity": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identity",
+                "description": "The caller, or `None` when anonymous."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       }

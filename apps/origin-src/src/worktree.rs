@@ -635,6 +635,7 @@ mod tests {
 
     use super::*;
     use crate::parallel::PARALLEL_THRESHOLD;
+    use crate::tree::TreeSource;
 
     struct Fixture {
         dir: tempfile::TempDir,
