@@ -24,10 +24,11 @@ impl WorkingCopy {
     /// unique prefix of its id, a change for its head, or a revision. A
     /// prefix naming a change and another revision than its head is
     /// ambiguous.
-    fn find_revision(&self, index: &Index, rev: &str) -> Result<RevisionId, WorkspaceError> {
+    fn find_revision(&self, rev: &str) -> Result<RevisionId, WorkspaceError> {
         if rev == "@" {
             return Ok(self.id);
         }
+        let index = &self.index;
         match (index.find_change(rev), index.find_revision(rev)) {
             (Err(FindError::NotFound(_)), revision) => Ok(revision?),
             (Ok(change), Err(FindError::NotFound(_))) => Workspace::single_head(index, change),
@@ -44,14 +45,10 @@ impl WorkingCopy {
 
     /// The record `annotated` names, as [`WorkingCopy::find_revision`]
     /// finds a revision, or a statement by a unique prefix of its id.
-    fn find_record(
-        &self,
-        index: &Index,
-        annotated: Annotated<'_>,
-    ) -> Result<RecordId, WorkspaceError> {
+    fn find_record(&self, annotated: Annotated<'_>) -> Result<RecordId, WorkspaceError> {
         Ok(match annotated {
-            Annotated::Revision(rev) => RecordId::Revision(self.find_revision(index, rev)?),
-            Annotated::Statement(prefix) => RecordId::Statement(index.find_statement(prefix)?),
+            Annotated::Revision(rev) => RecordId::Revision(self.find_revision(rev)?),
+            Annotated::Statement(prefix) => RecordId::Statement(self.index.find_statement(prefix)?),
         })
     }
 }
@@ -100,15 +97,20 @@ impl Workspace {
     }
 
     /// Issues `core.divergent` if `revision`, just saved, made its change
-    /// diverge. The statement is the same for the same heads, so checking
-    /// again writes nothing.
-    pub(super) fn flag_divergence(&self, revision: RevisionId) -> Result<(), WorkspaceError> {
+    /// diverge, as `index`, which has it, tells. The statement is the same
+    /// for the same heads, so checking again writes nothing.
+    pub(super) fn flag_divergence(
+        &self,
+        index: &Index,
+        revision: RevisionId,
+    ) -> Result<(), WorkspaceError> {
         let revision: Revision = self.store.get(revision)?;
         // A new change has a single revision.
-        if revision.predecessors.is_empty() {
+        if revision.predecessors.is_empty() || !index.is_divergent(revision.change) {
             return Ok(());
         }
-        Annotations::open(&self.store)?.flag_divergence(revision.change, self.node_principal())?;
+        Annotations::new(&self.store, index.clone())
+            .flag_divergence(revision.change, self.node_principal())?;
         Ok(())
     }
 
@@ -134,8 +136,8 @@ impl Workspace {
             return Err(WorkspaceError::ReservedKind(kind));
         }
         let working_copy = self.refresh()?;
-        let annotations = Annotations::open(&self.store)?;
-        let subject = working_copy.find_record(annotations.index(), annotated)?;
+        let subject = working_copy.find_record(annotated)?;
+        let annotations = Annotations::new(&self.store, working_copy.index);
         let issuer = self.config.user();
         let supersedes = annotations.current(subject, &kind, &issuer)?;
         // What a withdrawal takes back: a statement with a verdict.
@@ -233,8 +235,8 @@ impl Workspace {
     /// Fails if the revision cannot be found or a record cannot be read.
     pub fn statements(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
-        let annotations = Annotations::open(&self.store)?;
-        let revision = working_copy.find_revision(annotations.index(), rev)?;
+        let revision = working_copy.find_revision(rev)?;
+        let annotations = Annotations::new(&self.store, working_copy.index);
         let subject = RecordId::Revision(revision);
         if annotations.index().statements(subject).is_empty() {
             println!("No statements about revision {}", revision.short());
@@ -327,8 +329,8 @@ impl Workspace {
     /// written.
     pub fn promote(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
-        let mut annotations = Annotations::open(&self.store)?;
-        let revision = working_copy.find_revision(annotations.index(), rev)?;
+        let revision = working_copy.find_revision(rev)?;
+        let mut annotations = Annotations::new(&self.store, working_copy.index);
         let promoted = annotations.promote(RecordId::Revision(revision), &self.node_principal())?;
         if promoted.is_empty() {
             println!("Nothing to promote to revision {}", revision.short());

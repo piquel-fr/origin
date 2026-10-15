@@ -141,6 +141,12 @@ enum WorkspaceCommand {
     Target(TargetCommand),
     /// List the targets, with their tips, authorities and requirements.
     Targets,
+    /// Move the working copy where its change went from another
+    /// workspace, or onto its target's new tip, with the edits made since.
+    Pull,
+    /// Manage workspaces: working copies sharing this repository.
+    #[command(subcommand)]
+    Workspace(WorkspacesCommand),
 }
 
 #[derive(Debug, Args)]
@@ -333,6 +339,26 @@ enum IndexCommand {
     Rebuild,
 }
 
+#[derive(Debug, Subcommand)]
+enum WorkspacesCommand {
+    /// Create a workspace, with a new change beside the working copy's.
+    New {
+        /// Check out this change's head instead.
+        #[arg(long)]
+        change: Option<String>,
+        /// Where: by default beside the main working copy, named after the
+        /// change.
+        path: Option<PathBuf>,
+    },
+    /// List the workspaces and their changes.
+    List,
+    /// Remove a workspace, keeping its work as a revision of its change.
+    Rm {
+        /// The workspace.
+        path: PathBuf,
+    },
+}
+
 impl Cli {
     /// Parses the command line, then checks what parsing can't: an
     /// `annotate`'s arguments, whose meaning depends on `--on`. Exits as a
@@ -415,6 +441,12 @@ impl WorkspaceCommand {
                 workspace.target_new(&name, &from)?;
             }
             Self::Targets => workspace.targets()?,
+            Self::Pull => workspace.pull()?,
+            Self::Workspace(WorkspacesCommand::New { change, path }) => {
+                workspace.add_workspace(change.as_deref(), path.as_deref())?;
+            }
+            Self::Workspace(WorkspacesCommand::List) => workspace.list_workspaces()?,
+            Self::Workspace(WorkspacesCommand::Rm { path }) => workspace.remove_workspace(&path)?,
         }
         Ok(())
     }
