@@ -312,6 +312,17 @@ impl<P: Platform> Store<P> {
         Ok(self.packs.find(id))
     }
 
+    /// The id of every packed object, as of the current manifest.
+    pub(super) fn packed_ids(&self) -> Result<Vec<ObjectId>, StoreError> {
+        self.reload_packs()?;
+        Ok(self
+            .packs
+            .loaded()
+            .iter()
+            .flat_map(|pack| pack.entries().map(|(id, _)| id))
+            .collect())
+    }
+
     /// Loads the manifest's packs, unless they're already loaded.
     fn reload_packs(&self) -> Result<(), StoreError> {
         let dir = self.packs_dir();
@@ -645,7 +656,7 @@ impl<P: Platform> Store<P> {
 mod tests {
     use std::slice;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
 
     use origin_platform::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Native, Op};
@@ -964,5 +975,22 @@ mod tests {
             }
         });
         assert!(store.packs.loaded().len() < 6, "merged as it went");
+    }
+
+    #[test]
+    fn listing_never_misses_an_object_during_compaction() {
+        let (_dir, store) = store();
+        let written = objects(0, 4000);
+        store.write_all(&written).unwrap();
+        let compacted = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while !compacted.load(Ordering::SeqCst) {
+                    assert_eq!(store.ids().unwrap().len(), written.len());
+                }
+            });
+            store.compact().unwrap();
+            compacted.store(true, Ordering::SeqCst);
+        });
     }
 }
