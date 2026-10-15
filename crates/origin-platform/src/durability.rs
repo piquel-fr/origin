@@ -1,0 +1,420 @@
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::num::NonZero;
+use std::panic;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread;
+
+use crate::{Error, Op};
+
+/// Flushes written data to stable storage, so it survives a crash or a power
+/// loss.
+///
+/// The default methods use the standard library, which issues each
+/// platform's strongest sync. Each platform syncs batches its own way.
+pub trait Durability {
+    /// Flushes a file's contents, and the metadata needed to read them back.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file system reports a write error.
+    fn sync_file(&self, file: &File) -> io::Result<()> {
+        file.sync_data()
+    }
+
+    /// Flushes a directory's entries, making the files created in, renamed
+    /// into or removed from it durable.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the directory cannot be opened or the file system reports a
+    /// write error.
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+
+    /// Flushes the contents of many files at once, more cheaply than
+    /// syncing each. The files must be on one file system.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a file cannot be opened or the file system reports a write
+    /// error, naming the file involved.
+    fn sync_batch<'f>(&self, files: impl IntoIterator<Item = &'f Path>) -> Result<(), Error>;
+}
+
+/// Files written durably as a group, at the cost of one batch sync and one
+/// sync per directory involved.
+///
+/// [`DurableWrite::stage`] writes each file under a temporary name in its
+/// destination's directory, which [`DurableWrite::is_temporary`] recognizes.
+/// [`DurableWrite::commit`] then makes them all durable with
+/// [`Durability::sync_batch`], renames them into place from several threads
+/// and syncs their directories. Readers see either the previous file or the
+/// complete new one, and once `commit` returns a crash loses none of them.
+/// Dropping the write before committing removes its temporary files; a crash
+/// leaves them behind, so code that lists a directory written this way skips
+/// them, and removes the stale ones.
+///
+/// Staging beside the destination keeps each rename within one directory,
+/// so writes to different directories never contend on a shared one.
+///
+/// Files can be staged from several threads at once.
+#[derive(Debug)]
+pub struct DurableWrite<'a, P> {
+    platform: &'a P,
+    staged: Mutex<Staged>,
+}
+
+/// The files staged so far.
+#[derive(Debug, Default)]
+struct Staged {
+    /// Each temporary file and the path it's published to.
+    files: Vec<(PathBuf, PathBuf)>,
+    /// The directories whose entries change: the published files' parents.
+    dirs: BTreeSet<PathBuf>,
+}
+
+/// Distinguishes the temporary files of one process.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+impl<P> DurableWrite<'_, P> {
+    /// How temporary file names start: `.tmp-<pid>-<n>`.
+    const TEMP_PREFIX: &str = ".tmp-";
+
+    /// The fewest renames worth a thread of their own in
+    /// [`DurableWrite::commit`]: below that, spawning costs more than it
+    /// saves.
+    const RENAMES_PER_THREAD: usize = 64;
+
+    /// Whether `name` is the name of a temporary file: one being written, or
+    /// left behind by a write that crashed.
+    #[must_use]
+    pub fn is_temporary(name: &OsStr) -> bool {
+        name.as_encoded_bytes()
+            .starts_with(Self::TEMP_PREFIX.as_bytes())
+    }
+}
+
+impl<'a, P: Durability> DurableWrite<'a, P> {
+    /// Starts a write on `platform`.
+    pub fn new(platform: &'a P) -> Self {
+        Self {
+            platform,
+            staged: Mutex::default(),
+        }
+    }
+
+    /// Writes `contents` as the next version of `path`, and creates its
+    /// missing parent directories. The file appears at `path` on
+    /// [`DurableWrite::commit`], replacing any file there.
+    ///
+    /// Each directory created is durable at once, whatever becomes of the
+    /// write, so a later write into it never relies on this one committing.
+    /// Only a creator that dies between creating a directory and syncing
+    /// its parent leaves one that isn't, so create shared directories up
+    /// front.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a directory or the temporary file cannot be created or
+    /// written.
+    pub fn stage(&self, path: impl Into<PathBuf>, contents: &[u8]) -> Result<(), Error> {
+        let path = path.into();
+        self.create_parents(&path)?;
+        let temp = Self::parent(&path).join(format!(
+            "{}{}-{}",
+            Self::TEMP_PREFIX,
+            process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        if let Err(error) = Self::write_temp(&temp, contents) {
+            // Best effort: the file is unusable either way.
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
+        staged.dirs.insert(Self::parent(&path).to_owned());
+        staged.files.push((temp, path));
+        Ok(())
+    }
+
+    fn write_temp(temp: &Path, contents: &[u8]) -> Result<(), Error> {
+        File::create(temp)
+            .and_then(|mut file| file.write_all(contents))
+            .map_err(|source| Error::new(Op::Write, temp, source))
+    }
+
+    /// Creates the missing parent directories of `path`, outermost first,
+    /// syncing the directory each is created in right after creating it.
+    fn create_parents(&self, path: &Path) -> Result<(), Error> {
+        let mut missing = Vec::new();
+        let mut dir = Self::parent(path);
+        while !dir.is_dir() {
+            missing.push(dir);
+            dir = Self::parent(dir);
+        }
+        for dir in missing.into_iter().rev() {
+            match fs::create_dir(dir) {
+                // Another write created it first, and may not have synced
+                // its parent yet.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                result => result.map_err(|source| Error::new(Op::CreateDir, dir, source))?,
+            }
+            let parent = Self::parent(dir);
+            self.platform
+                .sync_dir(parent)
+                .map_err(|source| Error::new(Op::Sync, parent, source))?;
+        }
+        Ok(())
+    }
+
+    /// The directory containing `path`, which is `.` for a bare file name.
+    fn parent(path: &Path) -> &Path {
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        }
+    }
+
+    /// Syncs every staged file, renames them into place, then syncs each
+    /// directory involved once.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the files cannot be synced, in which case none is published,
+    /// or if a file cannot be renamed or a directory cannot be synced. Files
+    /// renamed before such a failure are visible but may not be durable.
+    pub fn commit(mut self) -> Result<(), Error> {
+        let staged = self
+            .staged
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.platform
+            .sync_batch(staged.files.iter().map(|(temp, _)| temp.as_path()))?;
+        Self::rename_all(&staged.files)?;
+        // Every file is published, so dropping the write removes none.
+        staged.files.clear();
+        for dir in &staged.dirs {
+            self.platform
+                .sync_dir(dir)
+                .map_err(|source| Error::new(Op::Sync, dir, source))?;
+        }
+        Ok(())
+    }
+
+    /// Renames each temporary file to its path, spread over the cores. Each
+    /// rename locks its directory, and a batch usually spans many.
+    fn rename_all(files: &[(PathBuf, PathBuf)]) -> Result<(), Error> {
+        let rename = |files: &[(PathBuf, PathBuf)]| {
+            files.iter().try_for_each(|(temp, path)| {
+                fs::rename(temp, path).map_err(|source| Error::new(Op::Publish, path, source))
+            })
+        };
+        let most = files.len() / Self::RENAMES_PER_THREAD;
+        // Checked first: asking for the cores reads the cgroup's quota.
+        if most <= 1 {
+            return rename(files);
+        }
+        let threads = thread::available_parallelism()
+            .map_or(1, NonZero::get)
+            .min(most);
+        thread::scope(|scope| {
+            files
+                .chunks(files.len().div_ceil(threads))
+                .map(|chunk| scope.spawn(move || rename(chunk)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .try_for_each(|thread| {
+                    thread
+                        .join()
+                        .unwrap_or_else(|panic| panic::resume_unwind(panic))
+                })
+        })
+    }
+}
+
+impl<P> Drop for DurableWrite<'_, P> {
+    /// Removes the temporary files that were not published.
+    fn drop(&mut self) {
+        let staged = self
+            .staged
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (temp, _) in &staged.files {
+            // Best effort: a leftover is garbage that readers skip. After a
+            // failed rename, some of these are already published.
+            let _ = fs::remove_file(temp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records syncs instead of performing them, and fails batches when
+    /// asked to.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<Call>>,
+        fail_batches: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Call {
+        Dir(PathBuf),
+        /// A batch sync, with how many of its files were still unpublished
+        /// temporary files.
+        Batch(usize),
+    }
+
+    impl Recorder {
+        fn record(&self, call: Call) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn take(&self) -> Vec<Call> {
+            std::mem::take(&mut self.calls.lock().unwrap())
+        }
+    }
+
+    impl Durability for Recorder {
+        fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+            self.record(Call::Dir(dir.to_owned()));
+            Ok(())
+        }
+
+        fn sync_batch<'f>(&self, files: impl IntoIterator<Item = &'f Path>) -> Result<(), Error> {
+            if self.fail_batches {
+                let source = io::Error::other("batch failed");
+                return Err(Error::new(Op::Sync, Path::new("batch"), source));
+            }
+            let unpublished = files.into_iter().filter(|temp| temp.exists()).count();
+            self.record(Call::Batch(unpublished));
+            Ok(())
+        }
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn syncs_the_batch_before_publishing_and_each_directory_once() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        fs::create_dir(root.join("a")).unwrap();
+        let recorder = Recorder::default();
+        let write = DurableWrite::new(&recorder);
+
+        write.stage(root.join("a/1"), b"one").unwrap();
+        write.stage(root.join("a/2"), b"two").unwrap();
+        assert_eq!(recorder.take(), [], "staging syncs nothing");
+        write.stage(root.join("b/c/3"), b"three").unwrap();
+        assert_eq!(
+            recorder.take(),
+            [Call::Dir(root.to_owned()), Call::Dir(root.join("b"))],
+            "but the directories it creates, at once"
+        );
+        let staged = names(&root.join("a"));
+        assert_eq!(staged.len(), 2);
+        assert!(
+            staged
+                .iter()
+                .all(|name| DurableWrite::<Recorder>::is_temporary(name.as_ref())),
+            "files are staged beside their destination, under temporary names: {staged:?}"
+        );
+
+        write.commit().unwrap();
+        assert_eq!(
+            recorder.take(),
+            [
+                Call::Batch(3),
+                Call::Dir(root.join("a")),
+                Call::Dir(root.join("b/c")),
+            ],
+            "the whole batch is synced before any file is renamed, then each \
+             changed directory once"
+        );
+        assert_eq!(fs::read(root.join("a/1")).unwrap(), b"one");
+        assert_eq!(fs::read(root.join("b/c/3")).unwrap(), b"three");
+        assert_eq!(
+            names(&root.join("a")),
+            ["1", "2"],
+            "no temporary file is left"
+        );
+        assert_eq!(names(&root.join("b/c")), ["3"]);
+    }
+
+    #[test]
+    fn directories_stay_durable_when_their_write_is_abandoned() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = Recorder::default();
+        let abandoned = DurableWrite::new(&recorder);
+        abandoned
+            .stage(root.path().join("new/file"), b"old")
+            .unwrap();
+        drop(abandoned);
+        assert_eq!(recorder.take(), [Call::Dir(root.path().to_owned())]);
+
+        // A later write into the directory relies on it.
+        let retry = DurableWrite::new(&recorder);
+        retry.stage(root.path().join("new/file"), b"new").unwrap();
+        retry.commit().unwrap();
+        assert_eq!(
+            recorder.take(),
+            [Call::Batch(1), Call::Dir(root.path().join("new"))]
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_sync_publishes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = Recorder {
+            fail_batches: true,
+            ..Recorder::default()
+        };
+        let write = DurableWrite::new(&recorder);
+        write.stage(root.path().join("file"), b"contents").unwrap();
+
+        assert_eq!(write.commit().unwrap_err().op, Op::Sync);
+        assert_eq!(names(root.path()), Vec::<String>::new(), "nothing is left");
+        assert_eq!(recorder.take(), [], "no directory is synced");
+    }
+
+    #[test]
+    fn replaces_existing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("head");
+        fs::write(&path, b"old").unwrap();
+        let recorder = Recorder::default();
+        let write = DurableWrite::new(&recorder);
+        write.stage(&path, b"new").unwrap();
+        write.commit().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn dropping_an_uncommitted_write_publishes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = Recorder::default();
+        let write = DurableWrite::new(&recorder);
+        write.stage(root.path().join("file"), b"contents").unwrap();
+        drop(write);
+
+        assert_eq!(names(root.path()), Vec::<String>::new(), "nothing is left");
+        assert_eq!(recorder.take(), []);
+    }
+}
