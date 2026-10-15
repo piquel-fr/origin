@@ -1,6 +1,7 @@
 //! A repository's storage on disk, under its `.origin` directory:
-//! content-addressed objects here, and target chains in
-//! [`targets`](crate::targets).
+//! content-addressed objects here, target chains in
+//! [`targets`](crate::targets), and pending landings in
+//! [`queue`](crate::queue).
 //!
 //! Each object lives in its own zstd-compressed file at
 //! `objects/loose/<first 2 hex digits>/<remaining hex digits>`. Objects are
@@ -184,6 +185,10 @@ impl<P: Platform> Store<P> {
 
     pub(crate) fn index_dir(&self) -> PathBuf {
         self.root.join("index")
+    }
+
+    pub(crate) fn queue_dir(&self) -> PathBuf {
+        self.root.join("queue")
     }
 
     fn path(&self, id: ObjectId) -> PathBuf {

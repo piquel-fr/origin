@@ -1,13 +1,15 @@
-//! Comparing trees, and looking up what they hold.
+//! Comparing trees, merging them, and looking up what they hold.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use origin_platform::Platform;
 use origin_shared::{
-    Digest, EntryKind, EntryName, Inputs, ObjectId, RepoPath, Tree, TreeEntry, TreeId,
+    Digest, EncodedObject, EntryKind, EntryName, Inputs, ObjectId, Record, RepoPath, Tree,
+    TreeEntry, TreeId,
 };
 
+use crate::conflict::Conflict;
 use crate::store::{Store, StoreError};
 
 /// A file that differs between two trees.
@@ -81,6 +83,208 @@ impl<P: Platform> Store<P> {
             self.diff_dir(&path, old_tree, new_tree, changes)?;
         }
         Ok(())
+    }
+}
+
+/// Two trees merged with the changes each made to a common one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Merge {
+    /// The merged tree: both sides' changes, and `ours` where they conflict.
+    pub tree: TreeId,
+    /// The trees the merge made, which the store may not have yet.
+    pub trees: Vec<EncodedObject>,
+    /// The files with conflict markers a [marked](Store::merge_marked)
+    /// merge made, which the store may not have yet either.
+    pub files: Vec<EncodedObject>,
+    /// The paths both sides changed, each its own way, sorted.
+    pub conflicts: Vec<RepoPath>,
+}
+
+impl<P: Platform> Store<P> {
+    /// Merges `ours` and `theirs`, two trees made from `base`, file by file:
+    /// a path one side changed takes that side's version, and a path both
+    /// changed, each its own way, is a conflict, where the merge keeps
+    /// `ours`. A path is a file, so two sides that changed different files
+    /// of a directory merge cleanly. Without a base, every path either side
+    /// has counts as changed. Subtrees with equal ids are never read, so the
+    /// cost follows the size of the changes.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree that differs cannot be read.
+    pub fn merge(
+        &self,
+        base: Option<TreeId>,
+        ours: TreeId,
+        theirs: TreeId,
+    ) -> Result<Merge, StoreError> {
+        self.merge_with(base, ours, theirs, None)
+    }
+
+    /// Merges like [`Store::merge`], but where both sides changed a text
+    /// file, the merged one holds both versions between conflict markers
+    /// naming the sides with `labels`, see [`Conflict::mark`]. Binary files,
+    /// and paths a directory is on either side of, keep `ours`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree that differs, or a file that conflicts, cannot be
+    /// read.
+    pub fn merge_marked(
+        &self,
+        base: Option<TreeId>,
+        ours: TreeId,
+        theirs: TreeId,
+        labels: [&str; 2],
+    ) -> Result<Merge, StoreError> {
+        self.merge_with(base, ours, theirs, Some(labels))
+    }
+
+    fn merge_with(
+        &self,
+        base: Option<TreeId>,
+        ours: TreeId,
+        theirs: TreeId,
+        labels: Option<[&str; 2]>,
+    ) -> Result<Merge, StoreError> {
+        let mut merge = Merge {
+            tree: ours,
+            trees: Vec::new(),
+            files: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let merged = self.merge_dir(
+            &RepoPath::root(),
+            base,
+            Some(ours),
+            Some(theirs),
+            labels,
+            &mut merge,
+        )?;
+        merge.tree = if let Some(tree) = merged {
+            tree
+        } else {
+            let empty = Tree::default().encode();
+            let id = empty.id().into();
+            merge.trees.push(empty);
+            id
+        };
+        merge.trees.sort_unstable_by_key(EncodedObject::id);
+        merge.trees.dedup_by_key(|tree| tree.id());
+        merge.files.sort_unstable_by_key(EncodedObject::id);
+        merge.files.dedup_by_key(|file| file.id());
+        merge.conflicts.sort_unstable();
+        Ok(merge)
+    }
+
+    /// Merges three versions of the directory `dir`, `None` standing for one
+    /// that doesn't exist, returning the merged one, or `None` if it's
+    /// empty.
+    fn merge_dir(
+        &self,
+        dir: &RepoPath,
+        base: Option<TreeId>,
+        ours: Option<TreeId>,
+        theirs: Option<TreeId>,
+        labels: Option<[&str; 2]>,
+        merge: &mut Merge,
+    ) -> Result<Option<TreeId>, StoreError> {
+        if ours == theirs || base == theirs {
+            return Ok(ours);
+        }
+        if base == ours {
+            return Ok(theirs);
+        }
+        let read = |id: Option<TreeId>| id.map(|id| self.get(id)).transpose();
+        let (base, ours, theirs): (Tree, Tree, Tree) = (
+            read(base)?.unwrap_or_default(),
+            read(ours)?.unwrap_or_default(),
+            read(theirs)?.unwrap_or_default(),
+        );
+        let mut names: Vec<&EntryName> = [&base, &ours, &theirs]
+            .into_iter()
+            .flat_map(|tree| tree.iter().map(|(name, _)| name))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut merged = Tree::default();
+        for name in names {
+            let [base, ours, theirs] =
+                [&base, &ours, &theirs].map(|tree| tree.get(name.as_str()).copied());
+            let entry = if ours == theirs || base == theirs {
+                ours
+            } else if base == ours {
+                theirs
+            } else if ours.is_none_or(|ours| ours.kind.is_tree())
+                && theirs.is_none_or(|theirs| theirs.kind.is_tree())
+            {
+                // Both sides changed a directory, or one changed it and the
+                // other removed it: merge it file by file.
+                let subtree = |entry: Option<TreeEntry>| entry.and_then(TreeEntry::subtree);
+                self.merge_dir(
+                    &dir.join(name),
+                    subtree(base),
+                    subtree(ours),
+                    subtree(theirs),
+                    labels,
+                    merge,
+                )?
+                .map(|tree| TreeEntry {
+                    kind: EntryKind::Tree,
+                    id: tree.into(),
+                })
+            } else {
+                merge.conflicts.push(dir.join(name));
+                match labels {
+                    Some(labels) => self.mark(ours, theirs, labels, merge)?,
+                    None => ours,
+                }
+            };
+            if let Some(entry) = entry {
+                merged.insert(name.clone(), entry);
+            }
+        }
+        if merged.is_empty() {
+            return Ok(None);
+        }
+        let encoded = merged.encode();
+        let id = encoded.id().into();
+        merge.trees.push(encoded);
+        Ok(Some(id))
+    }
+
+    /// The entry of a file both sides changed, `ours` and `theirs`, that
+    /// holds both versions between conflict markers: a file on the side
+    /// that removed it is empty. Keeps `ours` if either side isn't a
+    /// regular file, or is binary or missing from the store.
+    fn mark(
+        &self,
+        ours: Option<TreeEntry>,
+        theirs: Option<TreeEntry>,
+        labels: [&str; 2],
+        merge: &mut Merge,
+    ) -> Result<Option<TreeEntry>, StoreError> {
+        let content = |entry: Option<TreeEntry>| match entry {
+            None => Ok(Some(Vec::new())),
+            Some(entry) if matches!(entry.kind, EntryKind::File | EntryKind::Executable) => {
+                self.try_blob(entry.id)
+            }
+            Some(_) => Ok(None),
+        };
+        let (Some(our_content), Some(their_content)) = (content(ours)?, content(theirs)?) else {
+            return Ok(ours);
+        };
+        let Some(marked) = Conflict::mark(&our_content, &their_content, labels) else {
+            return Ok(ours);
+        };
+        let file = EncodedObject::blob(&marked);
+        let kind = ours.or(theirs).map_or(EntryKind::File, |entry| entry.kind);
+        let entry = TreeEntry {
+            kind,
+            id: file.id(),
+        };
+        merge.files.push(file);
+        Ok(Some(entry))
     }
 }
 
@@ -307,6 +511,108 @@ pub(crate) mod tests {
         assert_eq!(store.diff(old, old).unwrap(), []);
         let empty = build(&store, &[]);
         assert_eq!(store.diff(empty, old).unwrap().len(), 5);
+    }
+
+    /// The files of `tree`, by path, with their contents' ids.
+    fn files(store: &Store, tree: TreeId) -> Vec<(String, ObjectId)> {
+        let empty = build(store, &[]);
+        store
+            .diff(empty, tree)
+            .unwrap()
+            .into_iter()
+            .map(|change| (change.path.as_str().to_owned(), change.new.unwrap().id))
+            .collect()
+    }
+
+    #[test]
+    fn merges_changes_to_different_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join(".origin"), Native::default());
+        store.init().unwrap();
+        let base = build(
+            &store,
+            &[
+                ("src/a", "a"),
+                ("src/b", "b"),
+                ("gone/x", "x"),
+                ("same", "s"),
+            ],
+        );
+        // Ours edits a file and removes a directory; theirs edits another
+        // file of the same directory, adds one, and makes the same edit.
+        let ours = build(&store, &[("src/a", "a2"), ("src/b", "b"), ("same", "s2")]);
+        let theirs = build(
+            &store,
+            &[
+                ("src/a", "a"),
+                ("src/b", "b2"),
+                ("gone/x", "x"),
+                ("new/deep", "n"),
+                ("same", "s2"),
+            ],
+        );
+        let merge = store.merge(Some(base), ours, theirs).unwrap();
+        assert_eq!(merge.conflicts, Vec::<RepoPath>::new());
+        let expected = build(
+            &store,
+            &[
+                ("src/a", "a2"),
+                ("src/b", "b2"),
+                ("new/deep", "n"),
+                ("same", "s2"),
+            ],
+        );
+        assert_eq!(files(&store, merge.tree), files(&store, expected));
+        assert_eq!(merge.tree, expected, "trees are canonical");
+        assert!(
+            merge.trees.iter().any(|tree| tree.id() == expected.into()),
+            "the merged trees are returned to be written"
+        );
+
+        // Merging onto an unchanged base reads nothing and makes no tree.
+        let unchanged = store.merge(Some(base), ours, base).unwrap();
+        assert_eq!((unchanged.tree, unchanged.trees), (ours, Vec::new()));
+    }
+
+    #[test]
+    fn conflicts_keep_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join(".origin"), Native::default());
+        store.init().unwrap();
+        let base = build(
+            &store,
+            &[("edit", "1"), ("dir/removed", "r"), ("file", "f")],
+        );
+        let ours = build(
+            &store,
+            &[("edit", "ours"), ("dir/removed", "r2"), ("file", "f")],
+        );
+        let theirs = build(
+            &store,
+            &[("edit", "theirs"), ("file/now-dir", "d"), ("other", "o")],
+        );
+        let merge = store.merge(Some(base), ours, theirs).unwrap();
+        let paths: Vec<_> = merge.conflicts.iter().map(RepoPath::as_str).collect();
+        assert_eq!(
+            paths,
+            ["dir/removed", "edit"],
+            "both edited `edit`; ours edited what theirs removed"
+        );
+        let expected = build(
+            &store,
+            &[
+                ("edit", "ours"),
+                ("dir/removed", "r2"),
+                ("file/now-dir", "d"),
+                ("other", "o"),
+            ],
+        );
+        assert_eq!(files(&store, merge.tree), files(&store, expected));
+
+        // Without a base, both sides added everything.
+        let unrelated = store.merge(None, ours, theirs).unwrap();
+        let paths: Vec<_> = unrelated.conflicts.iter().map(RepoPath::as_str).collect();
+        assert_eq!(paths, ["edit", "file"]);
     }
 
     #[test]

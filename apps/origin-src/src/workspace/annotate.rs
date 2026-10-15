@@ -30,7 +30,7 @@ impl WorkingCopy {
 
 impl Workspace {
     /// This node, which issues the statements core makes.
-    fn node_principal(&self) -> Principal {
+    pub(super) fn node_principal(&self) -> Principal {
         Principal::Node(self.config.node().clone())
     }
 
@@ -187,7 +187,7 @@ impl Workspace {
         let working_copy = self.refresh()?;
         let mut annotations = Annotations::open(&self.store)?;
         let revision = working_copy.find_revision(annotations.index(), rev)?;
-        let promoted = annotations.promote(revision, &self.node_principal())?;
+        let promoted = annotations.promote(RecordId::Revision(revision), &self.node_principal())?;
         if promoted.is_empty() {
             println!("Nothing to promote to revision {}", revision.short());
         }

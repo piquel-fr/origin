@@ -304,13 +304,14 @@ impl<'a, P: Platform> Annotations<'a, P> {
         self.index.remember_digests(self.store, &digests.concat())
     }
 
-    /// The statements promoting results to `revision`, as `issuer` would
+    /// The statements promoting results to `subject`, as `issuer` would
     /// issue them, without writing them, sorted by kind: for each
     /// [promotion group](Statement::promotion_group), the latest statement
-    /// about another record with the same input digest as the revision,
+    /// about another record with the same input digest as the subject,
     /// unless its issuer superseded it. Groups whose kind and issuer the
-    /// revision already has a result of, directly or promoted, are skipped:
-    /// a result that ran there wins.
+    /// subject already has a result of, directly or promoted, are skipped:
+    /// a result that ran there wins. A statement has no snapshot, so
+    /// nothing is promoted to one.
     ///
     /// # Errors
     ///
@@ -318,11 +319,12 @@ impl<'a, P: Platform> Annotations<'a, P> {
     /// be remembered.
     pub fn promotions(
         &mut self,
-        revision: RevisionId,
+        subject: RecordId,
         issuer: &Principal,
     ) -> Result<Vec<Statement>, StoreError> {
-        let subject = RecordId::Revision(revision);
-        let snapshot = self.store.get(revision)?.snapshot;
+        let Some(snapshot) = self.store.snapshot_of(subject)? else {
+            return Ok(Vec::new());
+        };
         self.compute_digests()?;
 
         // The results the revision has that hold, by kind and original
@@ -367,7 +369,7 @@ impl<'a, P: Platform> Annotations<'a, P> {
         Ok(promotions)
     }
 
-    /// Issues the [`promotions`](Self::promotions) to `revision` as
+    /// Issues the [`promotions`](Self::promotions) to `subject` as
     /// `issuer`, returning them.
     ///
     /// # Errors
@@ -376,10 +378,10 @@ impl<'a, P: Platform> Annotations<'a, P> {
     /// be written.
     pub fn promote(
         &mut self,
-        revision: RevisionId,
+        subject: RecordId,
         issuer: &Principal,
     ) -> Result<Vec<(StatementId, Statement)>, StoreError> {
-        let promotions = self.promotions(revision, issuer)?;
+        let promotions = self.promotions(subject, issuer)?;
         let encoded: Vec<_> = promotions.iter().map(Statement::encode).collect();
         self.store.write_all(&encoded)?;
         Ok(encoded
@@ -687,7 +689,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use origin_shared::{Base, BlobId, Digest, Inputs, RepoPath, Revision, Verdict};
+    use origin_shared::{Base, BlobId, Digest, Inputs, RepoPath, Revision, RevisionId, Verdict};
 
     use super::*;
     use crate::tree::tests::build;
@@ -766,7 +768,7 @@ mod tests {
         let promoter = principal("node:queue");
         Annotations::open(store)
             .unwrap()
-            .promote(revision, &promoter)
+            .promote(RecordId::Revision(revision), &promoter)
             .unwrap()
             .into_iter()
             .map(|(_, statement)| {
