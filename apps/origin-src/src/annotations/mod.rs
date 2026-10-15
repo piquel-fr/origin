@@ -300,7 +300,9 @@ pub enum AnnotateError {
 
 #[cfg(test)]
 mod tests {
-    use origin_shared::{Base, BlobId, Digest, Inputs, ObjectId, RepoPath, Revision, Verdict};
+    use origin_shared::{
+        Base, BlobId, Digest, Inputs, ObjectId, RepoPath, Revision, RevisionId, Verdict,
+    };
 
     use super::*;
     use crate::tree::tests::build;
@@ -382,7 +384,7 @@ mod tests {
         let promoter = principal("node:queue");
         Annotations::open(store)
             .unwrap()
-            .promote(revision, &promoter)
+            .promote(RecordId::Revision(revision), &promoter)
             .unwrap()
             .into_iter()
             .map(|(_, statement)| {
