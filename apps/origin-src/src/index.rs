@@ -221,6 +221,55 @@ impl Index {
     pub fn statements(&self, subject: RecordId) -> &[StatementId] {
         self.statements.get(&subject).map_or(&[], Vec::as_slice)
     }
+
+    /// The one change whose id starts with `prefix`, a few hex digits.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no change, or more than one, has an id starting with
+    /// `prefix`.
+    pub fn find_change(&self, prefix: &str) -> Result<ChangeId, FindChangeError> {
+        let prefix = prefix.to_ascii_lowercase();
+        if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FindChangeError::Invalid(prefix));
+        }
+        let mut matches: Vec<ChangeId> = self
+            .changes
+            .keys()
+            .filter(|change| change.to_hex().starts_with(&prefix))
+            .copied()
+            .collect();
+        match matches.len() {
+            0 => Err(FindChangeError::NotFound(prefix)),
+            1 => Ok(matches[0]),
+            _ => {
+                matches.sort_unstable();
+                Err(FindChangeError::Ambiguous { prefix, matches })
+            }
+        }
+    }
+}
+
+/// A change id prefix that doesn't name exactly one change.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FindChangeError {
+    /// It isn't hex digits.
+    #[error("`{0}` is not a change id")]
+    Invalid(String),
+    /// No change has an id starting with it.
+    #[error("no change has an id starting with `{0}`")]
+    NotFound(String),
+    /// Several changes do.
+    #[error(
+        "`{prefix}` could be any of the changes {}",
+        matches.iter().map(ChangeId::to_hex).collect::<Vec<_>>().join(", ")
+    )]
+    Ambiguous {
+        /// The prefix.
+        prefix: String,
+        /// The changes whose ids start with it.
+        matches: Vec<ChangeId>,
+    },
 }
 
 /// What the index keeps of one record: its id, and the fields it's looked
@@ -732,6 +781,38 @@ mod tests {
         assert!(!index.is_divergent(c));
         assert_eq!(index.revisions(c).len(), 4);
         assert_eq!(index.heads(change(2)), [], "unknown changes have none");
+    }
+
+    #[test]
+    fn finds_changes_by_unique_prefix() {
+        let (_dir, store) = store();
+        let ab = ChangeId::from_bytes([0xab; 16]);
+        let ac = ChangeId::from_bytes([0xac; 16]);
+        store
+            .write_all(&[revision(ab, &[], "ab"), revision(ac, &[], "ac")])
+            .unwrap();
+        let index = Index::open(&store).unwrap();
+
+        assert_eq!(index.find_change("ab"), Ok(ab));
+        assert_eq!(index.find_change("AC"), Ok(ac), "either case");
+        assert_eq!(index.find_change(&ab.to_hex()), Ok(ab));
+        assert_eq!(
+            index.find_change("a"),
+            Err(FindChangeError::Ambiguous {
+                prefix: "a".to_owned(),
+                matches: vec![ab, ac]
+            })
+        );
+        assert!(matches!(
+            index.find_change("ff"),
+            Err(FindChangeError::NotFound(_))
+        ));
+        for invalid in ["", "xyz"] {
+            assert!(matches!(
+                index.find_change(invalid),
+                Err(FindChangeError::Invalid(_))
+            ));
+        }
     }
 
     /// Records arriving in several batches, out of order and some twice.

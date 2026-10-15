@@ -3,6 +3,7 @@ use std::fmt;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
+use crate::id::hex;
 use crate::{AcceptanceId, RevisionId, StatementId, TargetId, TreeId};
 
 pub use ed25519_dalek::Signature;
@@ -147,6 +148,12 @@ impl NodeKey {
         Self(SigningKey::from_bytes(secret))
     }
 
+    /// The secret key, to keep the key pair somewhere safe.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; ed25519_dalek::SECRET_KEY_LENGTH] {
+        self.0.to_bytes()
+    }
+
     /// The public half, which verifies the node's signatures.
     #[must_use]
     pub fn public(&self) -> NodePublicKey {
@@ -161,9 +168,15 @@ impl fmt::Debug for NodeKey {
     }
 }
 
-/// A node's public key.
+/// A node's public key, displayed as lowercase hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodePublicKey(VerifyingKey);
+
+impl fmt::Display for NodePublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::string(self.0.as_bytes()))
+    }
+}
 
 /// A signature that the claimed signer did not make.
 #[derive(Debug, thiserror::Error)]
