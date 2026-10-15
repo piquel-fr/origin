@@ -1,10 +1,12 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::str::FromStr;
 
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
 use crate::name::names;
 use crate::{
-    AcceptanceId, BlobId, Digest, Principal, RepoPath, RevisionId, StatementId, TreeEntry, TreeId,
+    AcceptanceId, BlobId, Digest, InvalidName, Principal, RepoPath, RevisionId, StatementId,
+    TreeEntry, TreeId,
 };
 
 /// An attributable claim about another record: a check result, a review, a
@@ -158,6 +160,23 @@ impl fmt::Display for Verdict {
             Self::Fail => "fail",
             Self::Neutral => "neutral",
         })
+    }
+}
+
+/// Parses the names [`Verdict`] displays as: `pass`, `fail` and `neutral`.
+impl FromStr for Verdict {
+    type Err = InvalidName;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "pass" => Ok(Self::Pass),
+            "fail" => Ok(Self::Fail),
+            "neutral" => Ok(Self::Neutral),
+            _ => Err(InvalidName {
+                what: "verdict",
+                name: input.to_owned(),
+            }),
+        }
     }
 }
 
@@ -352,5 +371,13 @@ mod tests {
             assert!(reserved.is_reserved(), "{reserved:?}");
         }
         assert!(!Kind::new("corex.test").unwrap().is_reserved());
+    }
+
+    #[test]
+    fn verdicts_parse_as_they_display() {
+        for verdict in [Verdict::Pass, Verdict::Fail, Verdict::Neutral] {
+            assert_eq!(verdict.to_string().parse::<Verdict>().unwrap(), verdict);
+        }
+        assert!("Pass".parse::<Verdict>().is_err());
     }
 }

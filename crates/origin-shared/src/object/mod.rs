@@ -395,6 +395,9 @@ pub(crate) mod tests {
         acceptance.verify(&sample_key().public()).unwrap();
         let other = NodeKey::from_bytes(&[1; 32]);
         assert!(acceptance.verify(&other.public()).is_err());
+        let public = sample_key().public();
+        assert_eq!(public.to_string().parse::<NodePublicKey>().unwrap(), public);
+        assert!("ab".parse::<NodePublicKey>().is_err());
 
         // Any change to the body breaks the signature: here the sequence
         // number, right after the kind and the target id.
