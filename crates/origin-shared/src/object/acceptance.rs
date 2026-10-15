@@ -1,10 +1,11 @@
 use std::fmt;
+use std::str::FromStr;
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
 use crate::id::hex;
-use crate::{AcceptanceId, RevisionId, StatementId, TargetId, TreeId};
+use crate::{AcceptanceId, ParseIdError, RevisionId, StatementId, TargetId, TreeId};
 
 pub use ed25519_dalek::Signature;
 
@@ -175,6 +176,21 @@ pub struct NodePublicKey(VerifyingKey);
 impl fmt::Display for NodePublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::string(self.0.as_bytes()))
+    }
+}
+
+/// Parses the hex [`NodePublicKey`] displays as.
+impl FromStr for NodePublicKey {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        hex::decode(input)
+            .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+            .map(Self)
+            .ok_or_else(|| ParseIdError {
+                what: "node public key",
+                input: input.to_owned(),
+            })
     }
 }
 
