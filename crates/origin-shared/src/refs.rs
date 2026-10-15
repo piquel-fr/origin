@@ -102,7 +102,7 @@ pub struct InvalidBranchName(pub String);
 
 /// A compare-and-swap of one branch. Updates are applied in transactions:
 /// all of them succeed, or none do.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct RefUpdate {
     /// The branch to move.
     pub branch: BranchName,

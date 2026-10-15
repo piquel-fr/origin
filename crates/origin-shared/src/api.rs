@@ -180,6 +180,8 @@ pub enum ErrorCode {
     BadRequest,
     /// A repository, branch, path, or object does not exist.
     NotFound,
+    /// A branch is not where a push expected it: someone else pushed first.
+    Conflict,
     /// The server failed.
     Internal,
 }

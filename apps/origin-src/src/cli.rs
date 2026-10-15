@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use origin_shared::BranchName;
 
 use crate::http::ServerConfig;
 use crate::repository::{RepoConfig, Repository};
@@ -27,6 +28,17 @@ enum Command {
         /// Where to create it.
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Check out a branch of a remote repository. Only the latest commit is
+    /// downloaded; history is fetched when needed.
+    Clone {
+        /// The repository: `http://host[:port]/<repository>`, or a path.
+        url: String,
+        /// Where to check it out. Defaults to the repository's name.
+        path: Option<PathBuf>,
+        /// The branch to check out.
+        #[arg(short, long)]
+        branch: Option<BranchName>,
     },
     /// Serve repositories over HTTP.
     Serve {
@@ -72,6 +84,15 @@ enum WorkspaceCommand {
         #[arg(short = 'n', long)]
         limit: Option<usize>,
     },
+    /// Show the remote, or set it.
+    Remote {
+        /// The new remote: `http://host[:port]/<repository>`, or a path.
+        url: Option<String>,
+    },
+    /// Fast-forward the current branch to the remote's.
+    Pull,
+    /// Send the current branch's new commits to the remote.
+    Push,
 }
 
 impl Cli {
@@ -83,25 +104,32 @@ impl Cli {
     pub async fn run(self) -> Result<()> {
         match self.command {
             Command::Init { path } => Workspace::init(&path)?,
+            Command::Clone { url, path, branch } => {
+                Workspace::clone(&url, path.as_deref(), branch).await?;
+            }
             Command::Serve { config } => ServerConfig::load(&config)?.serve().await?,
             Command::Repo(RepoCommand::Create { path, description }) => {
                 Repository::create(&path, &RepoConfig { description })?;
             }
-            Command::Workspace(command) => command.run()?,
+            Command::Workspace(command) => command.run().await?,
         }
         Ok(())
     }
 }
 
 impl WorkspaceCommand {
-    fn run(self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         let cwd = env::current_dir().context("cannot read the current directory")?;
-        let workspace = Workspace::discover(&cwd)?;
+        let mut workspace = Workspace::discover(&cwd)?;
         match self {
             Self::Status => workspace.status()?,
             Self::Diff => workspace.diff()?,
             Self::Commit { message } => workspace.commit(message)?,
-            Self::Log { limit } => workspace.log(limit)?,
+            Self::Log { limit } => workspace.log(limit).await?,
+            Self::Remote { url: None } => workspace.show_remote(),
+            Self::Remote { url: Some(url) } => workspace.set_remote(&url)?,
+            Self::Pull => workspace.pull().await?,
+            Self::Push => workspace.push().await?,
         }
         Ok(())
     }

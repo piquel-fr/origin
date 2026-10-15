@@ -19,6 +19,7 @@ fixture = []
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+origin-client.workspace = true
 origin-shared.workspace = true
 serde.workspace = true
 similar.workspace = true
@@ -33,7 +34,6 @@ zstd.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
-origin-client.workspace = true
 # The benchmarks build their working trees with the fixtures.
 origin-src = { workspace = true, features = ["fixture"] }
 serde_json.workspace = true

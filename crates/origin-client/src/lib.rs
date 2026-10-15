@@ -22,7 +22,7 @@ use origin_shared::api::{
     ApiError, CommitsRequest, ListedEntry, Location, ObjectsRequest, RepoInfo, RepoName,
     RepoSummary,
 };
-use origin_shared::pack::{Pack, PackError};
+use origin_shared::pack::{Pack, PackError, PushRequest};
 use reqwest::{Method, RequestBuilder};
 use serde::de::DeserializeOwned;
 
@@ -74,6 +74,9 @@ endpoints! {
         /// Fetches the objects at some paths of a commit.
         fn fetch_objects(request: &ObjectsRequest) -> Pack =
             POST "objects", json(request) => pack;
+        /// Moves branches, with the objects their new commits add, as one
+        /// transaction: every branch moves, or none does.
+        fn push(push: &PushRequest) -> () = POST "push", body(push.encode()) => empty;
     }
 }
 
@@ -160,6 +163,11 @@ impl Response {
 
     async fn pack(self) -> Result<Pack, Error> {
         Ok(Pack::decode(&self.bytes().await?)?)
+    }
+
+    /// Reads a response without content to the end.
+    async fn empty(self) -> Result<(), Error> {
+        self.bytes().await.map(drop)
     }
 }
 

@@ -262,6 +262,68 @@
         }
       }
     },
+    "/api/v1/repos/{repo}/push": {
+      "post": {
+        "summary": "Moves branches, with the objects their new commits add, as one\ntransaction. The body is a push (see `origin_shared::pack`).",
+        "operationId": "push",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "$ref": "#/components/schemas/Binary"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Every branch moved"
+          },
+          "400": {
+            "description": "The push is incomplete or malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A branch moved since the pusher looked; nothing changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/repos/{repo}/tree": {
       "get": {
         "summary": "Lists a directory on a branch.",
@@ -419,6 +481,7 @@
         "enum": [
           "bad_request",
           "not_found",
+          "conflict",
           "internal"
         ]
       },

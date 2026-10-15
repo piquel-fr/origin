@@ -1,12 +1,15 @@
-//! The binary format objects travel in.
+//! The binary formats objects travel in.
 //!
 //! A pack is a sequence of entries, each
 //! `id:[u8; 32] len:u64 bytes:[u8; len]` with `bytes` the object's encoding.
 //! Decoding verifies every object against its id, so a pack can come from an
 //! untrusted peer.
+//!
+//! A push is `len:u32 updates:[u8; len] pack`, with `updates` the JSON list
+//! of branch updates.
 
 use crate::object::IdMismatch;
-use crate::{EncodedObject, ObjectId};
+use crate::{EncodedObject, ObjectId, RefUpdate};
 
 /// A batch of objects.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -58,15 +61,61 @@ impl Pack {
     }
 }
 
-/// Bytes that are not a valid pack.
+/// Branch updates with the objects they need, applied as one transaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PushRequest {
+    /// The branches to move, all or none.
+    pub updates: Vec<RefUpdate>,
+    /// Every object the new commits add, relative to their first parent.
+    pub pack: Pack,
+}
+
+impl PushRequest {
+    /// Encodes the push.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updates do not fit the 4 GiB header, which would take
+    /// tens of millions of branches.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let updates = serde_json::to_vec(&self.updates).expect("updates serialize to JSON");
+        let len = u32::try_from(updates.len()).expect("updates fit in 4 GiB");
+        let mut out = len.to_le_bytes().to_vec();
+        out.extend_from_slice(&updates);
+        out.extend_from_slice(&self.pack.encode());
+        out
+    }
+
+    /// Decodes and verifies a push.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the push is truncated, its updates are invalid, or an object
+    /// does not match its id.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PackError> {
+        let (len, rest) = bytes.split_first_chunk::<4>().ok_or(PackError::Truncated)?;
+        let len = usize::try_from(u32::from_le_bytes(*len)).map_err(|_| PackError::Truncated)?;
+        let (updates, pack) = rest.split_at_checked(len).ok_or(PackError::Truncated)?;
+        Ok(Self {
+            updates: serde_json::from_slice(updates)?,
+            pack: Pack::decode(pack)?,
+        })
+    }
+}
+
+/// Bytes that are not a valid pack or push.
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
-    /// The pack ended in the middle of an entry.
+    /// The bytes ended in the middle of an entry.
     #[error("pack is truncated")]
     Truncated,
     /// An object does not match its id.
     #[error(transparent)]
     Corrupt(#[from] IdMismatch),
+    /// A push's branch updates are invalid.
+    #[error("invalid branch updates")]
+    Updates(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -80,6 +129,26 @@ mod tests {
         };
         assert_eq!(Pack::decode(&pack.encode()).unwrap(), pack);
         assert_eq!(Pack::decode(&[]).unwrap(), Pack::default());
+    }
+
+    #[test]
+    fn pushes_round_trip() {
+        let blob = EncodedObject::blob(b"a");
+        let push = PushRequest {
+            updates: vec![RefUpdate {
+                branch: crate::BranchName::default(),
+                expected: None,
+                new: Some(blob.id()),
+            }],
+            pack: Pack {
+                objects: vec![blob],
+            },
+        };
+        assert_eq!(PushRequest::decode(&push.encode()).unwrap(), push);
+        assert!(matches!(
+            PushRequest::decode(&[9, 0, 0, 0, b'[']),
+            Err(PackError::Truncated)
+        ));
     }
 
     #[test]

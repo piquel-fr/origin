@@ -2,10 +2,12 @@
 //!
 //! ```text
 //! .origin/
-//!   config.toml   the checked-out branch
-//!   branches      local branches (see `RefStore`)
-//!   objects/      local objects (see `ObjectStore`)
-//!   state         the stat cache of the last snapshot
+//!   config.toml       the checked-out branch and the remote
+//!   branches          local branches (see `RefStore`)
+//!   remote-branches   where the remote's branches were when last synced
+//!   objects/          local objects (see `ObjectStore`): only what was
+//!                     fetched or created here, not the whole repository
+//!   state             the stat cache of the last snapshot
 //! ```
 
 use std::env;
@@ -18,9 +20,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::output::FileDiff;
 use crate::refs::{RefError, RefStore};
+use crate::remote::Remote;
 use crate::store::{ObjectStore, StoreError};
+use crate::sync::{Pulled, Pushed, Sync, SyncError};
 use crate::tree::Change;
-use crate::worktree::{Snapshot, SnapshotError, StatCache};
+use crate::worktree::{Checkout, Snapshot, SnapshotError, StatCache};
 
 /// A working copy and its local repository.
 #[derive(Debug)]
@@ -29,6 +33,7 @@ pub struct Workspace {
     meta: PathBuf,
     objects: ObjectStore,
     branches: RefStore,
+    remote_branches: RefStore,
     config: Config,
 }
 
@@ -37,6 +42,9 @@ pub struct Workspace {
 struct Config {
     /// The checked-out branch. It may not exist yet in a new repository.
     branch: BranchName,
+    /// Where to push and pull: a URL, or the path of a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
 }
 
 impl Workspace {
@@ -51,17 +59,30 @@ impl Workspace {
     /// Fails if `root` already has a repository or cannot be written.
     pub fn init(root: &Path) -> Result<(), WorkspaceError> {
         let root = path::absolute(root).map_err(|source| WorkspaceError::io(root, source))?;
-        let meta = root.join(Self::META_DIR);
-        if meta.exists() {
-            return Err(WorkspaceError::AlreadyInitialized(root));
-        }
-        fs::create_dir_all(&meta).map_err(|source| WorkspaceError::io(&meta, source))?;
-        let config = Config {
-            branch: BranchName::default(),
-        };
-        Self::with_config(root.clone(), config).save_config()?;
+        Self::create(&root, BranchName::default(), None)?;
         println!("Initialized an empty repository in {}", root.display());
         Ok(())
+    }
+
+    /// Creates a repository in `root`, on a `branch` without commits.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `root` already has a repository or cannot be written.
+    pub fn create(
+        root: &Path,
+        branch: BranchName,
+        remote: Option<String>,
+    ) -> Result<Self, WorkspaceError> {
+        let meta = root.join(Self::META_DIR);
+        if meta.exists() {
+            return Err(WorkspaceError::AlreadyInitialized(root.to_owned()));
+        }
+        fs::create_dir_all(&meta).map_err(|source| WorkspaceError::io(&meta, source))?;
+        let config = Config { branch, remote };
+        let workspace = Self::with_config(root.to_owned(), config);
+        workspace.save_config()?;
+        Ok(workspace)
     }
 
     /// Opens the working copy containing `start`.
@@ -88,6 +109,7 @@ impl Workspace {
         Self {
             objects: ObjectStore::new(meta.join("objects")),
             branches: RefStore::new(meta.join("branches")),
+            remote_branches: RefStore::new(meta.join("remote-branches")),
             root,
             meta,
             config,
@@ -127,8 +149,87 @@ impl Workspace {
         Ok(self.branches.get(&self.config.branch)?)
     }
 
-    /// Returns the root tree of `head`
-    fn head_tree(&self, head: Option<ObjectId>) -> Result<Option<ObjectId>, WorkspaceError> {
+    /// Moves the checked-out branch, if it is still at `expected`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the branch moved or the branches cannot be written.
+    pub fn move_head(
+        &self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<(), WorkspaceError> {
+        Ok(self.branches.update(&[RefUpdate {
+            branch: self.config.branch.clone(),
+            expected,
+            new: Some(new),
+        }])?)
+    }
+
+    /// The remote to push to and pull from.
+    #[must_use]
+    pub fn remote(&self) -> Option<&str> {
+        self.config.remote.as_deref()
+    }
+
+    /// `origin remote`: prints the remote.
+    pub fn show_remote(&self) {
+        println!("{}", self.remote().unwrap_or("No remote."));
+    }
+
+    /// `origin remote <url>`: sets the remote. Pushing and pulling start over
+    /// from what the new remote has.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `url` is not a valid remote or the configuration cannot be
+    /// written.
+    pub fn set_remote(&mut self, url: &str) -> Result<(), SyncError> {
+        let url = Self::absolute_url(url)?;
+        Remote::open(&url)?;
+        self.config.remote = Some(url);
+        self.save_config()?;
+        let path = self.meta.join("remote-branches");
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                Err(WorkspaceError::io(&path, error).into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Where the checked-out branch was on the remote when last synced.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote branches cannot be read.
+    pub fn tracking(&self) -> Result<Option<ObjectId>, WorkspaceError> {
+        Ok(self.remote_branches.get(&self.config.branch)?)
+    }
+
+    /// Records that the checked-out branch moved on the remote.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote branches cannot be written.
+    pub fn set_tracking(
+        &self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<(), WorkspaceError> {
+        Ok(self.remote_branches.update(&[RefUpdate {
+            branch: self.config.branch.clone(),
+            expected,
+            new: Some(new),
+        }])?)
+    }
+
+    /// The root tree of a commit, or `None` for no commit.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the commit cannot be read.
+    pub fn head_tree(&self, head: Option<ObjectId>) -> Result<Option<ObjectId>, WorkspaceError> {
         Ok(head
             .map(|id| self.objects.commit(id))
             .transpose()?
@@ -150,6 +251,22 @@ impl Workspace {
                 .map_err(|source| WorkspaceError::io(&path, source))?;
         }
         Ok(tree)
+    }
+
+    /// Moves a working copy matching the tree `old` to the tree `new`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if an object is missing or a file cannot be written.
+    pub fn checkout(&self, old: Option<ObjectId>, new: ObjectId) -> Result<(), WorkspaceError> {
+        let path = self.meta.join("state");
+        let mut cache = StatCache::load(&path);
+        let changes = self.objects.diff(old, Some(new))?;
+        let staging = self.meta.join("staging");
+        Checkout::new(&self.root, &self.objects, &staging).apply(&changes, &mut cache)?;
+        cache
+            .save(&path)
+            .map_err(|source| WorkspaceError::io(&path, source))
     }
 
     /// Snapshots the working copy and lists how it differs from the head.
@@ -236,22 +353,100 @@ impl Workspace {
     }
 
     /// `origin log`: prints the history of the checked-out branch, newest
-    /// first, following first parents.
+    /// first, following first parents. Commits missing locally are fetched.
     ///
     /// # Errors
     ///
-    /// Fails if the head or a commit cannot be read.
-    pub fn log(&self, limit: Option<usize>) -> Result<(), WorkspaceError> {
+    /// Fails if the head or a commit cannot be read or fetched.
+    pub async fn log(&self, limit: Option<usize>) -> Result<(), SyncError> {
+        let sync = Sync::new(self)?;
         let mut next = self.head()?;
         for _ in 0..limit.unwrap_or(usize::MAX) {
             let Some(id) = next else { break };
-            let commit = self.objects.commit(id)?;
+            let commit = sync.commit(id).await?;
             let date = commit.author.time().strftime("%Y-%m-%d %H:%M %z");
             println!("{}  {date}  {}", id.short(), commit.author.name);
             for line in commit.message.lines() {
                 println!("    {line}");
             }
             next = commit.parents.first().copied();
+        }
+        Ok(())
+    }
+
+    /// `origin clone`: checks out `branch` of the repository at `url` into
+    /// `path`, or a directory named after the repository.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Sync::clone`], or if `path` is missing and the
+    /// repository's name cannot be told from `url`.
+    pub async fn clone(
+        url: &str,
+        path: Option<&Path>,
+        branch: Option<BranchName>,
+    ) -> Result<(), SyncError> {
+        let url = Self::absolute_url(url)?;
+        let name = Path::new(url.trim_end_matches('/')).file_name();
+        let root = path
+            .or(name.map(Path::new))
+            .ok_or_else(|| SyncError::Unnamed(url.clone()))?;
+        let root = path::absolute(root).map_err(|source| WorkspaceError::io(root, source))?;
+        let workspace = Sync::clone(&url, &root, branch).await?;
+        match workspace.head()? {
+            Some(head) => println!(
+                "Cloned {} at {} into {}",
+                workspace.branch(),
+                head.short(),
+                root.display()
+            ),
+            None => println!("Cloned an empty repository into {}", root.display()),
+        }
+        Ok(())
+    }
+
+    /// Makes a remote `url` independent of the current directory: local
+    /// paths become absolute, URLs are kept.
+    fn absolute_url(url: &str) -> Result<String, WorkspaceError> {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return Ok(url.to_owned());
+        }
+        let path =
+            path::absolute(url).map_err(|source| WorkspaceError::io(Path::new(url), source))?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// `origin pull`: fast-forwards the checked-out branch to the remote's.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Sync::pull`].
+    pub async fn pull(&self) -> Result<(), SyncError> {
+        match Sync::new(self)?.pull().await? {
+            Pulled::UpToDate => println!("Already up to date."),
+            Pulled::FastForwarded { to, files } => {
+                println!("Fast-forwarded to {}: {files} files changed", to.short());
+            }
+        }
+        Ok(())
+    }
+
+    /// `origin push`: sends the checked-out branch's new commits to the
+    /// remote.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Sync::push`].
+    pub async fn push(&self) -> Result<(), SyncError> {
+        match Sync::new(self)?.push().await? {
+            Pushed::UpToDate => println!("Everything up to date."),
+            Pushed::Pushed { to, commits } => {
+                println!(
+                    "Pushed {commits} commits: {} is at {}",
+                    self.branch(),
+                    to.short()
+                );
+            }
         }
         Ok(())
     }
