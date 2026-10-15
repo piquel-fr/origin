@@ -29,9 +29,7 @@ macro_rules! ids {
             /// The full id as lowercase hex.
             #[must_use]
             pub fn to_hex(&self) -> String {
-                let mut hex = [0; 2 * $len];
-                hex::encode(&self.0, &mut hex);
-                String::from_utf8(hex.to_vec()).expect("hex digits are ASCII")
+                hex::string(&self.0)
             }
 
             /// An abbreviated id for display to humans.
@@ -192,12 +190,19 @@ pub struct ParseIdError {
     pub input: String,
 }
 
-/// Lowercase hex, without allocating.
-mod hex {
+/// Lowercase hex.
+pub(crate) mod hex {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
     /// Number of hex digits a short id has.
     pub const SHORT_LEN: usize = 12;
+
+    /// `bytes` as a string of lowercase hex.
+    pub fn string(bytes: &[u8]) -> String {
+        let mut hex = vec![0; 2 * bytes.len()];
+        encode(bytes, &mut hex);
+        String::from_utf8(hex).expect("hex digits are ASCII")
+    }
 
     /// Writes the two digits of each byte of `bytes` to `out`, which is
     /// twice as long.

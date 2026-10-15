@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Development tasks for the origin workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+origin-src = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true
