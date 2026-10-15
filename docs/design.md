@@ -379,7 +379,11 @@ and stops at the first one that waits.
      several, as git's recursive strategy does. The merge is checked as a
      revision on the tip, authored by the queue's node, so results about the
      same merge on another target never count.
-   - A landing that changes nothing is skipped.
+   - A landing that changes nothing is skipped: the target already has it.
+     But a merge of another target's tip that changes nothing still lands,
+     as an acceptance of the same state that needs no evidence, so later
+     merges start from it, unless either tip is already in the other's
+     history: then neither has anything the other lacks.
 3. **On conflict,** issue a `core.conflict` statement and keep the landing
    blocked. Nothing fails, and landing again retries it.
 4. **Check the policy** in force *now*:
