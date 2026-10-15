@@ -69,7 +69,10 @@ impl fmt::Debug for EntryName {
 }
 
 /// What a tree entry points to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum EntryKind {
     /// A regular file, pointing to a blob.

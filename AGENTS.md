@@ -7,8 +7,8 @@ currently contains the first prototype.
 
 - `crates/origin-shared`: the object model, wire formats, and API contracts
   shared by every component.
-- `crates/origin-client`: the HTTP client, generated from the server's OpenAPI
-  document. Never edit generated code by hand.
+- `crates/origin-client`: the SDK, a typed client for origin servers. Each
+  endpoint is one line of its `endpoints!` macro.
 - `apps/origin-src`: the `origin` binary, both the command line and the
   server.
 

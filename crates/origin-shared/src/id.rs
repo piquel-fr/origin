@@ -5,7 +5,20 @@ use std::str::FromStr;
 ///
 /// Ids are only produced by hashing ([`crate::EncodedObject`]) or by parsing
 /// one that was produced that way, so an id always names some encoding.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(try_from = "String", into = "String")]
+#[schema(value_type = String, example = "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b")]
 pub struct ObjectId([u8; Self::LEN]);
 
 impl ObjectId {
@@ -65,6 +78,20 @@ pub struct ParseObjectIdError {
     input: String,
     #[source]
     source: blake3::HexError,
+}
+
+impl TryFrom<String> for ObjectId {
+    type Error = ParseObjectIdError;
+
+    fn try_from(hex: String) -> Result<Self, Self::Error> {
+        hex.parse()
+    }
+}
+
+impl From<ObjectId> for String {
+    fn from(id: ObjectId) -> Self {
+        id.to_hex()
+    }
 }
 
 impl FromStr for ObjectId {

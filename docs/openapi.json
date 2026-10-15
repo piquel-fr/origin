@@ -1,0 +1,530 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "origin API",
+    "description": "Repository management and object transfer for origin servers.",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "v1"
+  },
+  "paths": {
+    "/api/v1/openapi.json": {
+      "get": {
+        "summary": "The OpenAPI document of this API.",
+        "operationId": "openapi_document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos": {
+      "get": {
+        "summary": "Lists the repositories on the server.",
+        "operationId": "list_repos",
+        "responses": {
+          "200": {
+            "description": "The repositories",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RepoSummary"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}": {
+      "get": {
+        "summary": "Describes a repository and its branches.",
+        "operationId": "repo_info",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The repository",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/commits": {
+      "post": {
+        "summary": "Fetches commits and their ancestors, as a pack.",
+        "operationId": "fetch_commits",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommitsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The objects, as a pack",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/file": {
+      "get": {
+        "summary": "Reads a file on a branch.",
+        "operationId": "read_file",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "The branch to read.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/BranchName"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "The path to read, empty for the root.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/RepoPath"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file content",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/objects": {
+      "post": {
+        "summary": "Fetches the objects at some paths of a commit, as a pack.",
+        "operationId": "fetch_objects",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObjectsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The objects, as a pack",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/tree": {
+      "get": {
+        "summary": "Lists a directory on a branch.",
+        "operationId": "list_tree",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/RepoName"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "The branch to read.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/BranchName"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "The path to read, empty for the root.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/RepoPath"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The directory entries, sorted by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ListedEntry"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Something does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "description": "What went wrong with a request.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "The kind of failure."
+          },
+          "message": {
+            "type": "string",
+            "description": "A human-readable explanation."
+          }
+        }
+      },
+      "Binary": {
+        "type": "string",
+        "contentMediaType": "application/octet-stream"
+      },
+      "Branch": {
+        "type": "object",
+        "description": "A branch and the commit it points to.",
+        "required": [
+          "name",
+          "commit"
+        ],
+        "properties": {
+          "commit": {
+            "$ref": "#/components/schemas/ObjectId",
+            "description": "The commit it points to."
+          },
+          "name": {
+            "$ref": "#/components/schemas/BranchName",
+            "description": "The branch's name."
+          }
+        }
+      },
+      "BranchName": {
+        "type": "string",
+        "description": "The name of a branch, such as `main` or `feature/login`.\n\nNames are `/`-separated segments of ASCII letters, digits, `.`, `_` and\n`-`. No segment is empty or starts with `.`, which keeps names usable as\nfile paths and git ref names.",
+        "example": "main"
+      },
+      "CommitsRequest": {
+        "type": "object",
+        "description": "Asks for commits and their ancestors.",
+        "required": [
+          "ids",
+          "depth"
+        ],
+        "properties": {
+          "depth": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many generations to return: 1 returns only `ids`, 2 adds their\nparents, and so on.",
+            "minimum": 0
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectId"
+            },
+            "description": "The commits to start from."
+          }
+        }
+      },
+      "EntryKind": {
+        "type": "string",
+        "description": "What a tree entry points to.",
+        "enum": [
+          "file",
+          "executable",
+          "symlink",
+          "tree"
+        ]
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "The kind of an [`ApiError`].",
+        "enum": [
+          "bad_request",
+          "not_found",
+          "internal"
+        ]
+      },
+      "ListedEntry": {
+        "type": "object",
+        "description": "One entry of a directory listing.",
+        "required": [
+          "name",
+          "kind",
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ObjectId",
+            "description": "The object it points to."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EntryKind",
+            "description": "What the entry is."
+          },
+          "name": {
+            "type": "string",
+            "description": "The entry's name."
+          }
+        }
+      },
+      "ObjectId": {
+        "type": "string",
+        "description": "Identifies an object by the BLAKE3 hash of its encoding.\n\nIds are only produced by hashing ([`crate::EncodedObject`]) or by parsing\none that was produced that way, so an id always names some encoding.",
+        "example": "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+      },
+      "ObjectsRequest": {
+        "type": "object",
+        "description": "Asks for the objects at some paths of a commit: trees for directories,\nblobs for files.\n\nObjects are requested by path rather than by id so the server knows\nwhere in the repository each one lives.",
+        "required": [
+          "commit",
+          "paths"
+        ],
+        "properties": {
+          "commit": {
+            "$ref": "#/components/schemas/ObjectId",
+            "description": "The commit whose tree the paths are in."
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoPath"
+            },
+            "description": "The paths to read. The empty path is the root tree."
+          }
+        }
+      },
+      "RepoInfo": {
+        "type": "object",
+        "description": "A repository with its branches.",
+        "required": [
+          "name",
+          "description",
+          "branches"
+        ],
+        "properties": {
+          "branches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Branch"
+            },
+            "description": "Every branch, sorted by name."
+          },
+          "description": {
+            "type": "string",
+            "description": "What the repository holds."
+          },
+          "name": {
+            "$ref": "#/components/schemas/RepoName",
+            "description": "The repository's name."
+          }
+        }
+      },
+      "RepoName": {
+        "type": "string",
+        "description": "The name of a repository on a server: ASCII letters, digits, `.`, `_`\nand `-`, not starting with `.`.",
+        "example": "origin"
+      },
+      "RepoPath": {
+        "type": "string",
+        "description": "A path relative to the repository root, such as `src/main.rs`.\n\nComponents are valid [`EntryName`]s joined by `/`. The empty path is the\nroot directory.",
+        "example": "src/main.rs"
+      },
+      "RepoSummary": {
+        "type": "object",
+        "description": "A repository, as listed by the server.",
+        "required": [
+          "name",
+          "description"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "What the repository holds."
+          },
+          "name": {
+            "$ref": "#/components/schemas/RepoName",
+            "description": "The repository's name."
+          }
+        }
+      }
+    }
+  }
+}

@@ -12,6 +12,7 @@ blake3.workspace = true
 jiff.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+utoipa.workspace = true
 
 [dev-dependencies]
 divan.workspace = true

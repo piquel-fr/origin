@@ -10,8 +10,19 @@ use crate::ObjectId;
 /// Names are `/`-separated segments of ASCII letters, digits, `.`, `_` and
 /// `-`. No segment is empty or starts with `.`, which keeps names usable as
 /// file paths and git ref names.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
 #[serde(try_from = "String", into = "String")]
+#[schema(value_type = String, example = "main")]
 pub struct BranchName(String);
 
 impl BranchName {
