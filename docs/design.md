@@ -161,21 +161,23 @@ A statement can declare what it depended on:
 
 ```rust
 struct Inputs {
-    paths: Vec<Glob>,      // e.g. ["src/**", "Cargo.toml", "Cargo.lock"]
+    paths: Vec<RepoPath>,  // e.g. ["src", "Cargo.toml", "Cargo.lock"]
     definition: Digest,    // the check's command and configuration
     toolchain: Digest,     // e.g. the hash of `rustc -V` output
     external: bool,        // also depended on things outside the snapshot
 }
 ```
 
-The input digest is the hash of the matching subtrees of the snapshot, plus
-`definition` and `toolchain`. A statement is **promotable** when it declares
+Each path names a file or a directory, and covers everything under it. The
+input digest is the hash of the ids the snapshot stores at those paths, plus
+`definition` and `toolchain`. Trees are already content-addressed, so the
+digest costs one lookup per path, however large the tree. A statement is **promotable** when it declares
 inputs and `external` is false. When a new revision's input digest equals
 the digest of an existing promotable result, the result is promoted
 automatically.
 
 So a docs-only change keeps its `lint` and `build` results, because neither
-reads `docs/**`. `docs-test` runs again, because it does read `docs/**`. Nobody
+reads `docs`. `docs-test` runs again, because it does read `docs`. Nobody
 writes rules about which changes are "docs-only".
 
 Promotion is only as safe as the declared inputs. A check that also reads
@@ -276,10 +278,12 @@ divergence), `revision.created`, `target.advanced` and `check.requested`.
 Events are delivered at least once and carry the record id, so consumers
 deduplicate by it.
 
-- **Locally,** `origin watch [--kind ...] [--subject ...]` follows the log.
+- **Locally,** `origin watch [--kind ...] [--subject ...]` polls the op log
+  for new entries.
 - **In server mode,** the server dispatches each event to the users
-  subscribed to it, over a resumable server-sent-events stream
-  (`GET /events?cursor=...`), filtered by what each user may read.
+  subscribed to it, filtered by what each user may read. Subscribers
+  long-poll: `GET /events?cursor=...&wait=30s` answers as soon as there
+  are events after the cursor, with a JSON batch and the next cursor.
 
 A cursor belongs to one node. Two nodes may deliver the same events in a
 different order.
@@ -303,17 +307,17 @@ being checked:
 ```toml
 [checks.lint]
 command   = "cargo clippy --workspace -- -D warnings"
-inputs    = ["src/**", "Cargo.toml", "Cargo.lock"]
+inputs    = ["src", "Cargo.toml", "Cargo.lock"]
 toolchain = "rustc -V"
 
 [checks.docs-test]
 command   = "cargo test --doc"
-inputs    = ["src/**", "docs/**"]
+inputs    = ["src", "docs"]
 toolchain = "rustc -V"
 
 [checks.links]
 command  = "lychee docs"
-inputs   = ["docs/**"]
+inputs   = ["docs"]
 external = true          # reads the network: never promoted
 ```
 
@@ -335,7 +339,7 @@ the rules into `policy.toml` and splits access into capabilities:
 Static tokens in the server configuration keep working.
 `origin token issue --scope ... --ttl ...` issues short-lived tokens with
 narrower scopes for agents and CI runners. A typical agent token carries
-`write src/**` and nothing else.
+`write src` and nothing else.
 
 Origin has no way to erase content from history. A secret that leaks into a
 revision is rotated. Once anyone has fetched it, deleting it would change
@@ -380,7 +384,10 @@ Code that differs between platforms lives behind traits in
 | `Durability` | `fsync` of files and directories | `F_FULLFSYNC` |
 | `FileLock` | `flock` | `flock` |
 | `CloneFile` | `FICLONE` | `clonefile` |
-| `Watch` | inotify | FSEvents |
+
+The standard library already provides locks and full syncs on both
+platforms, and `reflink-copy` provides clones, so `unsafe` stays forbidden
+everywhere.
 
 Each platform has its own module. A single type alias picks one according to
 the build target. That alias is the only conditional compilation in the
@@ -464,6 +471,8 @@ the work landed in one acceptance. It also reports timings.
 
 - A virtual filesystem for workspaces: FUSE on Linux first, then FSKit on
   macOS. It goes behind a `Vfs` trait in `origin-platform`.
+- A `Watch` trait (inotify, FSEvents) instead of polling, if polling ever
+  shows up in profiles.
 - Webhooks, as a plugin.
 - Line-level and structure-aware merging.
 - Set reconciliation (Negentropy-style) for sync, and batched merge trains.
