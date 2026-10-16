@@ -52,6 +52,7 @@ use origin_shared::{
 
 use crate::annotations::{AnnotateError, Annotations, Claim};
 use crate::conflict::Conflict;
+use crate::oplog::Effect;
 use crate::policy::{Policy, PolicyError, Requirement};
 use crate::store::{Store, StoreError};
 use crate::targets::Head;
@@ -692,14 +693,20 @@ impl<P: Platform> Session<'_, '_, P> {
         Ok(self.queue.queue_dir(self.onto.id())?.join(name))
     }
 
-    /// Durably keeps a waiting landing, replacing the last attempt's.
+    /// Durably keeps a waiting landing, replacing the last attempt's, and
+    /// logs that it waits.
     fn keep(&self, pending: &Pending) -> Result<(), StoreError> {
         let write = self.store().durable_write();
         write.stage(
             self.pending_path(&pending.proposal)?,
             pending.encode().as_bytes(),
         )?;
-        Ok(write.commit()?)
+        let waiting = Effect::Waiting {
+            onto: pending.onto.clone(),
+            proposal: pending.proposal.clone(),
+        };
+        self.store().commit_logged(write, &waiting)?;
+        Ok(())
     }
 
     /// Durably forgets a landing that waited, if one did.
@@ -918,7 +925,7 @@ pub enum LandError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Mutex;
     use std::thread;
 
@@ -929,14 +936,14 @@ mod tests {
 
     /// A repository whose `policy` and `main` the node `queue` orders, with
     /// `extra` added to its `policy.toml`.
-    struct Repo {
+    pub(crate) struct Repo {
         _dir: tempfile::TempDir,
-        store: Store,
+        pub(crate) store: Store,
         key: NodeKey,
     }
 
     impl Repo {
-        fn new(extra: &str) -> Self {
+        pub(crate) fn new(extra: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::new(dir.path().join(".origin"), Native::default());
             store.init().unwrap();
@@ -960,7 +967,7 @@ mod tests {
         }
 
         /// Writes a snapshot of `files`, contents included.
-        fn files(&self, files: &[(&str, &str)]) -> TreeId {
+        pub(crate) fn files(&self, files: &[(&str, &str)]) -> TreeId {
             let blobs: Vec<_> = files
                 .iter()
                 .map(|(_, content)| EncodedObject::blob(content.as_bytes()))
@@ -969,11 +976,11 @@ mod tests {
             build(&self.store, files)
         }
 
-        fn queue(&self) -> Queue<'_> {
+        pub(crate) fn queue(&self) -> Queue<'_> {
             Queue::new(&self.store, &self.key, PrincipalName::new("queue").unwrap())
         }
 
-        fn tip(&self, target: &TargetName) -> Head {
+        pub(crate) fn tip(&self, target: &TargetName) -> Head {
             self.store.head(target).unwrap().unwrap()
         }
 
@@ -986,7 +993,7 @@ mod tests {
         }
 
         /// Writes a revision of `change` with `files`, made on `base`.
-        fn revision(
+        pub(crate) fn revision(
             &self,
             change: u8,
             predecessors: &[RevisionId],
@@ -1011,7 +1018,7 @@ mod tests {
 
         /// A revision of a new change `change` on the tip of `main`, adding
         /// `files` to it.
-        fn change_on_main(&self, change: u8, files: &[(&str, &str)]) -> RevisionId {
+        pub(crate) fn change_on_main(&self, change: u8, files: &[(&str, &str)]) -> RevisionId {
             let base = Base::Acceptance(self.tip(&TargetName::MAIN).acceptance);
             let mut all = self.main_files();
             all.extend(
@@ -1044,7 +1051,7 @@ mod tests {
                 .collect()
         }
 
-        fn land(&self, change: u8) -> Vec<Landing> {
+        pub(crate) fn land(&self, change: u8) -> Vec<Landing> {
             self.queue()
                 .land_change(ChangeId::from_bytes([change; 16]), &TargetName::MAIN)
                 .unwrap()
@@ -1160,7 +1167,7 @@ mod tests {
     }
 
     /// A `ci.test` result about `subject` from `issuer`, reading `src`.
-    fn ci_test(subject: RevisionId, issuer: &str) -> Statement {
+    pub(crate) fn ci_test(subject: RevisionId, issuer: &str) -> Statement {
         Statement {
             subject: RecordId::Revision(subject),
             kind: Kind::new("ci.test").unwrap(),

@@ -2,9 +2,13 @@
 //! `origin` binary.
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 /// A temporary working copy, and a user configuration of its own.
 struct Repo {
@@ -32,6 +36,33 @@ impl Repo {
             .env("ORIGIN_CONFIG_DIR", self.config.path())
             .output()
             .unwrap()
+    }
+
+    /// Starts a long-running command, such as `watch`, returning it and its
+    /// output lines as they come.
+    fn spawn(&self, args: &[&str]) -> (Child, mpsc::Receiver<String>) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_origin"))
+            .args(args)
+            .current_dir(self.dir.path())
+            .env("ORIGIN_CONFIG_DIR", self.config.path())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            for line in stdout.lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        (child, receive)
+    }
+
+    /// The revision the working copy is, in full.
+    fn revision(&self) -> String {
+        self.read(".origin/workspace").trim_end().to_owned()
     }
 
     /// Runs a command that must succeed, returning its output.
@@ -884,5 +915,132 @@ fn a_workspace_follows_its_change_once_it_lands_elsewhere() {
     assert_eq!(
         fs::read_to_string(conflicting.join("shared")).unwrap(),
         "mine\n"
+    );
+}
+
+#[test]
+fn undo_moves_the_working_copy_back_one_operation_at_a_time() {
+    let repo = Repo::new();
+    let first = repo.change();
+    repo.write("a", "a\n");
+    repo.ok(&["describe", "Add a"]);
+    repo.ok(&["new", "Second"]);
+    assert_ne!(repo.change(), first);
+
+    let undone = repo.ok(&["undo"]);
+    assert!(undone.starts_with("Undid #"), "{undone}");
+    assert!(undone.contains(": origin new Second\n"), "{undone}");
+    assert_eq!(repo.change(), first);
+
+    // Describing makes a newer revision of the change: undoing it restores
+    // the description in another one, so the change keeps a single head.
+    repo.ok(&["describe", "Renamed"]);
+    repo.ok(&["undo"]);
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.starts_with(&format!("Working copy: {first} Add a\n")),
+        "{status}"
+    );
+    assert!(!repo.ok(&["evolog", &first]).contains("divergent"));
+
+    // Then the first description, back to the edits it was made on, and
+    // then nothing is left but creating the repository.
+    repo.ok(&["undo"]);
+    let status = repo.ok(&["status"]);
+    assert!(status.starts_with(&format!("Working copy: {first} (no description)\n")));
+    assert!(status.ends_with("A a\n"), "the edits stay: {status}");
+    assert!(
+        repo.fails(&["undo"])
+            .contains("nothing to undo but the creation")
+    );
+}
+
+#[test]
+fn undo_moves_only_its_own_workspace() {
+    let repo = Repo::new();
+    let others = tempfile::tempdir().unwrap();
+    let ws = others.path().join("ws");
+    repo.workspace(&ws, &[]);
+    repo.ok_in(&ws, &["new", "Agent work"]);
+    repo.ok(&["new", "Main work"]);
+    let main = repo.change();
+
+    // The latest operation is main's, but the workspace undoes its own.
+    let agent = repo.ok_in(&ws, &["undo"]);
+    assert!(agent.contains(": origin new Agent work\n"), "{agent}");
+    assert_eq!(repo.change(), main);
+
+    let log = repo.ok(&["op", "log"]);
+    let headers: Vec<_> = log
+        .lines()
+        .filter(|line| !line.starts_with("    "))
+        .collect();
+    assert!(
+        headers[0].starts_with("○ #") && headers[0].ends_with(": origin undo"),
+        "{log}"
+    );
+    assert!(headers[1].starts_with("@ #") && headers[1].ends_with(": origin new Main work"));
+    assert!(headers[1].contains(&repo.dir.path().display().to_string()));
+    assert!(log.contains("    undid #"), "{log}");
+    assert_eq!(
+        repo.ok(&["op", "log", "-n", "1"]).lines().count(),
+        2,
+        "the undo, and its move"
+    );
+}
+
+#[test]
+fn a_move_cut_short_is_finished_by_the_next_command() {
+    let repo = Repo::new();
+    repo.write("a", "a\n");
+    repo.ok(&["describe", "First"]);
+    let first = repo.revision();
+    repo.ok(&["new", "Second"]);
+    repo.write("b", "b\n");
+    repo.write("a", "changed\n");
+    repo.ok(&["status"]);
+
+    // A crash in the middle of `edit` back to the first: some files checked
+    // out, others not.
+    fs::write(repo.path(".origin/moving"), format!("{first} command\n")).unwrap();
+    fs::remove_file(repo.path("b")).unwrap();
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.starts_with("Finished moving the working copy to "),
+        "{status}"
+    );
+    assert_eq!(repo.revision(), first);
+    assert_eq!(repo.read("a"), "a\n");
+    assert!(!repo.path("b").exists());
+    assert!(!repo.path(".origin/moving").exists());
+}
+
+#[test]
+fn watch_prints_events_from_a_cursor_or_as_they_happen() {
+    let repo = Repo::new();
+    let line =
+        |receive: &mpsc::Receiver<String>| receive.recv_timeout(Duration::from_secs(20)).unwrap();
+    // From the start: the targets `init` created.
+    let (mut all, receive) = repo.spawn(&["watch", "--since", "0"]);
+    let policy = line(&receive);
+    assert!(
+        policy.contains(" target.advanced target=policy seq=0 "),
+        "{policy}"
+    );
+    all.kill().unwrap();
+
+    let (mut checks, receive) = repo.spawn(&["watch", "--kind", "ci.*"]);
+    // Let it read where the log ends before anything happens.
+    thread::sleep(Duration::from_millis(500));
+    repo.ok(&["describe", "Work"]);
+    repo.ok(&["annotate", "@", "ci.test", "--pass"]);
+    let issued = line(&receive);
+    checks.kill().unwrap();
+    let fields: Vec<_> = issued.split(' ').collect();
+    assert!(fields[0].parse::<u64>().is_ok(), "a cursor first: {issued}");
+    assert_eq!(fields[1], "statement.issued");
+    assert!(
+        issued.contains(" kind=ci.test verdict=pass issuer=user:ada"),
+        "{issued}"
     );
 }

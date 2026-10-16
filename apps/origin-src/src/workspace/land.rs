@@ -19,6 +19,7 @@ use origin_shared::{
 
 use super::{WorkingCopy, Workspace, WorkspaceError};
 use crate::index::Index;
+use crate::oplog::Why;
 use crate::policy::Policy;
 use crate::queue::{Blocked, Landing, Pending, Proposal, Queue};
 
@@ -178,8 +179,7 @@ impl Workspace {
         let mut first = merge.trees;
         first.push(description);
         self.write(&[first, vec![encoded.clone()]])?;
-        self.checkout(files, revision.snapshot)?;
-        self.point_at(encoded.id().into())?;
+        self.switch_to(files, encoded.id().into(), revision.snapshot, Why::Command)?;
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
         Ok(Vec::new())
@@ -264,8 +264,12 @@ impl Workspace {
                 && *rebased != working_copy.id
             {
                 let rebased = *rebased;
-                self.checkout(files, self.store.get(rebased)?.snapshot)?;
-                self.point_at(rebased)?;
+                self.switch_to(
+                    files,
+                    rebased,
+                    self.store.get(rebased)?.snapshot,
+                    Why::Command,
+                )?;
                 println!(
                     "Working copy: {}",
                     self.headline(&self.store.get(rebased)?)?
@@ -314,8 +318,12 @@ impl Workspace {
         };
         let encoded = revision.encode();
         self.write(&[merge.trees, vec![encoded.clone()]])?;
-        self.checkout(current.snapshot, revision.snapshot)?;
-        self.point_at(encoded.id().into())?;
+        self.switch_to(
+            current.snapshot,
+            encoded.id().into(),
+            revision.snapshot,
+            Why::Command,
+        )?;
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
         Ok(())
@@ -378,7 +386,7 @@ impl Workspace {
         }
     }
 
-    fn describe_record(record: RecordId) -> String {
+    pub(super) fn describe_record(record: RecordId) -> String {
         match record {
             RecordId::Revision(id) => format!("revision {}", id.short()),
             RecordId::Snapshot(id) => format!("snapshot {}", id.short()),

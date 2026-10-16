@@ -29,6 +29,8 @@ use origin_shared::{
     Acceptance, AcceptanceId, Base, Record, Revision, RevisionId, Source, TargetId, TargetName,
 };
 
+use crate::index::Entry;
+use crate::oplog::Effect;
 use crate::store::{Store, StoreError};
 
 /// The latest acceptance of a target.
@@ -233,6 +235,23 @@ impl<P: Platform> Store<P> {
             .then_some(next))
     }
 
+    /// The name of the target `id`, or `None` if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Fails if its name cannot be read or is malformed.
+    pub fn target_name(&self, id: TargetId) -> Result<Option<TargetName>, StoreError> {
+        let path = self.target_files(id).name();
+        TargetFiles::read(&path)?
+            .map(|bytes| {
+                String::from_utf8(bytes)
+                    .ok()
+                    .and_then(|name| TargetName::new(name).ok())
+                    .ok_or(StoreError::Malformed(path))
+            })
+            .transpose()
+    }
+
     /// The names of every target, in no particular order.
     ///
     /// # Errors
@@ -285,6 +304,9 @@ impl<P: Platform> Store<P> {
             return Err(StoreError::WrongTarget(target.clone()));
         }
         let encoded = acceptance.encode();
+        // Readers of the op log wait for the head to name the acceptance
+        // while this is held.
+        let _writing = self.writing()?;
         // The acceptance is durable before the log refers to it.
         self.write_all(slice::from_ref(&encoded))?;
         let id = AcceptanceId::from(encoded.id());
@@ -301,7 +323,7 @@ impl<P: Platform> Store<P> {
                 // durable acceptances, but may not be durable themselves.
                 Some(latest) if head.is_none_or(|head| head.seq < latest.seq) => {
                     self.platform.sync_file(&log).map_err(log_error)?;
-                    self.publish(&files, target, latest)?;
+                    self.publish(&files, target, latest, Some(latest.acceptance))?;
                 }
                 _ => return Err(StoreError::Malformed(files.log())),
             }
@@ -329,18 +351,20 @@ impl<P: Platform> Store<P> {
             seq: body.seq,
             acceptance: id,
         };
-        self.publish(&files, target, head)?;
+        self.publish(&files, target, head, None)?;
         Ok(id)
     }
 
     /// Durably replaces the head of a target. Publishing the first
     /// acceptance creates the target: its name is written too, and its
-    /// directory made durable.
+    /// directory made durable. Publishing an acceptance a crash left
+    /// unpublished, `repaired`, logs it again.
     fn publish(
         &self,
         files: &TargetFiles,
         target: &TargetName,
         head: Head,
+        repaired: Option<AcceptanceId>,
     ) -> Result<(), StoreError> {
         let write = self.durable_write();
         let line = format!("{} {}\n", head.seq, head.acceptance);
@@ -349,7 +373,15 @@ impl<P: Platform> Store<P> {
         if created {
             write.stage(files.name(), target.as_str().as_bytes())?;
         }
-        write.commit()?;
+        match repaired {
+            // Its first attempt logged it before crashing, but readers may
+            // have given up on it: log it again.
+            Some(repaired) => {
+                let records = vec![Entry::Acceptance(repaired)];
+                self.commit_logged(write, &Effect::Wrote(records))?;
+            }
+            None => write.commit()?,
+        }
         if created {
             self.sync_dir(&self.targets_dir())?;
         }
@@ -560,10 +592,10 @@ mod tests {
                 Synced::Batch(0),
                 Synced::Dir(dir.path().join(".origin/objects/loose").join(shard)),
                 Synced::File,
-                Synced::Batch(1),
+                Synced::Batch(2),
                 Synced::Dir(target),
             ],
-            "the log, then the head"
+            "the log, then the head, with its op log entry"
         );
     }
 
@@ -582,11 +614,12 @@ mod tests {
         assert_eq!(
             store.platform.0.into_inner().unwrap(),
             [
-                // The acceptance and the index log, which costs no sync of
-                // its own.
+                // The acceptance and its op log entry, which costs no sync
+                // of its own.
                 Synced::Batch(2),
                 Synced::Dir(dir.path().join(".origin/objects/loose").join(&hex[..2])),
                 Synced::File,
+                // The head.
                 Synced::Batch(1),
                 Synced::Dir(target),
             ],

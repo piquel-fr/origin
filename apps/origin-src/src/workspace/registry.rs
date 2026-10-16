@@ -22,6 +22,7 @@ use origin_platform::DurableWrite;
 use origin_shared::{ChangeId, Digest, EncodedObject, Record, Revision, Tree};
 
 use super::{Workspace, WorkspaceError};
+use crate::oplog::Why;
 
 impl Workspace {
     /// The directory in the store's `.origin` with a file per workspace.
@@ -67,8 +68,11 @@ impl Workspace {
         self.write(&records)?;
         self.write_durably(self.registered(&root), &Self::path_bytes(&root))?;
         let mut workspace = Self {
+            store: self
+                .store
+                .clone()
+                .with_actor(self.store.actor().in_workspace(&root)),
             root,
-            store: self.store.clone(),
             config: self.config.clone(),
             revision: id,
         };
@@ -76,7 +80,7 @@ impl Workspace {
         workspace.checkout(empty, revision.snapshot)?;
         let repository = Self::path_bytes(self.store.root());
         workspace.write_durably(workspace.meta(Self::REPOSITORY), &repository)?;
-        workspace.point_at(id)?;
+        workspace.publish_pointer(None, id, Why::Command)?;
         println!("Created workspace {}", workspace.root.display());
         println!("Working copy: {}", workspace.headline(&revision)?);
         println!("On top of: {}", workspace.describe_base(revision.base)?);
@@ -123,7 +127,7 @@ impl Workspace {
             return Err(WorkspaceError::UnknownWorkspace(root));
         }
         if Self::read_pointer(&root)?.is_some() {
-            let mut workspace = Self::open(&root, self.config.clone())?;
+            let mut workspace = Self::open(&root, self.config.clone(), self.store.actor())?;
             let working_copy = workspace.refresh()?;
             println!(
                 "Kept its working copy: {}",

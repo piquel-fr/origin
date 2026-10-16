@@ -11,6 +11,9 @@ use clap::{Args, Parser, Subcommand};
 use origin_shared::{Digest, Inputs, Kind, RepoPath, TargetName, Verdict};
 
 use crate::config::UserConfig;
+use crate::events::Filter;
+use crate::oplog::Actor;
+use crate::policy::KindPattern;
 use crate::workspace::Workspace;
 
 /// A modern, git-compatible source control system.
@@ -129,6 +132,37 @@ enum WorkspaceCommand {
     /// Manage workspaces: working copies sharing this repository.
     #[command(subcommand)]
     Workspace(WorkspacesCommand),
+    /// Show the op log: what this node did, in every workspace.
+    #[command(subcommand)]
+    Op(OpCommand),
+    /// Move this workspace's working copy back to where it was before its
+    /// latest operation. Records and targets stay as they are.
+    Undo,
+    /// Print events as they happen, one a line, starting with the cursor to
+    /// resume from. Runs until interrupted.
+    Watch {
+        /// Only events of this name, such as `check.requested`, or about
+        /// statements of this kind, such as `core.conflict` or `ci.*`.
+        #[arg(long)]
+        kind: Vec<KindPattern>,
+        /// Only events about this: a revision or change id prefix, or a
+        /// target name.
+        #[arg(long)]
+        subject: Vec<String>,
+        /// Start after this cursor instead of now: `0` for every event kept.
+        #[arg(long)]
+        since: Option<u64>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpCommand {
+    /// List the latest operations, newest first.
+    Log {
+        /// Show at most this many operations.
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -275,20 +309,22 @@ impl Cli {
     /// Fails if the command fails; the error is meant for the user.
     pub fn run(self) -> Result<()> {
         let config = UserConfig::load()?;
+        // The op log records the command line, without the program's name.
+        let actor = Actor::new(env::args().skip(1).collect::<Vec<_>>().join(" "));
         match self.command {
             Command::Init { path } => {
-                Workspace::init(&path, config)?;
+                Workspace::init(&path, config, &actor)?;
             }
-            Command::Workspace(command) => command.run(config)?,
+            Command::Workspace(command) => command.run(config, &actor)?,
         }
         Ok(())
     }
 }
 
 impl WorkspaceCommand {
-    fn run(self, config: UserConfig) -> Result<()> {
+    fn run(self, config: UserConfig, actor: &Actor) -> Result<()> {
         let cwd = env::current_dir().context("cannot read the current directory")?;
-        let mut workspace = Workspace::discover(&cwd, config)?;
+        let mut workspace = Workspace::discover(&cwd, config, actor)?;
         match self {
             Self::Status => workspace.status()?,
             Self::Diff => workspace.diff()?,
@@ -328,6 +364,19 @@ impl WorkspaceCommand {
             }
             Self::Workspace(WorkspacesCommand::List) => workspace.list_workspaces()?,
             Self::Workspace(WorkspacesCommand::Rm { path }) => workspace.remove_workspace(&path)?,
+            Self::Op(OpCommand::Log { limit }) => workspace.op_log(limit)?,
+            Self::Undo => workspace.undo()?,
+            Self::Watch {
+                kind,
+                subject,
+                since,
+            } => workspace.watch(
+                &Filter {
+                    kinds: kind,
+                    subjects: subject,
+                },
+                since,
+            )?,
         }
         Ok(())
     }
