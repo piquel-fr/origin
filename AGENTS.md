@@ -19,6 +19,8 @@ currently contains the first prototype.
   server. `OriginService` (`service.rs`) is the one API over a repository:
   the HTTP routes (`http.rs`) and the command line's commands that the API
   offers only translate into its calls, so neither duplicates the other.
+  `sync.rs` shares records with a remote (`remote.rs`), which answers the
+  same calls over the SDK or, for a local path, in-process.
 - `tools/xtask`: development tasks, run with `cargo xtask`, such as timing
   origin against git (`just bench-git`).
 
@@ -29,15 +31,18 @@ to a hot path (hashing, storage, snapshots, transfer) should come with a
 benchmark, and its numbers in the pull request.
 
 - `just bench`: the divan micro-benchmarks (encoding, store writes,
-  snapshots, input digests and promotion, landing, reading events, and the
-  server's request latency and long-poll wakeups).
+  snapshots, input digests and promotion, landing, reading events, the
+  server's request latency and long-poll wakeups, and syncing a 20,000-file
+  tree over HTTP).
 - `just bench-git`: times origin against git on a 20,000-file tree with
   hyperfine, and rewrites `docs/benchmarks.md`.
 
 End-to-end tests run the `origin` binary with `ORIGIN_CONFIG_DIR` set to a
 temporary directory, which holds the user's `config.toml` and node key.
 The HTTP tests drive every SDK method against a real server. One fails
-while `docs/openapi.json` is stale: `just openapi` rewrites it.
+while `docs/openapi.json` is stale: `just openapi` rewrites it. The sync
+tests clone, push and land through `origin serve` and through local paths;
+`tests/common` holds the helpers every end-to-end test shares.
 
 ## Commits & Pull Requests
 

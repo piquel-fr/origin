@@ -386,6 +386,108 @@ impl<P: Platform> Store<P> {
     }
 }
 
+/// An object of a snapshot, and where it is: [`Store::added`] lists them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    /// Its path: the root for the snapshot's own tree.
+    pub path: RepoPath,
+    /// The object, and its kind.
+    pub entry: TreeEntry,
+}
+
+/// Which part of a snapshot [`Store::added`] walks.
+struct Scope<'p>(&'p [RepoPath]);
+
+impl Scope<'_> {
+    /// Whether everything at `path` and under it is in scope.
+    fn covers(&self, path: &RepoPath) -> bool {
+        self.0.is_empty() || self.0.iter().any(|prefix| path.starts_with(prefix))
+    }
+
+    /// Whether `path` is a directory on the way to something in scope.
+    fn leads_in(&self, path: &RepoPath) -> bool {
+        self.0.iter().any(|prefix| prefix.starts_with(path))
+    }
+}
+
+impl<P: Platform> Store<P> {
+    /// The objects of `snapshot` that none of the snapshots `have` holds at
+    /// the same path, parents before children: what someone holding `have`
+    /// lacks of it. With `paths`, only those under them, and the trees on
+    /// the way. Subtrees a `have` holds whole are skipped without being
+    /// read, so the cost follows the size of the change. Objects appear
+    /// once, at their first path.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree of `snapshot`, or of a `have`, cannot be read.
+    pub fn added(
+        &self,
+        snapshot: TreeId,
+        have: &[TreeId],
+        paths: &[RepoPath],
+    ) -> Result<Vec<Placed>, StoreError> {
+        let mut added = Vec::new();
+        let mut seen = HashSet::new();
+        self.add_dir(
+            &RepoPath::root(),
+            snapshot,
+            have,
+            &Scope(paths),
+            &mut seen,
+            &mut added,
+        )?;
+        Ok(added)
+    }
+
+    fn add_dir(
+        &self,
+        dir: &RepoPath,
+        tree: TreeId,
+        have: &[TreeId],
+        scope: &Scope<'_>,
+        seen: &mut HashSet<ObjectId>,
+        added: &mut Vec<Placed>,
+    ) -> Result<(), StoreError> {
+        if have.contains(&tree) {
+            return Ok(());
+        }
+        if seen.insert(tree.into()) {
+            added.push(Placed {
+                path: dir.clone(),
+                entry: TreeEntry {
+                    kind: EntryKind::Tree,
+                    id: tree.into(),
+                },
+            });
+        }
+        let have: Vec<Tree> = have
+            .iter()
+            .map(|&id| self.get(id))
+            .collect::<Result<_, _>>()?;
+        for (name, &entry) in &self.get(tree)? {
+            let path = dir.join(name);
+            let covered = scope.covers(&path);
+            if !(covered || entry.kind.is_tree() && scope.leads_in(&path)) {
+                continue;
+            }
+            let held = have.iter().filter_map(|tree| tree.get(name.as_str()));
+            if held.clone().any(|held| *held == entry) {
+                continue;
+            }
+            match entry.subtree() {
+                Some(subtree) => {
+                    let held: Vec<_> = held.filter_map(|held| held.subtree()).collect();
+                    self.add_dir(&path, subtree, &held, scope, seen, added)?;
+                }
+                None if seen.insert(entry.id) => added.push(Placed { path, entry }),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeMap;
@@ -511,6 +613,67 @@ pub(crate) mod tests {
         assert_eq!(store.diff(old, old).unwrap(), []);
         let empty = build(&store, &[]);
         assert_eq!(store.diff(empty, old).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn lists_what_the_haves_lack() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join(".origin"), Native::default());
+        store.init().unwrap();
+        let old = build(
+            &store,
+            &[
+                ("same/a", "1"),
+                ("edit/b", "2"),
+                ("file", "3"),
+                ("docs/x", "4"),
+            ],
+        );
+        let new = build(
+            &store,
+            &[
+                ("same/a", "1"),
+                ("edit/b", "changed"),
+                ("file/now-dir", "4"),
+                ("docs/x", "4"),
+                ("docs/copy", "4"),
+            ],
+        );
+        let paths = |placed: Vec<Placed>| -> Vec<String> {
+            placed
+                .iter()
+                .map(|placed| placed.path.to_string())
+                .collect()
+        };
+
+        assert_eq!(
+            paths(store.added(new, &[old], &[]).unwrap()),
+            ["/", "docs", "docs/copy", "edit", "edit/b", "file"],
+            "`file/now-dir` has the content of `docs/copy`, listed first"
+        );
+        assert_eq!(
+            store.added(new, &[], &[]).unwrap().len(),
+            8,
+            "5 trees, and 5 files of 3 contents"
+        );
+        assert_eq!(store.added(new, &[new], &[]).unwrap(), []);
+        let empty = build(&store, &[]);
+        assert_eq!(
+            paths(store.added(new, &[empty, old], &[]).unwrap()),
+            paths(store.added(new, &[old], &[]).unwrap()),
+            "any have holding an object is enough"
+        );
+
+        let only = |path: &str| [RepoPath::new(path).unwrap()];
+        assert_eq!(
+            paths(store.added(new, &[], &only("edit/b")).unwrap()),
+            ["/", "edit", "edit/b"],
+            "the trees on the way, then the path"
+        );
+        assert_eq!(
+            paths(store.added(new, &[old], &only("same")).unwrap()),
+            ["/"]
+        );
     }
 
     /// The files of `tree`, by path, with their contents' ids.

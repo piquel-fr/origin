@@ -179,7 +179,12 @@ impl<P: Platform> Store<P> {
         }
         self.oplog().init()?;
         let objects = self.root.join("objects");
-        let parent = self.root.parent().unwrap_or(Path::new("."));
+        // A relative root's parent is empty: the current directory.
+        let parent = self
+            .root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         for dir in [&loose, &objects, &self.root, parent] {
             self.sync_dir(dir)?;
         }
@@ -322,6 +327,24 @@ impl<P: Platform> Store<P> {
         Ok(self.path(id).exists() || self.find_packed(id)?.is_some())
     }
 
+    /// Those of `ids` the store has, in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::contains`].
+    pub fn present<I: Into<ObjectId> + Copy>(
+        &self,
+        ids: impl IntoIterator<Item = I>,
+    ) -> Result<Vec<I>, StoreError> {
+        let mut present = Vec::new();
+        for id in ids {
+            if self.contains(id.into())? {
+                present.push(id);
+            }
+        }
+        Ok(present)
+    }
+
     /// When this node stored the object: when its loose file was written,
     /// which packing it keeps.
     ///
@@ -461,6 +484,25 @@ impl<P: Platform> Store<P> {
     /// Fails if the object is missing, cannot be read, or is corrupt.
     pub fn read(&self, id: ObjectId) -> Result<EncodedObject, StoreError> {
         self.try_read(id)?.ok_or(StoreError::NotFound(id))
+    }
+
+    /// Reads objects the store must have, in order, from every core.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::read`].
+    pub fn read_all(&self, ids: &[ObjectId]) -> Result<Vec<EncodedObject>, StoreError> {
+        let chunks = Self::on_every_core(ids, |chunk| {
+            chunk
+                .iter()
+                .map(|&id| self.read(id))
+                .collect::<Result<Vec<_>, _>>()
+        });
+        let mut objects = Vec::with_capacity(ids.len());
+        for chunk in chunks {
+            objects.extend(chunk?);
+        }
+        Ok(objects)
     }
 
     /// Reads and decodes the record `id` names.

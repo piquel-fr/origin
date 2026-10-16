@@ -19,8 +19,9 @@
 //! in `docs/openapi.json`, for other languages.
 
 use origin_shared::api::{
-    Annotation, ApiError, EventsQuery, FetchRecords, LandRequest, Landings, LogEntry, LogQuery,
-    NewTarget, RepoName, RepoSummary, Revisions, StatementsQuery, Stored, TargetInfo,
+    Annotation, ApiError, EventsQuery, FetchRecords, FetchSnapshot, Inventory, InventoryRequest,
+    LandRequest, Landings, LogEntry, LogQuery, NewTarget, RepoName, RepoSummary, Revisions,
+    StatementsQuery, Stored, TargetInfo,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
@@ -65,9 +66,15 @@ endpoints! {
     }
 
     impl Repo {
-        /// Fetches objects by id, in the order asked.
+        /// Fetches records by id, in the order asked, each followed by the
+        /// blob it carries if the server has it: a revision's description,
+        /// a statement's payload.
         fn fetch_records(request: &FetchRecords) -> Pack =
             POST "records/fetch", json(request) => pack;
+        /// Fetches the trees and blobs of a snapshot that none of the
+        /// request's snapshots holds at the same path, parents first.
+        fn fetch_snapshot(request: &FetchSnapshot) -> Pack =
+            POST "snapshots/fetch", json(request) => pack;
         /// Puts a batch of objects: snapshots, revisions and statements,
         /// each needing only objects the batch or the repository has.
         fn put_records(pack: &Pack) -> Stored = PUT "records", body(pack.encode()) => json;
@@ -75,6 +82,10 @@ endpoints! {
         /// received them.
         fn statements(query: &StatementsQuery) -> Vec<Annotation> =
             GET "statements", query(query) => json;
+        /// What the server holds of some changes: their revisions, heads
+        /// and statements, by id.
+        fn inventory(request: &InventoryRequest) -> Vec<Inventory> =
+            POST "changes/inventory", json(request) => json;
         /// The revisions of a change, and its heads.
         fn revisions(change: ChangeId) -> Revisions = GET "changes/{change}/revisions" => json;
         /// Every target, with its tip, authority and requirements.

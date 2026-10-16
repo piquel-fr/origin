@@ -203,19 +203,24 @@ impl Workspace {
     }
 
     /// `origin watch [--kind <kind>]... [--subject <subject>]... [--since
-    /// <cursor>]`: prints the events of those kinds about those subjects,
-    /// every event without them, as they happen, one a line, from `since`,
-    /// or from now. Runs until interrupted.
+    /// <cursor>] [--local]`: prints the events of those kinds about those
+    /// subjects, every event without them, as they happen, one a line, from
+    /// `since`, or from now. They are the remote's, long-polled, if the
+    /// repository has one, or with `local`, this node's. Runs until
+    /// interrupted.
     ///
     /// # Errors
     ///
-    /// Fails if the cursor expired, or the op log or a record cannot be read.
+    /// Fails if the cursor expired, the remote fails, or the op log or a
+    /// record cannot be read.
     pub fn watch(
         &self,
         kinds: Vec<KindPattern>,
         subjects: Vec<String>,
         since: Option<u64>,
+        local: bool,
     ) -> Result<(), WorkspaceError> {
+        let remote = if local { None } else { self.remote()? };
         let service = self.service(None)?;
         let mut query = EventsQuery {
             cursor: since,
@@ -225,7 +230,10 @@ impl Workspace {
             subject: List(subjects),
         };
         loop {
-            let page = service.events(&Caller::Owner, &query)?;
+            let page = match remote {
+                Some(remote) => remote.events(&query)?,
+                None => service.events(&Caller::Owner, &query)?,
+            };
             for event in &page.events {
                 println!("{event}");
             }

@@ -11,8 +11,8 @@ use crate::landing::{Landing, Proposal};
 use crate::policy::{KindPattern, Requirement};
 use crate::text::Period;
 use crate::{
-    Acceptance, AcceptanceId, Head, ObjectId, PrincipalName, RecordId, Revision, RevisionId,
-    Statement, StatementId, TargetName,
+    Acceptance, AcceptanceId, ChangeId, Head, ObjectId, PrincipalName, RecordId, RepoPath,
+    Revision, RevisionId, Statement, StatementId, TargetName, TreeId,
 };
 
 /// The name of a repository on a server: ASCII letters, digits, `.`, `_`
@@ -95,11 +95,55 @@ pub struct RepoSummary {
     pub name: RepoName,
 }
 
-/// Asks for records, and any other objects, by id.
+/// Asks for records by id: revisions, statements and acceptances. Each
+/// comes with the blob it carries, if the repository has it: a revision's
+/// description, a statement's payload. Snapshots are fetched with
+/// [`FetchSnapshot`] instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct FetchRecords {
-    /// The objects, returned in this order.
+    /// The records, returned in this order, each followed by its blob.
     pub ids: Vec<ObjectId>,
+}
+
+/// Asks for the objects of a snapshot that the caller lacks: its trees and
+/// blobs, walked from its root. This is the only way blobs and trees leave
+/// a repository, so what each caller may read can be checked by path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct FetchSnapshot {
+    /// The snapshot.
+    pub snapshot: TreeId,
+    /// Snapshots the caller holds whole. Whatever one of them holds at the
+    /// same path is skipped, so only what changed since comes. Those the
+    /// repository doesn't have are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub have: Vec<TreeId>,
+    /// Only these files and directories, with everything under them, and
+    /// the trees on the way to them. Everything by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<RepoPath>,
+}
+
+/// Asks what a repository holds of some changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct InventoryRequest {
+    /// The changes.
+    pub changes: Vec<ChangeId>,
+}
+
+/// What a repository holds of a change: its records, by id, to compare
+/// with another node's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Inventory {
+    /// The change.
+    pub change: ChangeId,
+    /// Its revisions, in the order the repository received them: none if it
+    /// has never heard of the change.
+    pub revisions: Vec<RevisionId>,
+    /// Those no other revision of the change evolves from.
+    pub heads: Vec<RevisionId>,
+    /// The statements about its revisions, and about those statements, in
+    /// no particular order.
+    pub statements: Vec<StatementId>,
 }
 
 /// What putting a batch of records did.
@@ -172,6 +216,8 @@ pub struct LogQuery {
     /// default.
     #[serde(default)]
     pub since: u64,
+    /// Return at most this many acceptances: all by default.
+    pub limit: Option<u64>,
 }
 
 /// One acceptance of a target's log.
