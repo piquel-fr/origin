@@ -6,7 +6,7 @@ use crate::{AcceptanceId, BlobId, ChangeId, Principal, RevisionId, TreeId};
 /// Editing, rebasing or handing a change to someone else creates a new
 /// revision of the same change, whose predecessors are the revisions it
 /// evolves from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Revision {
     /// The change this is a version of.
     pub change: ChangeId,
@@ -41,7 +41,10 @@ impl Record for Revision {
 }
 
 /// What a revision was made on top of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Base {
     /// The state of a target after one of its acceptances.
     Acceptance(AcceptanceId),

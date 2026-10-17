@@ -38,14 +38,15 @@
 //! landings can be listed and retried.
 
 use std::collections::HashSet;
-use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Native, Platform};
+use origin_shared::landing::{Blocked, Landing, Pending, Proposal};
+use origin_shared::policy::Requirement;
 use origin_shared::{
-    AcceptanceBody, AcceptanceId, Base, ChangeId, EncodedObject, Kind, NodeKey, Principal,
+    AcceptanceBody, AcceptanceId, Base, ChangeId, EncodedObject, Head, Kind, NodeKey, Principal,
     PrincipalName, Record, RecordId, RepoPath, Revision, RevisionId, Source, StatementId, TargetId,
     TargetName, Tree, TreeId,
 };
@@ -54,9 +55,8 @@ use crate::ancestry::Ancestry;
 use crate::annotations::{AnnotateError, Annotations, Claim};
 use crate::conflict::Conflicts;
 use crate::oplog::Effect;
-use crate::policy::{Policy, PolicyError, Requirement};
+use crate::policy::{Policy, PolicyError};
 use crate::store::{Store, StoreError};
-use crate::targets::Head;
 
 /// The landing queues of a store's targets, as run by one node.
 #[derive(Debug)]
@@ -64,63 +64,6 @@ pub struct Queue<'a, P = Native> {
     store: &'a Store<P>,
     key: &'a NodeKey,
     node: PrincipalName,
-}
-
-/// What a landing lands.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Proposal {
-    /// A change, as of its head.
-    Change(ChangeId),
-    /// Another target, as of its tip.
-    Target(TargetName),
-}
-
-/// How a landing went.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Landing {
-    /// It landed.
-    Landed {
-        /// What landed.
-        proposal: Proposal,
-        /// The revision or acceptance the acceptance names.
-        source: Source,
-        /// The acceptance.
-        acceptance: Head,
-    },
-    /// The target already has it, so nothing landed.
-    Unchanged(Proposal),
-    /// It waits, and the queue keeps it.
-    Pending(Pending),
-}
-
-/// A landing that waits, kept in the queue to be listed and retried.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pending {
-    /// The target it lands on.
-    pub onto: TargetName,
-    /// What lands.
-    pub proposal: Proposal,
-    /// What the evidence must be about: the revision that would land, or
-    /// the merged snapshot of a target. A conflict is about the revision,
-    /// or the acceptance, that didn't merge.
-    pub subject: RecordId,
-    /// Why it waits.
-    pub blocked: Blocked,
-}
-
-/// Why a landing waits.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Blocked {
-    /// The target requires these statements about the subject.
-    Evidence(Vec<Requirement>),
-    /// Both sides changed these paths. The `core.conflict` statement lists
-    /// them too.
-    Conflict {
-        /// The statement.
-        statement: StatementId,
-        /// The paths, sorted.
-        paths: Vec<RepoPath>,
-    },
 }
 
 /// Landings onto one target, holding its queue's lock.
@@ -133,7 +76,8 @@ struct Session<'q, 'a, P> {
     /// The target's latest acceptance, and its snapshot.
     tip: Head,
     state: TreeId,
-    annotations: Annotations<'a, P>,
+    /// The statements, through an index caught up once the lock was taken.
+    annotations: &'q mut Annotations<'a, P>,
     _lock: LockedFile,
 }
 
@@ -210,6 +154,8 @@ impl<'a, P: Platform> Queue<'a, P> {
     /// yet, from the bottom of the stack. Stops at the first that waits,
     /// which the queue keeps as a landing of `change`: retrying it lands
     /// the rest of the stack once that one can.
+    /// The statements are found through `annotations`, whose index is
+    /// caught up first, so callers that keep one open don't read it again.
     ///
     /// # Errors
     ///
@@ -218,10 +164,11 @@ impl<'a, P: Platform> Queue<'a, P> {
     /// records cannot be read or written.
     pub fn land_change(
         &self,
+        annotations: &mut Annotations<'a, P>,
         change: ChangeId,
         onto: &TargetName,
     ) -> Result<Vec<Landing>, LandError> {
-        let mut session = self.session(onto)?;
+        let mut session = self.session(annotations, onto)?;
         let stack = session.stack(change)?;
         if stack.is_empty() {
             session.forget(&Proposal::Change(change))?;
@@ -240,7 +187,8 @@ impl<'a, P: Platform> Queue<'a, P> {
         Ok(landings)
     }
 
-    /// Lands the tip of `source` on `onto`.
+    /// Lands the tip of `source` on `onto`, finding statements through
+    /// `annotations` as [`Queue::land_change`] does.
     ///
     /// # Errors
     ///
@@ -249,13 +197,14 @@ impl<'a, P: Platform> Queue<'a, P> {
     /// written.
     pub fn land_target(
         &self,
+        annotations: &mut Annotations<'a, P>,
         source: &TargetName,
         onto: &TargetName,
     ) -> Result<Landing, LandError> {
         if source == onto {
             return Err(LandError::SameTarget(onto.clone()));
         }
-        let mut session = self.session(onto)?;
+        let mut session = self.session(annotations, onto)?;
         let tip = self
             .store
             .head(source)?
@@ -340,8 +289,8 @@ impl<'a, P: Platform> Queue<'a, P> {
                 }
                 let text =
                     fs::read_to_string(&path).map_err(|source| StoreError::io(&path, source))?;
-                let mut landing =
-                    Pending::decode(&text).ok_or_else(|| StoreError::Malformed(path.clone()))?;
+                let mut landing = PendingFile::decode(&text)
+                    .ok_or_else(|| StoreError::Malformed(path.clone()))?;
                 if let Blocked::Conflict { statement, paths } = &mut landing.blocked {
                     *paths = Conflicts::listed(store, &store.get(*statement)?)?.paths();
                 }
@@ -411,9 +360,14 @@ impl<'a, P: Platform> Queue<'a, P> {
     }
 
     /// Starts landing on `onto`: locks its queue, then reads the policy in
-    /// force and the target's tip.
-    fn session(&self, onto: &TargetName) -> Result<Session<'_, 'a, P>, LandError> {
+    /// force and the target's tip, and catches `annotations` up.
+    fn session<'q>(
+        &'q self,
+        annotations: &'q mut Annotations<'a, P>,
+        onto: &TargetName,
+    ) -> Result<Session<'q, 'a, P>, LandError> {
         let lock = self.lock(onto)?;
+        annotations.refresh()?;
         let tip = self
             .store
             .head(onto)?
@@ -434,7 +388,7 @@ impl<'a, P: Platform> Queue<'a, P> {
             policy_head,
             state: self.store.get(tip.acceptance)?.body().state,
             tip,
-            annotations: Annotations::open(self.store)?,
+            annotations,
             _lock: lock,
         })
     }
@@ -704,7 +658,7 @@ impl<P: Platform> Session<'_, '_, P> {
         let write = self.store().durable_write();
         write.stage(
             self.pending_path(&pending.proposal)?,
-            pending.encode().as_bytes(),
+            PendingFile::encode(pending).as_bytes(),
         )?;
         let waiting = Effect::Waiting {
             onto: pending.onto.clone(),
@@ -751,7 +705,10 @@ impl<P: Platform> Session<'_, '_, P> {
     }
 }
 
-impl Pending {
+/// The format of the files keeping waiting landings.
+struct PendingFile;
+
+impl PendingFile {
     /// The first line of every file keeping a waiting landing.
     const HEADER: &str = "origin pending 1";
 
@@ -759,20 +716,20 @@ impl Pending {
     /// <id>` or `target <name>`, `subject <kind> <id>`, then a `missing
     /// <kind> <verdict> <issuer>` line for each requirement it lacks, or
     /// `conflict <statement>`, whose payload lists the paths.
-    fn encode(&self) -> String {
-        let mut lines = vec![Self::HEADER.to_owned(), format!("onto {}", self.onto)];
-        lines.push(match &self.proposal {
+    fn encode(pending: &Pending) -> String {
+        let mut lines = vec![Self::HEADER.to_owned(), format!("onto {}", pending.onto)];
+        lines.push(match &pending.proposal {
             Proposal::Change(change) => format!("change {change}"),
             Proposal::Target(target) => format!("target {target}"),
         });
-        let (kind, id) = match self.subject {
+        let (kind, id) = match pending.subject {
             RecordId::Snapshot(id) => ("snapshot", id.to_hex()),
             RecordId::Revision(id) => ("revision", id.to_hex()),
             RecordId::Statement(id) => ("statement", id.to_hex()),
             RecordId::Acceptance(id) => ("acceptance", id.to_hex()),
         };
         lines.push(format!("subject {kind} {id}"));
-        match &self.blocked {
+        match &pending.blocked {
             Blocked::Evidence(missing) => lines.extend(missing.iter().map(|requirement| {
                 format!(
                     "missing {} {} {}",
@@ -784,9 +741,9 @@ impl Pending {
         lines.join("\n") + "\n"
     }
 
-    /// Decodes what [`Pending::encode`] wrote, without the conflicting
+    /// Decodes what [`PendingFile::encode`] wrote, without the conflicting
     /// paths, or `None` if it's malformed.
-    fn decode(text: &str) -> Option<Self> {
+    fn decode(text: &str) -> Option<Pending> {
         let mut lines = text.lines();
         if lines.next()? != Self::HEADER {
             return None;
@@ -827,21 +784,12 @@ impl Pending {
             },
             None => Blocked::Evidence(missing),
         };
-        Some(Self {
+        Some(Pending {
             onto,
             proposal,
             subject,
             blocked,
         })
-    }
-}
-
-impl fmt::Display for Proposal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Change(change) => write!(f, "change {}", change.short()),
-            Self::Target(target) => write!(f, "`{target}`"),
-        }
     }
 }
 
@@ -1053,8 +1001,16 @@ pub(crate) mod tests {
 
         pub(crate) fn land(&self, change: u8) -> Vec<Landing> {
             self.queue()
-                .land_change(ChangeId::from_bytes([change; 16]), &TargetName::MAIN)
+                .land_change(
+                    &mut self.annotations(),
+                    ChangeId::from_bytes([change; 16]),
+                    &TargetName::MAIN,
+                )
                 .unwrap()
+        }
+
+        pub(crate) fn annotations(&self) -> Annotations<'_> {
+            Annotations::open(&self.store).unwrap()
         }
     }
 
@@ -1251,7 +1207,11 @@ pub(crate) mod tests {
         let main = TargetName::MAIN;
         let error = repo
             .queue()
-            .land_change(ChangeId::from_bytes([1; 16]), &main)
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([1; 16]),
+                &main,
+            )
             .unwrap_err();
         assert!(matches!(error, LandError::Divergent { .. }), "{error}");
 
@@ -1269,7 +1229,11 @@ pub(crate) mod tests {
         repo.store.write_all(&[abandon.encode()]).unwrap();
         let error = repo
             .queue()
-            .land_change(ChangeId::from_bytes([2; 16]), &main)
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([2; 16]),
+                &main,
+            )
             .unwrap_err();
         assert!(matches!(error, LandError::Abandoned(_)), "{error}");
     }
@@ -1280,12 +1244,16 @@ pub(crate) mod tests {
         repo.change_on_main(1, &[("a", "a")]);
         let change = ChangeId::from_bytes([1; 16]);
         let other = Queue::new(&repo.store, &repo.key, PrincipalName::new("other").unwrap());
-        let error = other.land_change(change, &TargetName::MAIN).unwrap_err();
+        let error = other
+            .land_change(&mut repo.annotations(), change, &TargetName::MAIN)
+            .unwrap_err();
         assert!(matches!(error, LandError::NotAuthority { .. }), "{error}");
 
         let impostor = NodeKey::from_bytes(&[8; 32]);
         let queue = Queue::new(&repo.store, &impostor, PrincipalName::new("queue").unwrap());
-        let error = queue.land_change(change, &TargetName::MAIN).unwrap_err();
+        let error = queue
+            .land_change(&mut repo.annotations(), change, &TargetName::MAIN)
+            .unwrap_err();
         assert!(matches!(error, LandError::WrongKey(_)), "{error}");
         assert_eq!(repo.tip(&TargetName::MAIN).seq, 0);
     }
@@ -1337,7 +1305,11 @@ pub(crate) mod tests {
         let on_overhaul = Base::Acceptance(repo.tip(&overhaul).acceptance);
         repo.revision(2, &[], on_overhaul, &[("shared", "v2"), ("new", "n")]);
         queue
-            .land_change(ChangeId::from_bytes([2; 16]), &overhaul)
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([2; 16]),
+                &overhaul,
+            )
             .unwrap();
         repo.change_on_main(3, &[("other", "o")]);
         repo.land(3);
@@ -1345,10 +1317,14 @@ pub(crate) mod tests {
         // Catching up merges `main`'s change since the fork; finishing
         // lands the overhaul on `main`.
         assert!(matches!(
-            queue.land_target(&main, &overhaul).unwrap(),
+            queue
+                .land_target(&mut repo.annotations(), &main, &overhaul)
+                .unwrap(),
             Landing::Landed { .. }
         ));
-        let landing = queue.land_target(&overhaul, &main).unwrap();
+        let landing = queue
+            .land_target(&mut repo.annotations(), &overhaul, &main)
+            .unwrap();
         assert!(matches!(
             landing,
             Landing::Landed {
@@ -1360,11 +1336,13 @@ pub(crate) mod tests {
         assert_eq!(repo.state(&main), expected);
         assert_eq!(repo.state(&overhaul), expected);
         assert_eq!(
-            queue.land_target(&overhaul, &main).unwrap(),
+            queue
+                .land_target(&mut repo.annotations(), &overhaul, &main)
+                .unwrap(),
             Landing::Unchanged(Proposal::Target(overhaul.clone()))
         );
         assert!(matches!(
-            queue.land_target(&main, &main),
+            queue.land_target(&mut repo.annotations(), &main, &main),
             Err(LandError::SameTarget(_))
         ));
     }
@@ -1376,9 +1354,11 @@ pub(crate) mod tests {
         let tip = Base::Acceptance(repo.tip(&policy).acceptance);
         for (change, toml) in [(1, "not = [valid"), (2, "[nodes]\n")] {
             repo.revision(change, &[], tip, &[("policy.toml", toml)]);
-            let result = repo
-                .queue()
-                .land_change(ChangeId::from_bytes([change; 16]), &policy);
+            let result = repo.queue().land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([change; 16]),
+                &policy,
+            );
             assert!(
                 matches!(
                     result,
@@ -1407,7 +1387,11 @@ pub(crate) mod tests {
             .unwrap();
         let landings = repo
             .queue()
-            .land_change(ChangeId::from_bytes([3; 16]), &policy)
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([3; 16]),
+                &policy,
+            )
             .unwrap();
         assert!(
             matches!(landings[..], [Landing::Landed { .. }]),
@@ -1429,7 +1413,10 @@ pub(crate) mod tests {
                 issuer: "group:runners".parse().unwrap(),
             }]),
         };
-        assert_eq!(Pending::decode(&pending.encode()), Some(pending.clone()));
+        assert_eq!(
+            PendingFile::decode(&PendingFile::encode(&pending)),
+            Some(pending.clone())
+        );
         let conflict = Pending {
             proposal: change(9),
             blocked: Blocked::Conflict {
@@ -1438,8 +1425,11 @@ pub(crate) mod tests {
             },
             ..pending
         };
-        assert_eq!(Pending::decode(&conflict.encode()), Some(conflict));
-        assert_eq!(Pending::decode("origin pending 2\n"), None);
+        assert_eq!(
+            PendingFile::decode(&PendingFile::encode(&conflict)),
+            Some(conflict)
+        );
+        assert_eq!(PendingFile::decode("origin pending 2\n"), None);
     }
 
     /// A repository whose `main` requires a passing `ci.test` from
@@ -1579,7 +1569,11 @@ pub(crate) mod tests {
         );
         let error = repo
             .queue()
-            .land_change(ChangeId::from_bytes([1; 16]), &TargetName::MAIN)
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([1; 16]),
+                &TargetName::MAIN,
+            )
             .unwrap_err();
         assert!(
             matches!(&error, LandError::Unresolved { paths, .. } if *paths == [path.clone()]),
@@ -1611,7 +1605,7 @@ pub(crate) mod tests {
         let on = |target| Base::Acceptance(repo.tip(target).acceptance);
         repo.revision(2, &[], on(&a), &[("keep", "k")]);
         queue
-            .land_change(ChangeId::from_bytes([2; 16]), &a)
+            .land_change(&mut repo.annotations(), ChangeId::from_bytes([2; 16]), &a)
             .unwrap();
         repo.revision(
             3,
@@ -1620,10 +1614,10 @@ pub(crate) mod tests {
             &[("keep", "k"), ("delete", "d"), ("other", "o")],
         );
         queue
-            .land_change(ChangeId::from_bytes([3; 16]), &b)
+            .land_change(&mut repo.annotations(), ChangeId::from_bytes([3; 16]), &b)
             .unwrap();
         assert!(matches!(
-            queue.land_target(&a, &b).unwrap(),
+            queue.land_target(&mut repo.annotations(), &a, &b).unwrap(),
             Landing::Landed { .. }
         ));
         assert_eq!(repo.state(&b), repo.files(&[("keep", "k"), ("other", "o")]));
@@ -1638,7 +1632,11 @@ pub(crate) mod tests {
             let on = Base::Acceptance(repo.tip(target).acceptance);
             repo.revision(change, &[], on, files);
             queue
-                .land_change(ChangeId::from_bytes([change; 16]), target)
+                .land_change(
+                    &mut repo.annotations(),
+                    ChangeId::from_bytes([change; 16]),
+                    target,
+                )
                 .unwrap();
         };
         // `c` and `d` fork from an empty `main`, `a` and `b` from the next
@@ -1659,16 +1657,16 @@ pub(crate) mod tests {
         land(30, &c, &[("c", "c")]);
         land(31, &d, &[("d", "d")]);
         assert!(matches!(
-            queue.land_target(&c, &a).unwrap(),
+            queue.land_target(&mut repo.annotations(), &c, &a).unwrap(),
             Landing::Landed { .. }
         ));
         assert!(matches!(
-            queue.land_target(&d, &b).unwrap(),
+            queue.land_target(&mut repo.annotations(), &d, &b).unwrap(),
             Landing::Landed { .. }
         ));
 
         assert!(matches!(
-            queue.land_target(&a, &b).unwrap(),
+            queue.land_target(&mut repo.annotations(), &a, &b).unwrap(),
             Landing::Landed { .. }
         ));
         assert_eq!(
@@ -1687,7 +1685,11 @@ pub(crate) mod tests {
             let on = Base::Acceptance(repo.tip(target).acceptance);
             repo.revision(change, &[], on, files);
             queue
-                .land_change(ChangeId::from_bytes([change; 16]), target)
+                .land_change(
+                    &mut repo.annotations(),
+                    ChangeId::from_bytes([change; 16]),
+                    target,
+                )
                 .unwrap();
         };
         queue.create_target(&a, &TargetName::MAIN).unwrap();
@@ -1717,7 +1719,8 @@ pub(crate) mod tests {
         land(3, &a, &[("a", "1"), ("b", "0"), ("shared", "a")]);
         land(4, &b, &[("a", "0"), ("b", "1"), ("shared", "b")]);
 
-        let Landing::Pending(pending) = queue.land_target(&a, &b).unwrap() else {
+        let Landing::Pending(pending) = queue.land_target(&mut repo.annotations(), &a, &b).unwrap()
+        else {
             panic!("the bases disagree on `shared`, so it can't be merged blindly");
         };
         assert!(
@@ -1727,7 +1730,7 @@ pub(crate) mod tests {
         // Once `a` takes `b`'s side, the disjoint edits merge.
         land(5, &a, &[("a", "1"), ("b", "0"), ("shared", "b")]);
         assert!(matches!(
-            queue.land_target(&a, &b).unwrap(),
+            queue.land_target(&mut repo.annotations(), &a, &b).unwrap(),
             Landing::Landed { .. }
         ));
         assert_eq!(
@@ -1744,7 +1747,11 @@ pub(crate) mod tests {
             let on = Base::Acceptance(repo.tip(target).acceptance);
             repo.revision(change, &[], on, files);
             queue
-                .land_change(ChangeId::from_bytes([change; 16]), target)
+                .land_change(
+                    &mut repo.annotations(),
+                    ChangeId::from_bytes([change; 16]),
+                    target,
+                )
                 .unwrap();
         };
         let [a, b] = ["a", "b"].map(|name| TargetName::new(name).unwrap());
@@ -1775,7 +1782,8 @@ pub(crate) mod tests {
 
         // What `p` was is unknown, so the deletion can't be told from an
         // addition: it conflicts, rather than bring `p/delete` back.
-        let Landing::Pending(pending) = queue.land_target(&a, &b).unwrap() else {
+        let Landing::Pending(pending) = queue.land_target(&mut repo.annotations(), &a, &b).unwrap()
+        else {
             panic!("the bases disagree on `p`, so it can't be merged blindly");
         };
         assert!(
@@ -1838,7 +1846,11 @@ pub(crate) mod tests {
         repo.revision(2, &[], Base::Revision(first), &[("policy.toml", &open)]);
         let landings = repo
             .queue()
-            .land_change(ChangeId::from_bytes([2; 16]), &policy)
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([2; 16]),
+                &policy,
+            )
             .unwrap();
         assert_eq!(landed(&landings[0]), first);
         assert!(matches!(landings[1], Landing::Pending(_)), "{landings:?}");

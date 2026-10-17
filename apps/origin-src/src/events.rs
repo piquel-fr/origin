@@ -23,241 +23,58 @@
 //! a power loss could take back, so none is reused. Entries lost to damage
 //! deliver nothing, and the damage is reported on stderr.
 
-use std::fmt;
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use origin_platform::{Native, Platform};
-use origin_shared::{
-    AcceptanceId, ChangeId, Kind, Object, ObjectId, Principal, RecordId, RevisionId, StatementId,
-    TargetName, Verdict,
-};
+use origin_shared::event::{Event, EventKind, Filter, Page};
+use origin_shared::landing::{Blocked, Pending};
+use origin_shared::{Object, ObjectId};
 
 use crate::index;
 use crate::oplog::{Effect, Entry};
-use crate::policy::{KindPattern, Requirement};
-use crate::queue::{Blocked, Pending, Queue};
+use crate::queue::Queue;
 use crate::store::{Store, StoreError};
-
-/// Something that happened, and where it is in the op log.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Event {
-    /// The sequence number of the op log entry it comes from. Reading from
-    /// it delivers the events of the entries after it.
-    pub cursor: u64,
-    /// What happened.
-    pub kind: EventKind,
-}
-
-/// What happened.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventKind {
-    /// A statement was issued.
-    StatementIssued {
-        /// The statement.
-        statement: StatementId,
-        /// What it's about.
-        subject: RecordId,
-        /// Its kind.
-        kind: Kind,
-        /// Its verdict.
-        verdict: Option<Verdict>,
-        /// Who issued it.
-        issuer: Principal,
-    },
-    /// A revision was created.
-    RevisionCreated {
-        /// The revision.
-        revision: RevisionId,
-        /// Its change.
-        change: ChangeId,
-        /// Who made it.
-        author: Principal,
-    },
-    /// A target advanced.
-    TargetAdvanced {
-        /// The target.
-        target: TargetName,
-        /// The acceptance's position in its log.
-        seq: u64,
-        /// The acceptance.
-        acceptance: AcceptanceId,
-    },
-    /// A landing waits for a statement it requires.
-    CheckRequested {
-        /// The target it lands on.
-        onto: TargetName,
-        /// What the statement must be about.
-        subject: RecordId,
-        /// The statement required.
-        requirement: Requirement,
-    },
-}
-
-/// What an event is about, which `--subject` matches.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Subject {
-    /// A record.
-    Record(RecordId),
-    /// A change: the subject of its revisions' events.
-    Change(ChangeId),
-    /// A target.
-    Target(TargetName),
-}
-
-impl EventKind {
-    /// The event's name, such as `statement.issued`.
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::StatementIssued { .. } => "statement.issued",
-            Self::RevisionCreated { .. } => "revision.created",
-            Self::TargetAdvanced { .. } => "target.advanced",
-            Self::CheckRequested { .. } => "check.requested",
-        }
-    }
-
-    /// The record the event is about, to deduplicate by: the statement,
-    /// revision or acceptance, or for a check, the record to check.
-    #[must_use]
-    pub fn record(&self) -> RecordId {
-        match *self {
-            Self::StatementIssued { statement, .. } => RecordId::Statement(statement),
-            Self::RevisionCreated { revision, .. } => RecordId::Revision(revision),
-            Self::TargetAdvanced { acceptance, .. } => RecordId::Acceptance(acceptance),
-            Self::CheckRequested { subject, .. } => subject,
-        }
-    }
-
-    /// What the event is about: a statement's or a check's subject, a
-    /// revision's change, or the target that advanced.
-    #[must_use]
-    pub fn subject(&self) -> Subject {
-        match self {
-            Self::StatementIssued { subject, .. } | Self::CheckRequested { subject, .. } => {
-                Subject::Record(*subject)
-            }
-            Self::RevisionCreated { change, .. } => Subject::Change(*change),
-            Self::TargetAdvanced { target, .. } => Subject::Target(target.clone()),
-        }
-    }
-
-    /// The kinds `--kind` matches the event by: its name, and the kind of
-    /// the statement issued or requested.
-    fn kinds(&self) -> Vec<Kind> {
-        let name = Kind::new(self.name()).expect("event names are valid kinds");
-        match self {
-            Self::StatementIssued { kind, .. } => vec![name, kind.clone()],
-            Self::CheckRequested { requirement, .. } => vec![name, requirement.kind.clone()],
-            Self::RevisionCreated { .. } | Self::TargetAdvanced { .. } => vec![name],
-        }
-    }
-}
-
-impl fmt::Display for Subject {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Record(RecordId::Snapshot(id)) => write!(f, "snapshot:{id}"),
-            Self::Record(RecordId::Revision(id)) => write!(f, "revision:{id}"),
-            Self::Record(RecordId::Statement(id)) => write!(f, "statement:{id}"),
-            Self::Record(RecordId::Acceptance(id)) => write!(f, "acceptance:{id}"),
-            Self::Change(id) => write!(f, "change:{id}"),
-            Self::Target(name) => write!(f, "target:{name}"),
-        }
-    }
-}
-
-/// One line: the cursor, the name, then `key=value` fields with full ids.
-impl fmt::Display for Event {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.cursor, self.kind.name())?;
-        let verdict = |verdict: &Option<Verdict>| {
-            verdict.map_or_else(|| "none".to_owned(), |verdict| verdict.to_string())
-        };
-        match &self.kind {
-            EventKind::StatementIssued {
-                statement,
-                subject,
-                kind,
-                verdict: issued,
-                issuer,
-            } => write!(
-                f,
-                " statement={statement} subject={} kind={kind} verdict={} issuer={issuer}",
-                Subject::Record(*subject),
-                verdict(issued)
-            ),
-            EventKind::RevisionCreated {
-                revision,
-                change,
-                author,
-            } => write!(f, " revision={revision} change={change} author={author}"),
-            EventKind::TargetAdvanced {
-                target,
-                seq,
-                acceptance,
-            } => write!(f, " target={target} seq={seq} acceptance={acceptance}"),
-            EventKind::CheckRequested {
-                onto,
-                subject,
-                requirement,
-            } => write!(
-                f,
-                " onto={onto} subject={} kind={} verdict={} issuer={}",
-                Subject::Record(*subject),
-                requirement.kind,
-                requirement.verdict,
-                requirement.issuer
-            ),
-        }
-    }
-}
-
-/// Which events to deliver. An empty list matches everything.
-#[derive(Clone, Debug, Default)]
-pub struct Filter {
-    /// Event names or statement kinds, such as `check.requested`,
-    /// `core.conflict` or `ci.*`: an event matches one if its name, or the
-    /// kind it issues or requests, does.
-    pub kinds: Vec<KindPattern>,
-    /// Starts of subjects, such as a revision id prefix, `change:3fa2` or
-    /// `main`: an event matches one if its [subject](EventKind::subject),
-    /// written as `revision:<id>`, or its id or name alone, starts with it.
-    pub subjects: Vec<String>,
-}
-
-impl Filter {
-    /// Whether `event` passes the filter.
-    #[must_use]
-    pub fn matches(&self, event: &EventKind) -> bool {
-        let kind = self.kinds.is_empty()
-            || event
-                .kinds()
-                .iter()
-                .any(|kind| self.kinds.iter().any(|pattern| pattern.matches(kind)));
-        kind && (self.subjects.is_empty() || {
-            let subject = event.subject().to_string();
-            let bare = subject.split_once(':').map_or("", |(_, bare)| bare);
-            self.subjects.iter().any(|start| {
-                subject.starts_with(start.as_str()) || bare.starts_with(start.as_str())
-            })
-        })
-    }
-}
-
-/// A batch of events, and the cursor to read the next batch from.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Page {
-    /// The events, oldest first.
-    pub events: Vec<Event>,
-    /// The cursor after the entries read: pass it to the next read.
-    pub next: u64,
-}
 
 /// The events of a store.
 #[derive(Debug)]
 pub struct Events<'a, P = Native> {
     store: &'a Store<P>,
+    /// What [`Events::wait`] waits on between reads, if not just the time.
+    wakeup: Option<&'a Wakeup>,
+}
+
+/// Wakes the readers waiting for events in this process as soon as it
+/// writes, rather than at their next read of the op log. Writes from other
+/// processes still wait for that read.
+#[derive(Debug, Default)]
+pub struct Wakeup {
+    /// How many writes this process made.
+    writes: Mutex<u64>,
+    written: Condvar,
+}
+
+impl Wakeup {
+    /// Wakes every reader waiting: this process wrote.
+    pub fn notify(&self) {
+        *self.writes.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        self.written.notify_all();
+    }
+
+    /// How many writes this process made so far.
+    fn writes(&self) -> u64 {
+        *self.writes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits up to `timeout`, or until a write after the first `seen`.
+    fn sleep(&self, seen: u64, timeout: Duration) {
+        let writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
+        let _woken = self
+            .written
+            .wait_timeout_while(writes, timeout, |writes| *writes == seen)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
 }
 
 impl<'a, P: Platform> Events<'a, P> {
@@ -266,7 +83,19 @@ impl<'a, P: Platform> Events<'a, P> {
 
     /// The events of `store`.
     pub fn new(store: &'a Store<P>) -> Self {
-        Self { store }
+        Self {
+            store,
+            wakeup: None,
+        }
+    }
+
+    /// The events, with [`Events::wait`] also woken by `wakeup`.
+    #[must_use]
+    pub fn waking_on(self, wakeup: &'a Wakeup) -> Self {
+        Self {
+            wakeup: Some(wakeup),
+            ..self
+        }
     }
 
     /// The cursor after every event so far: reading from it delivers only
@@ -317,7 +146,8 @@ impl<'a, P: Platform> Events<'a, P> {
     }
 
     /// Like [`Events::after`], but waits up to `timeout` for events, reading
-    /// the op log every [`Events::POLL`]. The page is empty if none came.
+    /// the op log every [`Events::POLL`], and whenever the
+    /// [`Wakeup`] says this process wrote. The page is empty if none came.
     ///
     /// # Errors
     ///
@@ -332,6 +162,8 @@ impl<'a, P: Platform> Events<'a, P> {
         let start = Instant::now();
         let mut cursor = cursor;
         loop {
+            // Read before the op log, so no write after it is missed.
+            let seen = self.wakeup.map(Wakeup::writes);
             let page = self.after(cursor, filter, limit)?;
             let left = timeout.saturating_sub(start.elapsed());
             if !page.events.is_empty() || left.is_zero() {
@@ -339,7 +171,11 @@ impl<'a, P: Platform> Events<'a, P> {
             }
             // Entries with no matching events are read past.
             cursor = page.next;
-            thread::sleep(Self::POLL.min(left));
+            let pause = Self::POLL.min(left);
+            match (self.wakeup, seen) {
+                (Some(wakeup), Some(seen)) => wakeup.sleep(seen, pause),
+                _ => thread::sleep(pause),
+            }
         }
     }
 
@@ -435,7 +271,8 @@ impl<'a, P: Platform> Events<'a, P> {
 mod tests {
     use std::fs;
 
-    use origin_shared::{Base, ChangeId, ObjectId};
+    use origin_shared::event::Subject;
+    use origin_shared::{Base, ChangeId, ObjectId, RecordId, TargetName};
 
     use super::*;
     use crate::annotations::Annotations;
@@ -645,7 +482,7 @@ mod tests {
         // file replaces the conflict's: readers wait for both.
         let again = Effect::Waiting {
             onto: TargetName::MAIN,
-            proposal: crate::queue::Proposal::Change(ChangeId::from_bytes([2; 16])),
+            proposal: origin_shared::landing::Proposal::Change(ChangeId::from_bytes([2; 16])),
         };
         let (_, writing) = repo.store.oplog().append_in_progress(&again).unwrap();
         assert_eq!(

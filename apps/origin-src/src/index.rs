@@ -111,6 +111,22 @@ impl Index {
         Self::rebuild_locked(store, &index)
     }
 
+    /// Catches up with the op log of `store`, as [`Index::open`] does, for
+    /// a process that keeps the index open: reading only the op log
+    /// entries since the last catch-up costs little, where reading the
+    /// whole index again costs a lot. Reopens it if the op log no longer
+    /// has those entries.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Index::open`].
+    pub fn refresh<P: Platform>(&mut self, store: &Store<P>) -> Result<(), StoreError> {
+        if !self.catch_up(store)? {
+            *self = Self::open(store)?;
+        }
+        Ok(())
+    }
+
     /// Reconstructs the index of `store` from its records, and replaces the
     /// one on disk. Records the old index knew keep their arrival order.
     ///
@@ -1133,6 +1149,25 @@ mod tests {
         ));
         let index = Index::open(&store).unwrap();
         assert_eq!(index.revisions(change(1)).len(), written.len());
+    }
+
+    #[test]
+    fn refreshing_catches_up_an_index_kept_open() {
+        let (_dir, store) = store();
+        let mut index = Index::open(&store).unwrap();
+        let first = revision(change(1), &[], "first");
+        store.write_all(slice::from_ref(&first)).unwrap();
+        index.refresh(&store).unwrap();
+        assert_eq!(index, Index::open(&store).unwrap());
+
+        // Once the op log dropped what it missed, it reads the index again.
+        for i in 0..100 {
+            let object = revision(change(2), &[], &format!("{i}"));
+            store.write_all(slice::from_ref(&object)).unwrap();
+        }
+        index.refresh(&store).unwrap();
+        assert_eq!(index.revisions(change(2)).len(), 100);
+        assert_eq!(index.heads(change(1)), [revision_id(&first)]);
     }
 
     #[test]
