@@ -1,12 +1,14 @@
 //! The `origin` command line: argument parsing. The commands themselves are
 //! methods of [`Workspace`], which print their output.
 
+use std::convert::Infallible;
 use std::env;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use origin_shared::TargetName;
+use clap::{Args, Parser, Subcommand};
+use origin_shared::{Digest, Inputs, Kind, RepoPath, TargetName, Verdict};
 
 use crate::config::UserConfig;
 use crate::workspace::Workspace;
@@ -92,6 +94,107 @@ enum WorkspaceCommand {
     /// Manage the record index.
     #[command(subcommand)]
     Index(IndexCommand),
+    /// Issue a statement about a revision, such as a check result or a
+    /// review, superseding your previous one of the same kind about it.
+    Annotate(AnnotateArgs),
+    /// Show the statements about a revision.
+    Statements {
+        /// The revision: `@`, a change for its head, or a revision.
+        #[arg(default_value = "@")]
+        rev: String,
+    },
+    /// Carry results over to a revision from the records with the same
+    /// input digest.
+    Promote {
+        /// The revision: `@`, a change for its head, or a revision.
+        #[arg(default_value = "@")]
+        rev: String,
+    },
+    /// Drop the payloads past the retention set in `policy.toml`, pack
+    /// small objects, and remove the leftovers of crashed writes.
+    Gc,
+}
+
+#[derive(Debug, Args)]
+struct AnnotateArgs {
+    /// The revision: `@`, a change for its head, or a revision.
+    rev: String,
+    /// What kind of statement, such as `ci.test` or `review`.
+    kind: Kind,
+    #[command(flatten)]
+    verdict: VerdictArgs,
+    /// The files and directories the claim depended on, which lets it be
+    /// promoted to revisions where they're the same.
+    #[arg(long, num_args = 1..)]
+    inputs: Vec<RepoPath>,
+    /// The check's command and configuration: text, or the hex digest of
+    /// it.
+    #[arg(long, requires = "inputs")]
+    definition: Option<DigestArg>,
+    /// The tools that ran it, such as the output of `rustc -V`: text, or the
+    /// hex digest of it.
+    #[arg(long, requires = "inputs")]
+    toolchain: Option<DigestArg>,
+    /// The claim also depended on things outside the inputs, such as the
+    /// network, so it is never promoted.
+    #[arg(long, requires = "inputs")]
+    external: bool,
+    /// A file holding details, such as a log.
+    #[arg(long)]
+    payload: Option<PathBuf>,
+}
+
+/// Exactly one verdict.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct VerdictArgs {
+    /// The check passed, or you approve.
+    #[arg(long)]
+    pass: bool,
+    /// The check failed, or you object.
+    #[arg(long)]
+    fail: bool,
+    /// Neither: informational.
+    #[arg(long)]
+    neutral: bool,
+}
+
+impl VerdictArgs {
+    fn verdict(&self) -> Verdict {
+        match (self.pass, self.fail) {
+            (true, _) => Verdict::Pass,
+            (_, true) => Verdict::Fail,
+            _ => Verdict::Neutral,
+        }
+    }
+}
+
+impl AnnotateArgs {
+    /// The inputs declared, if any. Without a definition or toolchain, they
+    /// are the digest of nothing.
+    fn inputs(&self) -> Option<Inputs> {
+        let digest = |arg: &Option<DigestArg>| arg.map_or_else(|| Digest::of(b""), |arg| arg.0);
+        (!self.inputs.is_empty()).then(|| Inputs {
+            paths: self.inputs.clone(),
+            definition: digest(&self.definition),
+            toolchain: digest(&self.toolchain),
+            external: self.external,
+        })
+    }
+}
+
+/// A digest given as its hex, or as the text it's the digest of.
+#[derive(Clone, Copy, Debug)]
+struct DigestArg(Digest);
+
+impl FromStr for DigestArg {
+    type Err = Infallible;
+
+    fn from_str(arg: &str) -> Result<Self, Self::Err> {
+        Ok(Self(
+            arg.parse().unwrap_or_else(|_| Digest::of(arg.as_bytes())),
+        ))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,6 +237,16 @@ impl WorkspaceCommand {
             Self::Log { target, limit } => workspace.log(target, limit)?,
             Self::Evolog { change } => workspace.evolog(&change)?,
             Self::Index(IndexCommand::Rebuild) => workspace.rebuild_index()?,
+            Self::Annotate(args) => workspace.annotate(
+                &args.rev,
+                args.kind.clone(),
+                args.verdict.verdict(),
+                args.inputs(),
+                args.payload.as_deref(),
+            )?,
+            Self::Statements { rev } => workspace.statements(&rev)?,
+            Self::Promote { rev } => workspace.promote(&rev)?,
+            Self::Gc => workspace.gc()?,
         }
         Ok(())
     }

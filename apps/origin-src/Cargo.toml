@@ -34,6 +34,10 @@ origin-src = { workspace = true, features = ["fixture"] }
 tempfile.workspace = true
 
 [[bench]]
+name = "annotations"
+harness = false
+
+[[bench]]
 name = "snapshot"
 harness = false
 

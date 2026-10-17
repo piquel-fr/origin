@@ -233,6 +233,19 @@ fn divergence_shows_until_converged() {
     );
     assert!(repo.fails(&["edit", &change]).contains("is divergent"));
     assert_eq!(repo.ok(&["show", &change]).matches("Revision ").count(), 2);
+    // The divergence is flagged once, about one of the heads.
+    let evolog = repo.ok(&["evolog", &change]);
+    let flagged: usize = evolog
+        .lines()
+        .filter(|line| line.ends_with(" (head)"))
+        .map(|line| {
+            let revision = line.split(' ').nth(1).unwrap();
+            repo.ok(&["statements", revision])
+                .matches(" core.divergent by node:ada")
+                .count()
+        })
+        .sum();
+    assert_eq!(flagged, 1, "{evolog}");
 
     let converged = repo.ok(&["converge", &change]);
     assert!(
@@ -275,6 +288,22 @@ fn abandoning_the_current_change_restores_its_base() {
     assert!(show.contains(" (abandoned)\n"), "{show}");
     assert!(show.contains("Abandoned by user:ada: Too slow\n"), "{show}");
     assert!(show.contains("+cache\n"), "the attempt is kept: {show}");
+}
+
+#[test]
+fn only_those_who_worked_on_a_change_abandon_it() {
+    let repo = Repo::new();
+    repo.ok(&["new", "Ada's change"]);
+    let change = repo.change();
+    repo.ok(&["new", "Next"]);
+    let config = repo.config.path().join("config.toml");
+    fs::write(&config, "user = \"eve\"\n").unwrap();
+    repo.ok(&["abandon", &change, "--reason", "Not mine"]);
+    fs::write(&config, "user = \"ada\"\n").unwrap();
+
+    let show = repo.ok(&["show", &change]);
+    assert!(!show.contains("abandoned"), "{show}");
+    assert!(!show.contains("Abandoned by"), "{show}");
 }
 
 #[test]
@@ -348,4 +377,108 @@ fn a_closed_output_pipe_ends_quietly() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn statements_are_promoted_where_their_inputs_are_unchanged() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "fn a() {}\n");
+    repo.write("docs/guide.md", "# Guide\n");
+    repo.write("lint.log", "all clean\n");
+    let lint = repo.ok(&[
+        "annotate",
+        "@",
+        "ci.lint",
+        "--pass",
+        "--inputs",
+        "src",
+        "--definition",
+        "cargo clippy",
+        "--payload",
+        "lint.log",
+    ]);
+    assert!(lint.contains(": ci.lint pass about revision "), "{lint}");
+    assert!(lint.contains("\nInput digest: "), "{lint}");
+    repo.ok(&[
+        "annotate",
+        "@",
+        "docs.test",
+        "--fail",
+        "--inputs",
+        "src",
+        "docs",
+    ]);
+    let rerun = repo.ok(&[
+        "annotate",
+        "@",
+        "docs.test",
+        "--pass",
+        "--inputs",
+        "src",
+        "docs",
+    ]);
+    assert!(rerun.contains("\nSupersedes statement "), "{rerun}");
+    repo.ok(&[
+        "annotate",
+        "@",
+        "links",
+        "--pass",
+        "--inputs",
+        "docs",
+        "--external",
+    ]);
+    repo.ok(&["annotate", "@", "review", "--neutral"]);
+
+    let statements = repo.ok(&["statements"]);
+    assert_eq!(
+        statements.matches(" by user:ada").count(),
+        5,
+        "{statements}"
+    );
+    assert!(
+        statements.contains("docs.test fail by user:ada (superseded by "),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    inputs: docs, and external\n"),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    payload: all clean\n"),
+        "{statements}"
+    );
+
+    // A docs-only change keeps the lint result.
+    repo.ok(&["new", "Document more"]);
+    repo.write("docs/guide.md", "# Guide\nMore.\n");
+    let promoted = repo.ok(&["promote"]);
+    assert!(
+        promoted.starts_with("Promoted ci.lint pass by user:ada as statement "),
+        "{promoted}"
+    );
+    assert_eq!(promoted.lines().count(), 1, "{promoted}");
+    assert!(repo.ok(&["promote"]).starts_with("Nothing to promote"));
+    let statements = repo.ok(&["statements", "@"]);
+    assert!(
+        statements.contains(" ci.lint pass by node:ada\n"),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    promoted from statement "),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    payload: all clean\n"),
+        "{statements}"
+    );
+
+    assert!(
+        repo.fails(&["annotate", "@", "core.conflict", "--fail"])
+            .contains("is a reserved kind")
+    );
+    assert!(repo.fails(&["annotate", "@", "ci.lint"]).contains("--pass"));
+    assert!(
+        repo.ok(&["gc"])
+            .starts_with("Dropped 0 payloads past their retention")
+    );
 }

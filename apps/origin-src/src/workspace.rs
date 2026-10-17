@@ -16,20 +16,24 @@
 //! refers to them: the snapshot's objects, then the revision, then the
 //! `workspace` file naming it.
 
+mod annotate;
+
 use std::fs;
 use std::io;
 use std::path::{self, Path, PathBuf};
 
-use origin_platform::Native;
+use origin_platform::{LockedFile, Native};
 use origin_shared::{
     AcceptanceBody, AcceptanceId, Base, BlobId, ChangeId, EncodedObject, EntryKind, EntryName,
     Kind, NodePublicKey, Principal, Record, RecordId, Revision, RevisionId, Source, Statement,
     TargetId, TargetName, Tree, TreeEntry, TreeId,
 };
 
+use crate::annotations::AnnotateError;
 use crate::config::{ConfigError, UserConfig};
-use crate::index::{FindChangeError, Index};
+use crate::index::{FindChangeError, FindError, Index};
 use crate::output::FileDiff;
+use crate::policy::PolicyError;
 use crate::store::{Store, StoreError};
 use crate::worktree::{SnapshotError, StatCache, Worktree};
 
@@ -53,6 +57,9 @@ struct WorkingCopy {
     /// The revision's record, if recording the draft made a new revision,
     /// which is not written yet.
     unsaved: Option<EncodedObject>,
+    /// Keeps garbage collection away from the objects the snapshot found
+    /// stored, until the command that saves it is done.
+    _held: LockedFile,
 }
 
 impl WorkingCopy {
@@ -210,6 +217,7 @@ impl Workspace {
     /// Snapshots the working copy into a draft, recording nothing, for the
     /// commands that only read it.
     fn snapshot(&self) -> Result<WorkingCopy, WorkspaceError> {
+        let held = self.store.hold_objects()?;
         let revision: Revision = self.store.get(self.revision)?;
         let path = self.meta("state");
         let (files, cache) =
@@ -224,6 +232,7 @@ impl Workspace {
             revision,
             files,
             unsaved: None,
+            _held: held,
         })
     }
 
@@ -244,8 +253,8 @@ impl Workspace {
         Ok(WorkingCopy {
             id: encoded.id().into(),
             revision,
-            files: working_copy.files,
             unsaved: Some(encoded),
+            ..working_copy
         })
     }
 
@@ -259,14 +268,16 @@ impl Workspace {
         Ok(working_copy)
     }
 
-    /// Writes `layers` of objects, then makes `revision` the working copy.
+    /// Writes `layers` of objects, then makes `revision` the working copy,
+    /// flagging its change if that made it diverge.
     fn save(
         &mut self,
         layers: &[Vec<EncodedObject>],
         revision: RevisionId,
     ) -> Result<(), WorkspaceError> {
         self.write(layers)?;
-        self.point_at(revision)
+        self.point_at(revision)?;
+        self.flag_divergence(revision)
     }
 
     /// Writes `layers` of objects in order, each durable before the next,
@@ -502,6 +513,7 @@ impl Workspace {
             inputs: None,
             payload: Some(reason.id().into()),
             supersedes: None,
+            promoted_from: None,
         }
         .encode();
         if change != working_copy.revision.change {
@@ -742,7 +754,8 @@ impl Workspace {
         Ok(flags)
     }
 
-    /// Who abandoned a revision, and why.
+    /// Who abandoned a revision, and why: only those who may, as
+    /// [`Store::authorizes`] says.
     fn abandonments(
         &self,
         index: &Index,
@@ -751,7 +764,7 @@ impl Workspace {
         let mut abandonments = Vec::new();
         for &id in index.statements(RecordId::Revision(revision)) {
             let statement = self.store.get(id)?;
-            if statement.kind == Kind::ABANDON {
+            if statement.kind == Kind::ABANDON && self.store.authorizes(&statement)? {
                 let reason = match statement.payload {
                     Some(payload) => self.text(payload)?,
                     None => String::new(),
@@ -869,6 +882,18 @@ pub enum WorkspaceError {
     /// The working copy cannot be snapshotted or checked out.
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+    /// A revision id prefix doesn't name one revision.
+    #[error(transparent)]
+    FindRevision(#[from] FindError<RevisionId>),
+    /// Only origin itself issues statements of `core.` kinds.
+    #[error("`{0}` is a reserved kind: only origin itself issues `core.` statements")]
+    ReservedKind(Kind),
+    /// A statement cannot be issued.
+    #[error(transparent)]
+    Annotate(#[from] AnnotateError),
+    /// The policy cannot be read.
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
 }
 
 impl WorkspaceError {
