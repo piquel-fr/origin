@@ -16,6 +16,8 @@
 //! refers to them: the snapshot's objects, then the revision, then the
 //! `workspace` file naming it.
 
+mod annotate;
+
 use std::fs;
 use std::io;
 use std::path::{self, Path, PathBuf};
@@ -27,8 +29,9 @@ use origin_shared::{
     TargetId, TargetName, Tree, TreeEntry, TreeId,
 };
 
+use crate::annotations::AnnotateError;
 use crate::config::{ConfigError, UserConfig};
-use crate::index::{FindChangeError, Index};
+use crate::index::{FindChangeError, FindError, Index};
 use crate::output::FileDiff;
 use crate::store::{Store, StoreError};
 use crate::worktree::{SnapshotError, StatCache, Worktree};
@@ -245,8 +248,8 @@ impl Workspace {
         Ok(WorkingCopy {
             id: encoded.id().into(),
             revision,
-            files: working_copy.files,
             unsaved: Some(encoded),
+            ..working_copy
         })
     }
 
@@ -260,14 +263,16 @@ impl Workspace {
         Ok(working_copy)
     }
 
-    /// Writes `layers` of objects, then makes `revision` the working copy.
+    /// Writes `layers` of objects, then makes `revision` the working copy,
+    /// flagging its change if that made it diverge.
     fn save(
         &mut self,
         layers: &[Vec<EncodedObject>],
         revision: RevisionId,
     ) -> Result<(), WorkspaceError> {
         self.write(layers)?;
-        self.point_at(revision)
+        self.point_at(revision)?;
+        self.flag_divergence(revision)
     }
 
     /// Writes `layers` of objects in order, each durable before the next,
@@ -425,8 +430,14 @@ impl Workspace {
         };
         let encoded = revision.encode();
         let id = encoded.id().into();
+        let recorded = working_copy.unsaved.is_some();
         let first = working_copy.unsaved.into_iter().chain([description]);
         self.save(&[first.collect(), vec![encoded]], id)?;
+        // Edits recorded on a revision that is no longer its change's head
+        // make that change diverge.
+        if recorded {
+            self.flag_divergence(working_copy.id)?;
+        }
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.headline(&working_copy.revision)?);
         Ok(())
@@ -484,8 +495,10 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Fails if the change cannot be found or diverged, or the records
-    /// cannot be written.
+    /// Fails if the change cannot be found or diverged, the user didn't
+    /// create it, so readers would ignore the statement, or the records
+    /// cannot be written. Then no abandonment is written and nothing is
+    /// checked out.
     pub fn abandon(&mut self, change: Option<&str>, reason: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
         let index = Index::open(&self.store)?;
@@ -503,8 +516,16 @@ impl Workspace {
             inputs: None,
             payload: Some(reason.id().into()),
             supersedes: None,
+            promoted_from: None,
+        };
+        if !self.store.authorizes(&statement)? {
+            return Err(AnnotateError::Reserved {
+                kind: statement.kind,
+                issuer: statement.issuer,
+            }
+            .into());
         }
-        .encode();
+        let statement = statement.encode();
         if change != working_copy.revision.change {
             self.write(&[vec![reason], vec![statement]])?;
             println!("Abandoned change {}", change.short());
@@ -743,7 +764,8 @@ impl Workspace {
         Ok(flags)
     }
 
-    /// Who abandoned a revision, and why.
+    /// Who abandoned a revision, and why: only those who may, as
+    /// [`Store::authorizes`] says.
     fn abandonments(
         &self,
         index: &Index,
@@ -752,7 +774,7 @@ impl Workspace {
         let mut abandonments = Vec::new();
         for &id in index.statements(RecordId::Revision(revision)) {
             let statement = self.store.get(id)?;
-            if statement.kind == Kind::ABANDON {
+            if statement.kind == Kind::ABANDON && self.store.authorizes(&statement)? {
                 let reason = match statement.payload {
                     Some(payload) => self.text(payload)?,
                     None => String::new(),
@@ -870,6 +892,29 @@ pub enum WorkspaceError {
     /// The working copy cannot be snapshotted or checked out.
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+    /// A revision id prefix doesn't name one revision.
+    #[error(transparent)]
+    FindRevision(#[from] FindError<RevisionId>),
+    /// A prefix names a change and another revision than its head.
+    #[error(
+        "`{prefix}` names both change {} and revision {}: give more of either id",
+        change.short(),
+        revision.short()
+    )]
+    AmbiguousRevision {
+        /// The prefix.
+        prefix: String,
+        /// The change it names.
+        change: ChangeId,
+        /// The revision it names.
+        revision: RevisionId,
+    },
+    /// Only origin itself issues statements of `core.` kinds.
+    #[error("`{0}` is a reserved kind: only origin itself issues `core.` statements")]
+    ReservedKind(Kind),
+    /// A statement cannot be issued.
+    #[error(transparent)]
+    Annotate(#[from] AnnotateError),
 }
 
 impl WorkspaceError {

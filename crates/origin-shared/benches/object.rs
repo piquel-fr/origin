@@ -71,6 +71,7 @@ fn statement() -> Statement {
         }),
         payload: Some(id("log")),
         supersedes: None,
+        promoted_from: None,
     }
 }
 

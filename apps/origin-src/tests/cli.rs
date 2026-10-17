@@ -4,6 +4,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::slice;
+
+use origin_platform::Native;
+use origin_shared::{
+    ChangeId, EncodedObject, Kind, Record, Revision, RevisionId, Statement, StatementId, Verdict,
+};
+use origin_src::store::Store;
 
 /// A temporary working copy, and a user configuration of its own.
 struct Repo {
@@ -233,6 +240,19 @@ fn divergence_shows_until_converged() {
     );
     assert!(repo.fails(&["edit", &change]).contains("is divergent"));
     assert_eq!(repo.ok(&["show", &change]).matches("Revision ").count(), 2);
+    // The divergence is flagged once, about one of the heads.
+    let evolog = repo.ok(&["evolog", &change]);
+    let flagged: usize = evolog
+        .lines()
+        .filter(|line| line.ends_with(" (head)"))
+        .map(|line| {
+            let revision = line.split(' ').nth(1).unwrap();
+            repo.ok(&["statements", revision])
+                .matches(" core.divergent by node:ada")
+                .count()
+        })
+        .sum();
+    assert_eq!(flagged, 1, "{evolog}");
 
     let converged = repo.ok(&["converge", &change]);
     assert!(
@@ -277,6 +297,112 @@ fn abandoning_the_current_change_restores_its_base() {
     assert!(show.contains("+cache\n"), "the attempt is kept: {show}");
 }
 
+/// The working copy's revision, in full.
+fn revision_of(repo: &Repo) -> RevisionId {
+    repo.read(".origin/workspace").trim().parse().unwrap()
+}
+
+#[test]
+fn at_names_the_working_copy_s_own_revision() {
+    let repo = Repo::new();
+    repo.write("file", "base\n");
+    repo.ok(&["describe", "Shared work"]);
+    // Another revision of the change, then the working copy back on the
+    // one before: the change diverges, and `@` is still the working copy.
+    let pointer = repo.path(".origin/workspace");
+    let started = fs::read_to_string(&pointer).unwrap();
+    repo.ok(&["describe", "Elsewhere"]);
+    fs::write(&pointer, &started).unwrap();
+    repo.write("file", "here\n");
+    repo.ok(&["describe", "Shared work"]);
+    let ours = revision_of(&repo);
+    let issued = repo.ok(&["annotate", "@", "review", "--pass"]);
+    assert!(
+        issued.contains(&format!("about revision {}", ours.short())),
+        "{issued}"
+    );
+}
+
+#[test]
+fn a_prefix_naming_a_change_and_another_revision_is_ambiguous() {
+    let repo = Repo::new();
+    repo.write("file", "file\n");
+    repo.ok(&["describe", "Ours"]);
+    let ours = revision_of(&repo);
+    // Another change, whose id starts as that revision's does.
+    let store = Store::new(repo.path(".origin"), Native::default());
+    let mut change = [0; 16];
+    change[..4].copy_from_slice(&ours.as_bytes()[..4]);
+    let revision: Revision = store.get(ours).unwrap();
+    let other = Revision {
+        change: ChangeId::from_bytes(change),
+        predecessors: Vec::new(),
+        ..revision
+    }
+    .encode();
+    store.write_all(slice::from_ref(&other)).unwrap();
+
+    let hex = ours.to_string();
+    let refused = repo.fails(&["statements", &hex[..8]]);
+    assert!(refused.contains("names both change"), "{refused}");
+    assert!(repo.ok(&["statements", &hex[..12]]).contains(&ours.short()));
+}
+
+#[test]
+fn a_promotion_lists_without_its_original() {
+    let repo = Repo::new();
+    repo.ok(&["describe", "Ours"]);
+    let missing = StatementId::from(EncodedObject::blob(b"elsewhere").id());
+    let promotion = Statement {
+        subject: origin_shared::RecordId::Revision(revision_of(&repo)),
+        kind: Kind::new("ci.test").unwrap(),
+        verdict: Some(Verdict::Pass),
+        issuer: "node:ada".parse().unwrap(),
+        inputs: None,
+        payload: None,
+        supersedes: None,
+        promoted_from: Some(missing),
+    }
+    .encode();
+    let store = Store::new(repo.path(".origin"), Native::default());
+    store.write_all(slice::from_ref(&promotion)).unwrap();
+    let listed = repo.ok(&["statements"]);
+    assert!(
+        listed.contains(&format!(
+            "promoted from statement {} by an issuer not in this repository",
+            missing.short()
+        )),
+        "{listed}"
+    );
+}
+
+#[test]
+fn edits_recorded_on_a_stale_revision_flag_divergence() {
+    let repo = Repo::new();
+    repo.write("file", "base\n");
+    repo.ok(&["describe", "Shared work"]);
+    let change = repo.change();
+    let pointer = repo.path(".origin/workspace");
+    let started = fs::read_to_string(&pointer).unwrap();
+    repo.ok(&["describe", "Moved on"]);
+    // Edits on the revision before, recorded by `new`, make a second head.
+    fs::write(&pointer, &started).unwrap();
+    repo.write("file", "stale\n");
+    repo.ok(&["new", "Next"]);
+    let evolog = repo.ok(&["evolog", &change]);
+    let flagged: usize = evolog
+        .lines()
+        .filter(|line| line.ends_with(" (head)"))
+        .map(|line| {
+            let revision = line.split(' ').nth(1).unwrap();
+            repo.ok(&["statements", revision])
+                .matches(" core.divergent by node:ada")
+                .count()
+        })
+        .sum();
+    assert_eq!(flagged, 1, "{evolog}");
+}
+
 #[test]
 fn init_with_a_malformed_key_leaves_no_repository() {
     let repo = Repo::new();
@@ -284,6 +410,32 @@ fn init_with_a_malformed_key_leaves_no_repository() {
     let other = tempfile::tempdir().unwrap();
     assert!(!repo.run(other.path(), &["init"]).status.success());
     assert!(!other.path().join(".origin").exists());
+}
+
+#[test]
+fn only_the_creator_of_a_change_abandons_it() {
+    let repo = Repo::new();
+    repo.write("file", "ada's\n");
+    repo.ok(&["describe", "Ada's change"]);
+    let change = repo.change();
+    // Eve takes the change over, then tries to give it up.
+    let config = repo.config.path().join("config.toml");
+    fs::write(&config, "user = \"eve\"\n").unwrap();
+    repo.write("file", "eve's\n");
+    repo.ok(&["describe", "Eve's now"]);
+    let pointer = repo.read(".origin/workspace");
+    let statements = repo.ok(&["statements"]);
+
+    let refused = repo.fails(&["abandon", "--reason", "Not mine"]);
+    assert!(
+        refused.contains("may not issue `core.abandon`"),
+        "{refused}"
+    );
+    assert_eq!(repo.read(".origin/workspace"), pointer);
+    assert_eq!(repo.read("file"), "eve's\n");
+    assert_eq!(repo.ok(&["statements"]), statements);
+    fs::write(&config, "user = \"ada\"\n").unwrap();
+    assert!(!repo.ok(&["show", &change]).contains("bandoned"));
 }
 
 #[test]
@@ -357,4 +509,104 @@ fn a_closed_output_pipe_ends_quietly() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn statements_are_promoted_where_their_inputs_are_unchanged() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "fn a() {}\n");
+    repo.write("docs/guide.md", "# Guide\n");
+    repo.write("lint.log", "all clean\n");
+    let lint = repo.ok(&[
+        "annotate",
+        "@",
+        "ci.lint",
+        "--pass",
+        "--inputs",
+        "src",
+        "--definition",
+        "cargo clippy",
+        "--payload",
+        "lint.log",
+    ]);
+    assert!(lint.contains(": ci.lint pass about revision "), "{lint}");
+    assert!(lint.contains("\nInput digest: "), "{lint}");
+    repo.ok(&[
+        "annotate",
+        "@",
+        "docs.test",
+        "--fail",
+        "--inputs",
+        "src",
+        "docs",
+    ]);
+    let rerun = repo.ok(&[
+        "annotate",
+        "@",
+        "docs.test",
+        "--pass",
+        "--inputs",
+        "src",
+        "docs",
+    ]);
+    assert!(rerun.contains("\nSupersedes statement "), "{rerun}");
+    repo.ok(&[
+        "annotate",
+        "@",
+        "links",
+        "--pass",
+        "--inputs",
+        "docs",
+        "--external",
+    ]);
+    repo.ok(&["annotate", "@", "review", "--neutral"]);
+
+    let statements = repo.ok(&["statements"]);
+    assert_eq!(
+        statements.matches(" by user:ada").count(),
+        5,
+        "{statements}"
+    );
+    assert!(
+        statements.contains("docs.test fail by user:ada (superseded by "),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    inputs: docs, and external\n"),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    payload: all clean\n"),
+        "{statements}"
+    );
+
+    // A docs-only change keeps the lint result.
+    repo.ok(&["new", "Document more"]);
+    repo.write("docs/guide.md", "# Guide\nMore.\n");
+    let promoted = repo.ok(&["promote"]);
+    assert!(
+        promoted.starts_with("Promoted ci.lint pass by user:ada as statement "),
+        "{promoted}"
+    );
+    assert_eq!(promoted.lines().count(), 1, "{promoted}");
+    assert!(repo.ok(&["promote"]).starts_with("Nothing to promote"));
+    let statements = repo.ok(&["statements", "@"]);
+    assert!(
+        statements.contains(" ci.lint pass by node:ada\n"),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    promoted from statement "),
+        "{statements}"
+    );
+    assert!(
+        statements.contains("    payload: all clean\n"),
+        "{statements}"
+    );
+
+    assert!(
+        repo.fails(&["annotate", "@", "core.conflict", "--fail"])
+            .contains("is a reserved kind")
+    );
+    assert!(repo.fails(&["annotate", "@", "ci.lint"]).contains("--pass"));
 }
