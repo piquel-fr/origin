@@ -23,7 +23,14 @@ currently contains the first prototype.
   same calls over the SDK or, for a local path, in-process. Every call
   takes a `Caller`, authenticated by `auth.rs`; `permissions.rs` filters
   what it reads and checks what it writes, by the rights `policy.rs`
-  resolves from `policy.toml`.
+  resolves from `policy.toml`. `plugin.rs` runs `origin <name>` as
+  `origin-<name>` from `PATH`, passing the repository in the environment.
+- `apps/origin-ci`: the CI plugin, `origin-ci`. It reads `checks.toml`
+  from the revision it checks, runs each check in a checkout of its own,
+  and issues the results, as a tool (`origin ci run`) or a worker
+  answering `check.requested` (`origin ci worker`). Like every plugin, it
+  uses only the public API: `Remote`, which is the SDK over HTTP or the
+  service in-process, never origin-src's internals.
 - `tools/xtask`: development tasks, run with `cargo xtask`, such as timing
   origin against git (`just bench-git`).
 
@@ -41,8 +48,9 @@ benchmark, and its numbers in the pull request.
 
 - `just bench`: the divan micro-benchmarks (encoding, store writes,
   snapshots, input digests and promotion, landing, permission checks,
-  reading events, the server's request latency and long-poll wakeups, and
-  syncing a 20,000-file tree over HTTP).
+  reading events, the server's request latency and long-poll wakeups,
+  syncing a 20,000-file tree over HTTP, and the CI worker's overhead per
+  check).
 - `just bench-git`: times origin against git on a 20,000-file tree with
   hyperfine, and rewrites `docs/benchmarks.md`.
 
@@ -51,7 +59,9 @@ temporary directory, which holds the user's `config.toml` and node key.
 The HTTP tests drive every SDK method against a real server. One fails
 while `docs/openapi.json` is stale: `just openapi` rewrites it. The sync
 tests clone, push and land through `origin serve` and through local paths;
-`tests/common` holds the helpers every end-to-end test shares.
+`apps/origin-src/tests/common` holds the helpers every end-to-end test
+shares, plugins' included, which run `origin` from the target directory
+their own binary is built in.
 
 ## Commits & Pull Requests
 

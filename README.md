@@ -47,6 +47,9 @@ origin fetch [--target <t>] [--change <id>]  # new acceptances, and the records 
 origin pull                         # fetch, then move the working copy onto its target's tip
 origin whoami | permissions         # who the remote thinks you are, and what you may do there
 origin token issue --scope "write src" [--ttl 1h]  # a short-lived token for an agent
+
+origin ci run [<rev>]               # run the checks of checks.toml, and issue their results
+origin ci worker --remote <url>     # run the checks a server's landings wait for
 ```
 
 Landing rebases a change onto the target's tip, file by file, checks the
@@ -55,6 +58,8 @@ change), and appends an acceptance signed by your node, which must be the
 target's authority. A landing that conflicts or lacks evidence waits: issue
 the statements, or a new revision, and run `origin land` again. Policy is a
 target too: edit it with `origin new --on policy`, then `origin land`.
+Issuing a statement a waiting landing lacks, to the repository that orders
+its target, lets it continue: the queue retries it for whoever submitted it.
 
 Workspaces work like git worktrees: each has its own current change and
 shares the repository's records, so agents can work side by side. A new
@@ -93,6 +98,44 @@ the revision's id. Your name and node key live in `~/.config/origin` (or
 isn't the name you want, and the token to send each server under
 `[tokens]`, by its URL (`"http://127.0.0.1:7878" = "<token>"`), or in
 `$ORIGIN_TOKEN`. See [the design](docs/design.md) for the model.
+
+## Plugins and CI
+
+`origin <name>` runs `origin-<name>` from `PATH` when `<name>` isn't a
+built-in command, with its arguments; its output and exit code are the
+command's. Run in a working copy, which it snapshots first, it passes the
+plugin `ORIGIN_REPOSITORY`, the directory holding the repository's store,
+`ORIGIN_REVISION`, the working copy's revision, and `ORIGIN_REMOTE`, the
+remote, if there's one. Plugins use origin's public API only: a server's
+over HTTP, or for a local path, the same service in-process.
+
+The first is [`origin-ci`](apps/origin-ci). It reads the checks from
+`checks.toml` in the revision it checks:
+
+```toml
+[checks.test]
+command   = "cargo test"
+inputs    = ["src", "Cargo.toml", "Cargo.lock"]   # the whole snapshot by default
+toolchain = "rustc -V"                            # its output is hashed
+
+[checks.links]
+command  = "lychee docs"
+inputs   = ["docs"]
+external = true          # reads the network: never promoted
+```
+
+Each check runs in a checkout of the revision of its own, removed
+afterwards, and issues a `ci.<name>` statement: `pass` if the command exits
+with 0, with the last 64 KiB of its output as the payload, declaring its
+inputs, command and toolchain output, so its result is promoted to every
+revision where they're the same. A check a result of the same issuer
+already covers, ran or promoted, is skipped. `origin ci run` checks a
+revision of this repository as you, and fails if a check fails. `origin ci
+worker` answers a remote's `check.requested` events with a token of its
+own, such as one from `origin token issue --scope "read /" --scope
+"annotate ci.*"`: its statements land what waited for them. It saves its
+event cursor in `$XDG_STATE_HOME/origin-ci/` (or `~/.local/state/`), where
+the checkouts live too, and resumes after it when restarted.
 
 ## Permissions
 
@@ -138,9 +181,13 @@ copy, and the authority of their targets: it runs their landing queues,
 and packs their small objects once a few thousand pile up loose.
 
 ```sh
-origin repo create repos/demo   # a repository the server orders `policy` and `main` of
+origin repo create repos/demo [--admin user:alice]  # a repository the server orders
 origin serve                    # host the repositories over HTTP
 ```
+
+`--admin` names who changes the new repository's policy over the API;
+without it, only the server's operator does, by landing through the
+repository's path.
 
 Both read `origin-server.toml` (or `--config <file>`), whose paths are
 relative to it:

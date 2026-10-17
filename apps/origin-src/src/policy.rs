@@ -483,9 +483,19 @@ impl TryFrom<PolicyFile> for Policy {
 impl Policy {
     /// The first `policy.toml` of a repository: `node`, whose public key is
     /// `key`, is the authority of `policy` and `main`, and neither requires
-    /// anything, so a solo project lands instantly.
+    /// anything, so a solo project lands instantly. With an `admin`, its
+    /// `[grants]` make them the one who changes the policy, and let
+    /// everyone land elsewhere and annotate, as without grants.
     #[must_use]
-    pub fn initial(node: &PrincipalName, key: &NodePublicKey) -> String {
+    pub fn initial(node: &PrincipalName, key: &NodePublicKey, admin: Option<&Principal>) -> String {
+        let grants = match admin {
+            Some(admin) => format!(
+                "[grants]\n\
+                 all = [\"land *\", \"annotate *\"]\n\
+                 \"{admin}\" = [\"admin\"]\n"
+            ),
+            None => "# [grants]\n# \"user:alice\" = [\"admin\", \"land *\"]\n".to_owned(),
+        };
         format!(
             "# Who may land what. Changing it is a landing on `policy`.\n\
              \n\
@@ -508,8 +518,7 @@ impl Policy {
              # Who may land, annotate, and change this policy (`admin`). Without\n\
              # [grants], everyone lands and annotates, and no one is admin\n\
              # remotely.\n\
-             # [grants]\n\
-             # \"user:alice\" = [\"admin\", \"land *\"]\n\
+             {grants}\
              \n\
              # Who may read and write paths: everyone writes everything by default.\n\
              # [[paths]]\n\
@@ -727,6 +736,22 @@ mod tests {
              [[paths]]\npath = \"/\"\n\
              grants = {{ all = \"read\", \"node:ci-1\" = \"write\" }}\n"
         )
+    }
+
+    #[test]
+    fn an_initial_admin_alone_changes_the_policy() {
+        let node = PrincipalName::new("hosted").unwrap();
+        let key = origin_shared::NodeKey::from_bytes(&[42; 32]).public();
+        let admin = principal("user:alice");
+        for admin in [None, Some(&admin)] {
+            let policy: Policy = toml::from_str(&Policy::initial(&node, &key, admin)).unwrap();
+            let alice = policy.rights(Some(&principal("user:alice")));
+            assert_eq!(alice.admin, admin.is_some());
+            let bob = policy.rights(Some(&principal("user:bob")));
+            assert!(!bob.admin);
+            assert!(bob.may_land(&TargetName::MAIN));
+            assert!(bob.may_annotate(&kind("ci.test")));
+        }
     }
 
     #[test]

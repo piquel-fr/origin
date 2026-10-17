@@ -28,7 +28,7 @@ use origin_shared::api::{
     NewTarget, RevisionEntry, Revisions, Stored, TargetInfo, TokenRequest,
 };
 use origin_shared::event::{EventKind, Filter, Page};
-use origin_shared::landing::{Pending, Proposal};
+use origin_shared::landing::{Blocked, Pending, Proposal};
 use origin_shared::object::DecodeError;
 use origin_shared::pack::Pack;
 use origin_shared::{
@@ -38,12 +38,13 @@ use origin_shared::{
 };
 
 use crate::annotations::{AnnotateError, Annotations};
+use crate::config::{ConfigError, UserConfig};
 use crate::events::{Events, Wakeup};
 use crate::index::Index;
 pub use crate::permissions::Caller;
 use crate::permissions::{Forbidden, PutError, Reader, Writer};
 use crate::policy::{Policy, PolicyError};
-use crate::queue::{LandError, Queue};
+use crate::queue::{LandError, Queue, Waiting};
 use crate::store::{Store, StoreError};
 use crate::tree::Snapshots;
 
@@ -59,6 +60,19 @@ pub struct Node {
 }
 
 impl Node {
+    /// The node of the user's configuration, with its key, generated the
+    /// first time.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the key cannot be read, or generated and saved.
+    pub fn of(config: &UserConfig) -> Result<Self, ConfigError> {
+        Ok(Self {
+            name: config.node().clone(),
+            key: Arc::new(config.node_key()?),
+        })
+    }
+
     /// The node as a principal, which issues the statements it makes.
     fn principal(&self) -> Principal {
         Principal::Node(self.name.clone())
@@ -309,9 +323,16 @@ impl OriginService {
             RecordId::Acceptance(id) => {
                 self.store.get(id).map(|acceptance| acceptance.body().state)
             }
-            RecordId::Statement(_) | RecordId::Snapshot(_) => {
-                return Err(ServiceError::NotASnapshot(record));
+            // A landing's merged snapshot, for checks to read: never a
+            // tree within one, whose paths would be read as others.
+            RecordId::Snapshot(id) => {
+                let waiting = Queue::pending(&self.store)?;
+                if !waiting.iter().any(|pending| pending.subject == record) {
+                    return Err(ServiceError::NotASnapshot(record));
+                }
+                Ok(id)
             }
+            RecordId::Statement(_) => return Err(ServiceError::NotASnapshot(record)),
         };
         let snapshot = match snapshot {
             // Not a record of the kind it's named as.
@@ -518,7 +539,9 @@ impl OriginService {
     /// blobs and trees are durable before the records that refer to them,
     /// and promotions come last, each checked against its original by
     /// [`Store::claim`], once the original and both subjects are stored.
-    /// Issues `core.divergent` for the changes the revisions made diverge.
+    /// Issues `core.divergent` for the changes the revisions made diverge,
+    /// and retries the landings waiting for evidence about what the
+    /// statements are about.
     ///
     /// # Errors
     ///
@@ -555,6 +578,7 @@ impl OriginService {
         let mut promotions = Vec::new();
         let mut decoded = Vec::new();
         let mut changes = HashSet::new();
+        let mut subjects = HashSet::new();
         for object in pack.objects {
             let id = object.id();
             let record = object
@@ -577,10 +601,12 @@ impl OriginService {
                     decoded.push((id, record));
                 }
                 Object::Statement(ref statement) if statement.promoted_from.is_some() => {
+                    subjects.insert(statement.subject);
                     promotions.push((object, statement.clone()));
                     decoded.push((id, record));
                 }
-                Object::Statement(_) => {
+                Object::Statement(ref statement) => {
+                    subjects.insert(statement.subject);
                     records.push(object);
                     decoded.push((id, record));
                 }
@@ -620,6 +646,7 @@ impl OriginService {
             })?;
         }
         self.wakeup.notify();
+        self.resume(&subjects)?;
         Ok(Stored { new: new as u64 })
     }
 
@@ -646,6 +673,39 @@ impl OriginService {
         Ok(())
     }
 
+    /// Retries the landings waiting for evidence about one of `subjects`,
+    /// which statements were just issued about, each for its submitter:
+    /// the queue continues when the evidence arrives. A retry the policy in
+    /// force refuses, or that fails, leaves the landing as it was, and is
+    /// logged: the statements that triggered it stand.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the waiting landings cannot be read.
+    fn resume(&self, subjects: &HashSet<RecordId>) -> Result<(), ServiceError> {
+        if subjects.is_empty() {
+            return Ok(());
+        }
+        for Waiting { pending, submitter } in Queue::waiting(&self.store)? {
+            if !matches!(pending.blocked, Blocked::Evidence(_))
+                || !subjects.contains(&pending.subject)
+            {
+                continue;
+            }
+            let request = LandRequest {
+                proposal: pending.proposal,
+                onto: Some(pending.onto),
+            };
+            if let Err(error) = self.land(&submitter, &request) {
+                tracing::warn!(
+                    error = %anyhow::Error::from(error),
+                    "a waiting landing cannot continue"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the `promotions` [`OriginService::put_records`] puts, once
     /// [`Store::claim`] accepts each, returning how many were new. Their
     /// originals are never promotions, so they're stored by now.
@@ -668,6 +728,45 @@ impl OriginService {
             return Ok(0);
         }
         Ok(self.store.write_all(&checked)?)
+    }
+
+    /// Promotes results to `subject`, a revision, an acceptance or a
+    /// snapshot the caller sees, from the records with the same input
+    /// digest, as statements this node issues, and returns them: what a
+    /// check that would run again can skip. A promotion claims nothing new,
+    /// so any signed-in caller may ask for one. Landings waiting for
+    /// evidence about the subject are retried.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the caller is anonymous, or a record cannot be read or
+    /// written.
+    pub fn promote(
+        &self,
+        caller: &Caller,
+        subject: RecordId,
+    ) -> Result<Vec<Annotation>, ServiceError> {
+        if *caller == Caller::Anonymous {
+            return Err(Forbidden::Anonymous.into());
+        }
+        let rights = self.rights(caller)?;
+        if !Reader::new(&self.store, &rights).sees(subject)? {
+            return Err(ServiceError::UnknownRecord(subject));
+        }
+        let promoted = self
+            .annotations(|annotations| Ok(annotations.promote(subject, &self.node.principal())?))?;
+        if !promoted.is_empty() {
+            self.wakeup.notify();
+            self.resume(&HashSet::from([subject]))?;
+        }
+        Ok(promoted
+            .into_iter()
+            .map(|(id, statement)| Annotation {
+                id,
+                statement,
+                superseded_by: None,
+            })
+            .collect())
     }
 
     /// The statements about `subject`, in the order the repository received
@@ -799,7 +898,7 @@ impl OriginService {
             }
         };
         let queue = Queue::new(&self.store, &self.node.key, self.node.name.clone())
-            .submitted_by(rights.paths.clone());
+            .submitted_by(caller.clone(), rights.paths.clone());
         let landed = self.annotations(|annotations| {
             let landed = match &request.proposal {
                 Proposal::Change(change) => {

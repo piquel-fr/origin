@@ -65,7 +65,7 @@ static SETUP: LazyLock<Setup> = LazyLock::new(|| {
         name: "hosted".parse().unwrap(),
         key: Arc::new(NodeKey::from_bytes(&[7; 32])),
     };
-    let policy = Policy::initial(&node.name, &node.key.public());
+    let policy = Policy::initial(&node.name, &node.key.public(), None);
     let service = OriginService::create(server.path().join("demo"), node.clone(), &policy).unwrap();
     let mut cache = StatCache::default();
     let mut snapshot_into = |store: &Store, version: Option<u64>| {

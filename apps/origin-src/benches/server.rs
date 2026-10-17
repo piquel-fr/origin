@@ -44,7 +44,7 @@ impl Hosted {
             name: "hosted".parse().unwrap(),
             key: Arc::new(NodeKey::from_bytes(&[7; 32])),
         };
-        let policy = Policy::initial(&node.name, &node.key.public());
+        let policy = Policy::initial(&node.name, &node.key.public(), None);
         let service =
             OriginService::create(dir.path().join("demo"), node.clone(), &policy).unwrap();
         let revision = Self::put_change(&service, 0);

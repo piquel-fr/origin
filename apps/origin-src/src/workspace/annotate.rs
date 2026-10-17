@@ -5,6 +5,7 @@ use std::fs::File;
 use std::path::Path;
 use std::time::SystemTime;
 
+use origin_shared::api::Annotation;
 use origin_shared::{
     AttachmentId, EncodedObject, Inputs, Kind, Principal, RecordId, Revision, RevisionId,
     Statement, Verdict,
@@ -179,7 +180,8 @@ impl Workspace {
 
     /// `origin promote [<rev>]`: carries promotable results over to a
     /// revision, the working copy by default, from the records with the
-    /// same input digest, as statements this node issues.
+    /// same input digest, as statements this node issues. Landings waiting
+    /// for them continue.
     ///
     /// # Errors
     ///
@@ -188,12 +190,13 @@ impl Workspace {
     pub fn promote(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
         let revision = working_copy.find_revision(rev)?;
-        let mut annotations = Annotations::new(&self.store, working_copy.index);
-        let promoted = annotations.promote(RecordId::Revision(revision), &self.node_principal())?;
+        let promoted = self
+            .service(Some(working_copy.index))?
+            .promote(&Caller::Owner, RecordId::Revision(revision))?;
         if promoted.is_empty() {
             println!("Nothing to promote to revision {}", revision.short());
         }
-        for (id, statement) in promoted {
+        for Annotation { id, statement, .. } in promoted {
             let Some(original) = statement.promoted_from else {
                 continue;
             };

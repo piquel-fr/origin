@@ -59,7 +59,7 @@ impl Workspace {
             return Err(WorkspaceError::NotEmpty(root));
         }
         let created = !root.exists();
-        let remote = Self::open_remote(&url, &config)?;
+        let remote = Remote::open_for(&url, &config)?;
         let cloned = Self::clone_into(root.clone(), &url, remote, target, config, actor);
         if cloned.is_err() {
             // Best effort: the error says what went wrong.
@@ -126,23 +126,13 @@ impl Workspace {
     }
 
     /// The URL of the repository's remote, if it has one.
-    fn remote_url(&self) -> Result<Option<RemoteUrl>, WorkspaceError> {
+    pub(super) fn remote_url(&self) -> Result<Option<RemoteUrl>, WorkspaceError> {
         let path = self.store.root().join(Self::REMOTE);
         match fs::read_to_string(&path) {
             Ok(url) => Ok(Some(RemoteUrl::parse(url.trim_end())?)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(WorkspaceError::io(&path, source)),
         }
-    }
-
-    /// Opens the remote at `url` for the user of `config`, with their
-    /// token for it, if they have one.
-    fn open_remote(url: &RemoteUrl, config: &UserConfig) -> Result<Remote, WorkspaceError> {
-        let token = match url {
-            RemoteUrl::Http { base, .. } => config.token(base),
-            RemoteUrl::Path(_) => None,
-        };
-        Ok(Remote::open(url, Self::node_of(config)?, token)?)
     }
 
     /// The repository's remote, opened the first time it's needed, if it
@@ -152,7 +142,7 @@ impl Workspace {
             return Ok(remote.as_ref());
         }
         let remote = match self.remote_url()? {
-            Some(url) => Some(Self::open_remote(&url, &self.config)?),
+            Some(url) => Some(Remote::open_for(&url, &self.config)?),
             None => None,
         };
         Ok(self.remote.get_or_init(|| remote).as_ref())

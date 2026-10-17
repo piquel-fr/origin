@@ -20,7 +20,8 @@ use origin_shared::access::{InvalidToken, Rights};
 use origin_shared::api::{
     Annotation, ApiError, BrowseQuery, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot,
     Inventory, InventoryRequest, IssuedToken, LandRequest, Landings, Listing, LogEntry, LogQuery,
-    NewTarget, RepoName, RepoSummary, Revisions, StatementsQuery, Stored, TargetInfo, TokenRequest,
+    NewTarget, PromoteRequest, RepoName, RepoSummary, Revisions, StatementsQuery, Stored,
+    TargetInfo, TokenRequest,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
@@ -59,6 +60,7 @@ impl Api {
             .routes(routes!(put_records))
             .routes(routes!(inventory))
             .routes(routes!(statements))
+            .routes(routes!(promote))
             .routes(routes!(revisions))
             .routes(routes!(targets, create_target))
             .routes(routes!(log))
@@ -335,6 +337,34 @@ async fn statements(
 ) -> Result<Json<Vec<Annotation>>, HttpError> {
     call(repos, repo, caller, move |service, caller| {
         service.statements(caller, query.subject)
+    })
+    .await
+    .map(Json)
+}
+
+/// Promotes results to a record from the records with the same input
+/// digest, as statements this server issues, and retries the landings
+/// waiting for them.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{repo}/promote",
+    operation_id = "promote",
+    params(("repo" = String, Path, description = "The repository")),
+    request_body = PromoteRequest,
+    responses(
+        (status = 200, description = "The statements promoted: none if nothing matched", body = Vec<Annotation>),
+        (status = 403, description = "The caller isn't signed in", body = ApiError),
+        (status = 404, description = "The repository or the record does not exist", body = ApiError)
+    )
+)]
+async fn promote(
+    repos: Repos,
+    Path(repo): Path<RepoName>,
+    caller: Caller,
+    Json(request): Json<PromoteRequest>,
+) -> Result<Json<Vec<Annotation>>, HttpError> {
+    call(repos, repo, caller, move |service, caller| {
+        service.promote(caller, request.subject)
     })
     .await
     .map(Json)

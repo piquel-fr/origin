@@ -11,17 +11,18 @@ use std::fmt;
 use std::path::{self, Path, PathBuf};
 
 use origin_client::Client;
-use origin_shared::Head;
 use origin_shared::access::Rights;
 use origin_shared::api::{
-    BrowseQuery, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, Inventory, InventoryRequest,
-    IssuedToken, LandRequest, Landings, Listing, LogEntry, LogQuery, NewTarget, RepoName, Stored,
-    TargetInfo, TokenRequest,
+    Annotation, BrowseQuery, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, Inventory,
+    InventoryRequest, IssuedToken, LandRequest, Landings, Listing, LogEntry, LogQuery, NewTarget,
+    PromoteRequest, RepoName, Revisions, StatementsQuery, Stored, TargetInfo, TokenRequest,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
 use origin_shared::pack::Pack;
+use origin_shared::{ChangeId, Head};
 
+use crate::config::{ConfigError, UserConfig};
 use crate::service::{Caller, Node, OriginService, ServiceError};
 use crate::workspace::Workspace;
 
@@ -74,11 +75,19 @@ calls! {
     fn records(request: &FetchRecords) -> Pack = fetch_records(request), records(&request.ids);
     /// The trees and blobs of a snapshot that the request's snapshots lack.
     fn snapshot(request: &FetchSnapshot) -> Pack = fetch_snapshot(request), snapshot(request);
+    /// The revisions of a change, and its heads.
+    fn revisions(change: ChangeId) -> Revisions = revisions(change), revisions(change);
     /// What the remote holds of some changes.
     fn inventory(request: &InventoryRequest) -> Vec<Inventory> =
         inventory(request), inventory(request);
     /// Puts a batch of objects.
     fn put_records(pack: Pack) -> Stored = put_records(&pack), put_records(pack);
+    /// The statements about a record.
+    fn statements(query: &StatementsQuery) -> Vec<Annotation> =
+        statements(query), statements(query.subject);
+    /// Promotes results to a record, as statements the remote issues.
+    fn promote(request: &PromoteRequest) -> Vec<Annotation> =
+        promote(request), promote(request.subject);
     /// Submits a landing to the remote's queue.
     fn land(request: &LandRequest) -> Landings = land(request), land(request);
     /// The landings that wait on the remote.
@@ -99,6 +108,21 @@ calls! {
 }
 
 impl Remote {
+    /// Opens the remote at `url` for the user of `config`: over HTTP with
+    /// their token for its server, if they have one, or in-process by
+    /// their node.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Remote::open`], or if the node key cannot be loaded.
+    pub fn open_for(url: &RemoteUrl, config: &UserConfig) -> Result<Self, RemoteError> {
+        let token = match url {
+            RemoteUrl::Http { base, .. } => config.token(base),
+            RemoteUrl::Path(_) => None,
+        };
+        Self::open(url, Node::of(config)?, token)
+    }
+
     /// Opens the remote at `url`: an `http://` URL whose last path segment
     /// names the repository, called with `token` if there's one, or the
     /// path of a repository, which `node` serves in-process, to its owner.
@@ -204,6 +228,9 @@ pub enum RemoteError {
     /// The client has no TLS support yet.
     #[error("HTTPS remotes are not supported yet")]
     HttpsUnsupported,
+    /// The user's node key cannot be loaded.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     /// The runtime for HTTP requests cannot start.
     #[error("cannot start the runtime for HTTP requests")]
     Runtime(#[source] std::io::Error),
