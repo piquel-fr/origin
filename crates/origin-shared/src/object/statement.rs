@@ -6,8 +6,8 @@ use std::str::FromStr;
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
 use crate::name::names;
 use crate::{
-    AcceptanceId, BlobId, Digest, InvalidName, Principal, RepoPath, RevisionId, StatementId,
-    TreeEntry, TreeId,
+    AcceptanceId, BlobId, Digest, InvalidName, ObjectId, Principal, RepoPath, RevisionId,
+    StatementId, TreeEntry, TreeId,
 };
 
 /// An attributable claim about another record: a check result, a review, a
@@ -148,6 +148,28 @@ impl RecordId {
             Self::Acceptance(id) => ("acceptance", id.short()),
         };
         format!("{kind} {id}")
+    }
+
+    /// The kind of the record's object: a snapshot is a tree.
+    #[must_use]
+    pub fn kind(self) -> ObjectKind {
+        match self {
+            Self::Snapshot(_) => ObjectKind::Tree,
+            Self::Revision(_) => ObjectKind::Revision,
+            Self::Statement(_) => ObjectKind::Statement,
+            Self::Acceptance(_) => ObjectKind::Acceptance,
+        }
+    }
+}
+
+impl From<RecordId> for ObjectId {
+    fn from(record: RecordId) -> Self {
+        match record {
+            RecordId::Snapshot(id) => id.into(),
+            RecordId::Revision(id) => id.into(),
+            RecordId::Statement(id) => id.into(),
+            RecordId::Acceptance(id) => id.into(),
+        }
     }
 }
 
