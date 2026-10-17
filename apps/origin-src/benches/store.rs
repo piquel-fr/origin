@@ -1,6 +1,6 @@
 //! Store throughput: durable writes with and without batching, verified
-//! reads, target appends, and the record index. Run on a real disk: syncs
-//! cost nothing on a RAM-backed file system.
+//! reads, target appends, the record index, and reading events from the op
+//! log. Run on a real disk: syncs cost nothing on a RAM-backed file system.
 
 use std::fs::File;
 use std::io;
@@ -16,6 +16,7 @@ use origin_shared::{
     AcceptanceBody, Base, ChangeId, EncodedObject, Kind, NodeKey, Record, RecordId, Revision,
     Statement, TargetName, Tree, TreeId, Verdict,
 };
+use origin_src::events::{Events, Filter};
 use origin_src::index::Index;
 use origin_src::store::Store;
 
@@ -261,4 +262,30 @@ fn rebuild_index(bencher: Bencher<'_, '_>) {
     bencher
         .counter(ItemsCount::new(20_000_usize))
         .bench(|| Index::rebuild(&store).unwrap());
+}
+
+/// Reading the events of 10k records, each written in its own batch, as
+/// issuing statements does: what a subscriber catching up pays.
+#[divan::bench(sample_count = 20)]
+fn read_events(bencher: Bencher<'_, '_>) {
+    let (_dir, store) = store_on(NoSync);
+    for record in records(10_000) {
+        store.write_all(slice::from_ref(&record)).unwrap();
+    }
+    let events = Events::new(&store);
+    bencher
+        .counter(ItemsCount::new(10_000_usize))
+        .bench(|| events.after(0, &Filter::default(), usize::MAX).unwrap());
+}
+
+/// Polling for events when there are none, as `watch` does every 50 ms.
+#[divan::bench]
+fn poll_events(bencher: Bencher<'_, '_>) {
+    let (_dir, store) = store_on(NoSync);
+    for record in records(10_000) {
+        store.write_all(slice::from_ref(&record)).unwrap();
+    }
+    let events = Events::new(&store);
+    let end = events.end().unwrap();
+    bencher.bench(|| events.after(end, &Filter::default(), usize::MAX).unwrap());
 }
