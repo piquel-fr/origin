@@ -164,7 +164,7 @@ impl<P: Platform> Store<P> {
         for dir in [&loose, &objects, &self.root, parent] {
             self.sync_dir(dir)?;
         }
-        self.write_index(&[])
+        self.write_index(&[], &[])
     }
 
     pub(crate) fn sync_dir(&self, dir: &Path) -> Result<(), StoreError> {
@@ -341,6 +341,21 @@ impl<P: Platform> Store<P> {
             return zstd::stream::decode_all(compressed);
         }
         zstd::bulk::decompress(compressed, usize::try_from(size).map_err(|_| corrupt())?)
+    }
+
+    /// Reads a blob's content, or `None` if the store does not have it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the object cannot be read, is corrupt, or isn't a blob.
+    pub fn try_blob(&self, id: ObjectId) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(object) = self.try_read(id)? else {
+            return Ok(None);
+        };
+        let content = object
+            .blob_content()
+            .map_err(|source| StoreError::Decode { id, source })?;
+        Ok(Some(content.to_vec()))
     }
 
     /// Reads an object the store must have.

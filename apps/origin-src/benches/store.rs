@@ -168,6 +168,7 @@ fn records(count: usize) -> Vec<EncodedObject> {
                     inputs: None,
                     payload: None,
                     supersedes: None,
+                    promoted_from: None,
                 }
                 .encode()
             }
