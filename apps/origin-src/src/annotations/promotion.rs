@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 
 use origin_platform::Platform;
+use origin_shared::api::Annotation;
 use origin_shared::{Principal, Record, RecordId, Statement, StatementId, TreeId};
 
 use super::Annotations;
@@ -77,12 +78,25 @@ impl<P: Platform> Annotations<'_, P> {
     ///
     /// Fails if a record or a tree cannot be read.
     pub fn claims(&self, subject: RecordId) -> Result<Vec<Claim>, StoreError> {
+        self.claims_of(&self.listed(subject)?)
+    }
+
+    /// The claims that hold of `listed`, the statements about one record,
+    /// as [`Annotations::claims`] finds them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a record or a tree cannot be read.
+    pub(super) fn claims_of(&self, listed: &[Annotation]) -> Result<Vec<Claim>, StoreError> {
         let mut claims = Vec::new();
-        for annotation in self.about(subject)? {
+        for annotation in listed {
             if annotation.superseded_by.is_some() {
                 continue;
             }
-            let claim = match self.store.claim(annotation.id, annotation.statement) {
+            let claim = match self
+                .store
+                .claim(annotation.id, annotation.statement.clone())
+            {
                 Ok(Ok(claim)) => claim,
                 // A clone may lack the trees a promotion is checked with.
                 Ok(Err(_)) | Err(StoreError::NotFound(_)) => continue,
@@ -592,6 +606,11 @@ mod tests {
         );
         let annotations = Annotations::open(&store).unwrap();
         assert_eq!(annotations.claims(RecordId::Revision(second)).unwrap(), []);
+        let about = annotations.about(RecordId::Revision(second)).unwrap();
+        assert!(
+            about.iter().all(|annotation| !annotation.holds),
+            "{about:?}"
+        );
         assert_eq!(promote(&store, second), [("lint".to_owned(), Some(rerun))]);
     }
 }

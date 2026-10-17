@@ -16,6 +16,7 @@ use super::{WorkingCopy, Workspace, WorkspaceError};
 use crate::annotations::Annotations;
 use crate::index::{FindError, Index};
 use crate::policy::Policy;
+use crate::service::{Caller, OriginService};
 use crate::store::StoreError;
 use crate::tree::Snapshots;
 
@@ -236,29 +237,32 @@ impl Workspace {
     pub fn statements(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
         let revision = working_copy.find_revision(rev)?;
-        let annotations = Annotations::new(&self.store, working_copy.index);
+        let service = self.service(Some(working_copy.index))?;
         let subject = RecordId::Revision(revision);
-        if annotations.index().statements(subject).is_empty() {
+        if !self.print_statements(&service, subject, "", &mut HashSet::new())? {
             println!("No statements about revision {}", revision.short());
         }
-        self.print_statements(&annotations, subject, "", &mut HashSet::new())
+        Ok(())
     }
 
-    /// Prints the statements about `subject`, each one's lines after
-    /// `indent`, then the statements about it, indented further. `shown`
-    /// keeps a statement from printing twice, so a malformed store's cycle
-    /// ends.
+    /// Prints the statements about `subject` the user sees, as `service`
+    /// lists them, each one's lines after `indent`, then the statements
+    /// about it, indented further. `shown` keeps a statement from printing
+    /// twice, so a malformed store's cycle ends. Returns whether it printed
+    /// any.
     fn print_statements(
         &self,
-        annotations: &Annotations,
+        service: &OriginService,
         subject: RecordId,
         indent: &str,
         shown: &mut HashSet<StatementId>,
-    ) -> Result<(), WorkspaceError> {
-        for annotation in annotations.about(subject)? {
+    ) -> Result<bool, WorkspaceError> {
+        let mut printed = false;
+        for annotation in service.statements(&Caller::Owner, subject)? {
             if !shown.insert(annotation.id) {
                 continue;
             }
+            printed = true;
             let statement = &annotation.statement;
             let verdict = match statement.verdict {
                 Some(verdict) => format!(" {verdict}"),
@@ -299,9 +303,9 @@ impl Workspace {
             }
             let deeper = format!("{indent}    ");
             let about = RecordId::Statement(annotation.id);
-            self.print_statements(annotations, about, &deeper, shown)?;
+            self.print_statements(service, about, &deeper, shown)?;
         }
-        Ok(())
+        Ok(printed)
     }
 
     /// A payload's first line if it's text, its size otherwise, or that this

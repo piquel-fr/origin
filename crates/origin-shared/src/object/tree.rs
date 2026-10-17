@@ -73,6 +73,16 @@ impl EntryKind {
     pub fn is_tree(self) -> bool {
         self == Self::Tree
     }
+
+    /// The kind of object the entry points to: a tree, or a blob.
+    #[must_use]
+    pub fn object_kind(self) -> ObjectKind {
+        if self.is_tree() {
+            ObjectKind::Tree
+        } else {
+            ObjectKind::Blob
+        }
+    }
 }
 
 impl fmt::Display for EntryKind {

@@ -43,7 +43,7 @@ impl Workspace {
         change: Option<&str>,
         path: Option<&Path>,
     ) -> Result<(), WorkspaceError> {
-        let working_copy = self.refresh()?;
+        let mut working_copy = self.refresh()?;
         let (id, revision, records) = if let Some(change) = change {
             let change = working_copy.find_change(change)?;
             let head = Self::single_head(&working_copy.index, change)?;
@@ -62,7 +62,7 @@ impl Workspace {
             };
             let encoded = revision.encode();
             let id = encoded.id().into();
-            let conflicts = self.base_conflicts(base)?;
+            let conflicts = self.base_conflicts(&mut working_copy.index, base)?;
             let layers = self.revision_layers(vec![description], &encoded, &conflicts);
             (id, revision, layers)
         };
