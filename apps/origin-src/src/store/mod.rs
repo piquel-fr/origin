@@ -36,11 +36,11 @@ use std::time::{Duration, SystemTime};
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Native, Platform, WritableError};
 use origin_shared::object::{DecodeError, IdMismatch};
-use origin_shared::{EncodedObject, ObjectId, TargetName, TypedId};
+use origin_shared::{EncodedObject, Head, ObjectId, TargetName, TypedId};
 
 use crate::index::Entry;
 use crate::oplog::{Actor, Effect};
-use crate::targets::Head;
+use crate::targets;
 
 pub use packs::Compaction;
 use packs::Packs;
@@ -507,14 +507,14 @@ pub struct Batch<'a, P> {
     /// What the index keeps of each new record staged, for the op log.
     entries: Mutex<Vec<Entry>>,
     /// Whether the batch read the pack manifest, which it does before it
-    /// first trusts a pack to hold an object: see [`Batch::packed`].
+    /// first looks an object up in the packs: see [`Batch::packed`].
     manifest_read: Mutex<bool>,
 }
 
 impl<P: Platform> Batch<'_, P> {
     /// Stages an object, unless the store already has it, returning whether
     /// it was new. Either way, it is durable once the batch commits. An
-    /// object packed since the packs were last loaded is staged again, and
+    /// object packed since the batch read the manifest is staged again, and
     /// the next compaction removes the copy.
     ///
     /// # Errors
@@ -524,17 +524,7 @@ impl<P: Platform> Batch<'_, P> {
     pub fn write(&self, object: &EncodedObject) -> Result<bool, StoreError> {
         let id = object.id();
         let path = self.store.path(id);
-        if path.exists() {
-            // Its writer may not have synced its directory yet, and the
-            // batch's objects may refer to it.
-            let mut shard = path;
-            shard.pop();
-            self.write.sync_dir_with(shard);
-            return Ok(false);
-        }
-        if self.packed(id)? {
-            // The manifest naming its pack may not be durable yet.
-            self.write.sync_dir_with(self.store.packs_dir());
+        if self.hold(&path, || self.packed(id))? {
             return Ok(false);
         }
         let entry = Entry::of(object).map_err(|source| StoreError::Decode { id, source })?;
@@ -550,17 +540,50 @@ impl<P: Platform> Batch<'_, P> {
         Ok(true)
     }
 
+    /// Whether the store has `id`, which an object of the batch refers to.
+    /// If it does, it is durable once the batch commits, like the batch's
+    /// own objects.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::contains`].
+    pub fn depend(&self, id: ObjectId) -> Result<bool, StoreError> {
+        self.hold(&self.store.path(id), || {
+            Ok(self.packed(id)? || self.store.find_packed(id)?.is_some())
+        })
+    }
+
+    /// Whether the store has the object whose loose file is `path`, or
+    /// that `packed` finds, making it durable with the batch if so: its
+    /// writer may not have synced its directory yet, nor the compactor the
+    /// manifest naming its pack.
+    fn hold(
+        &self,
+        path: &Path,
+        packed: impl FnOnce() -> Result<bool, StoreError>,
+    ) -> Result<bool, StoreError> {
+        if path.exists() {
+            let mut shard = path.to_owned();
+            shard.pop();
+            self.write.sync_dir_with(shard);
+            return Ok(true);
+        }
+        let packed = packed()?;
+        if packed {
+            self.write.sync_dir_with(self.store.packs_dir());
+        }
+        Ok(packed)
+    }
+
     /// Whether a pack holds `id`, as of a manifest read since the batch
     /// started. Packs loaded before may include one that garbage
     /// collection rewrote without the object since, and nothing may skip
-    /// writing an object that's gone. Once the batch read the manifest,
-    /// holding [`Store::hold_objects`] as writers that skip objects do,
-    /// only compactions replace it, and they keep every object.
+    /// writing an object that's gone; a process may also have loaded no
+    /// packs yet, and must not stage every packed object again. Once the
+    /// batch read the manifest, holding [`Store::hold_objects`] as writers
+    /// that skip objects do, only compactions replace it, and they keep
+    /// every object.
     fn packed(&self, id: ObjectId) -> Result<bool, StoreError> {
-        // A miss only stages the object again, so it needs no fresh read.
-        if self.store.packs.find(id).is_none() {
-            return Ok(false);
-        }
         let mut read = self
             .manifest_read
             .lock()
@@ -569,6 +592,8 @@ impl<P: Platform> Batch<'_, P> {
             self.store.reload_packs()?;
             *read = true;
         }
+        // Lookups from every core needn't wait on each other.
+        drop(read);
         Ok(self.store.packs.find(id).is_some())
     }
 
@@ -646,7 +671,7 @@ pub enum StoreError {
     /// got there first.
     #[error(
         "target `{target}` moved: expected acceptance {expected} to follow {}",
-        Head::describe(*actual)
+        targets::describe(*actual)
     )]
     Conflict {
         /// The target.
@@ -765,6 +790,26 @@ pub(crate) mod tests {
 
         // Its writer may not have synced it yet, if another one wrote it.
         assert_eq!(store.write_all(slice::from_ref(&blob)).unwrap(), 0);
+        let shard = store.path(blob.id()).parent().unwrap().to_owned();
+        assert_eq!(
+            store.platform.0.into_inner().unwrap(),
+            [Synced::Batch(0), Synced::Dir(shard)]
+        );
+    }
+
+    #[test]
+    fn dependencies_are_durable_with_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join(".origin"), Recorder::default());
+        store.init().unwrap();
+        let blob = EncodedObject::blob(b"hello");
+        store.write_all(slice::from_ref(&blob)).unwrap();
+        store.platform.0.lock().unwrap().clear();
+
+        let batch = store.batch();
+        assert!(batch.depend(blob.id()).unwrap());
+        assert!(!batch.depend(EncodedObject::blob(b"absent").id()).unwrap());
+        batch.commit().unwrap();
         let shard = store.path(blob.id()).parent().unwrap().to_owned();
         assert_eq!(
             store.platform.0.into_inner().unwrap(),

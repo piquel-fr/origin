@@ -1,6 +1,6 @@
 [package]
 name = "origin-client"
-description = "HTTP client for the origin API, generated from its OpenAPI document"
+description = "The origin SDK: a typed client for origin servers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 origin-shared.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

@@ -5,8 +5,8 @@ use std::str::FromStr;
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
 use crate::name::names;
 use crate::{
-    AcceptanceId, BlobId, Digest, InvalidName, ObjectId, Principal, RepoPath, RevisionId,
-    StatementId, TreeEntry, TreeId,
+    AcceptanceId, BlobId, Digest, InvalidName, ObjectId, ParseIdError, Principal, RepoPath,
+    RevisionId, StatementId, TreeEntry, TreeId,
 };
 
 /// An attributable claim about another record: a check result, a review, a
@@ -15,7 +15,7 @@ use crate::{
 /// Statements are permanent. An issuer revises one by issuing another that
 /// supersedes it. A promoted statement carries another one over to a record
 /// with the same input digest, pointing at it instead of copying its issuer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Statement {
     /// The record the claim is about.
     pub subject: RecordId,
@@ -126,6 +126,41 @@ impl From<RecordId> for ObjectId {
     }
 }
 
+/// `revision:<id>`: the record's kind, then its full id. A snapshot is
+/// `snapshot:<id>`.
+impl fmt::Display for RecordId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Snapshot(_) => "snapshot",
+            Self::Revision(_) => "revision",
+            Self::Statement(_) => "statement",
+            Self::Acceptance(_) => "acceptance",
+        };
+        write!(f, "{kind}:{}", ObjectId::from(*self))
+    }
+}
+
+/// Parses what [`RecordId`] displays as.
+impl FromStr for RecordId {
+    type Err = ParseIdError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let invalid = || ParseIdError {
+            what: "record",
+            input: input.to_owned(),
+        };
+        let (kind, id) = input.split_once(':').ok_or_else(invalid)?;
+        let id: ObjectId = id.parse().map_err(|_| invalid())?;
+        Ok(match kind {
+            "snapshot" => Self::Snapshot(id.into()),
+            "revision" => Self::Revision(id.into()),
+            "statement" => Self::Statement(id.into()),
+            "acceptance" => Self::Acceptance(id.into()),
+            _ => return Err(invalid()),
+        })
+    }
+}
+
 // The tags are the records' object kinds.
 tagged!(RecordId {
     Snapshot = 2,
@@ -227,7 +262,7 @@ impl Field for Verdict {
 /// The input digest of a snapshot hashes the ids it stores at `paths`, with
 /// `definition` and `toolchain`. A statement that declares inputs and isn't
 /// `external` is promoted to every revision with the same input digest.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Inputs {
     /// The files and directories read, each covering everything under it.
     pub paths: Vec<RepoPath>,
