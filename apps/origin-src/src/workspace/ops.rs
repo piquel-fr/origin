@@ -143,12 +143,7 @@ impl Workspace {
             self.write(&[vec![encoded.clone()]])?;
             (encoded.id().into(), restored)
         };
-        self.switch_to(
-            working_copy.revision.snapshot,
-            to,
-            restored.snapshot,
-            Why::Undo(op),
-        )?;
+        self.switch_to(working_copy.revision.snapshot, to, Why::Undo(op))?;
         println!("Undid #{op}: origin {command}");
         println!("Working copy: {}", self.headline(&restored)?);
         println!("On top of: {}", self.describe_base(restored.base)?);

@@ -13,15 +13,25 @@ use std::sync::mpsc;
 use std::thread;
 
 /// A user, with a configuration directory, and so a node key, of their
-/// own. Clones share it.
+/// own, and the token they send servers, if any. Clones share it.
 #[derive(Clone)]
 pub struct User {
     config: Arc<tempfile::TempDir>,
+    token: Option<String>,
 }
 
 impl User {
-    /// A user named `name`, whose node is named after them.
+    /// A user named `name`, whose node is named after them, with the token
+    /// [`Server`] knows them by.
     pub fn new(name: &str) -> Self {
+        Self {
+            token: Some(Server::token(name)),
+            ..Self::anonymous(name)
+        }
+    }
+
+    /// A user named `name` without a token: servers don't know them.
+    pub fn anonymous(name: &str) -> Self {
         let config = tempfile::tempdir().unwrap();
         fs::write(
             config.path().join("config.toml"),
@@ -30,6 +40,15 @@ impl User {
         .unwrap();
         Self {
             config: Arc::new(config),
+            token: None,
+        }
+    }
+
+    /// The user, sending `token` instead.
+    pub fn with_token(&self, token: &str) -> Self {
+        Self {
+            token: Some(token.to_owned()),
+            ..self.clone()
         }
     }
 
@@ -44,7 +63,11 @@ impl User {
         command
             .args(args)
             .current_dir(cwd)
-            .env("ORIGIN_CONFIG_DIR", self.config());
+            .env("ORIGIN_CONFIG_DIR", self.config())
+            .env_remove("ORIGIN_TOKEN");
+        if let Some(token) = &self.token {
+            command.env("ORIGIN_TOKEN", token);
+        }
         command
     }
 }
@@ -193,7 +216,8 @@ impl Repo {
 }
 
 /// A running `origin serve` hosting one repository, `demo`, which its node,
-/// `hosted`, orders. Killed when dropped.
+/// `hosted`, orders. Each of [`Server::USERS`] signs in with
+/// [`Server::token`]. Killed when dropped.
 pub struct Server {
     dir: tempfile::TempDir,
     child: Child,
@@ -202,12 +226,28 @@ pub struct Server {
 }
 
 impl Server {
+    /// The users the server knows.
+    pub const USERS: [&str; 4] = ["ada", "bob", "carol", "alice"];
+
+    /// The static token of `user`.
+    pub fn token(user: &str) -> String {
+        format!("token-{user}")
+    }
+
     pub fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("origin-server.toml");
+        let tokens: Vec<_> = Self::USERS
+            .iter()
+            .map(|user| format!("\"user:{user}\" = \"{}\"", Self::token(user)))
+            .collect();
+        let tokens = tokens.join("\n");
         fs::write(
             &config,
-            "listen = \"127.0.0.1:0\"\nnode = \"hosted\"\n[repos]\ndemo = \"repos/demo\"\n",
+            format!(
+                "listen = \"127.0.0.1:0\"\nnode = \"hosted\"\n[repos]\ndemo = \"repos/demo\"\n\
+                 [tokens]\n{tokens}"
+            ),
         )
         .unwrap();
         let origin = |args: &[&str]| {
@@ -250,6 +290,49 @@ impl Server {
     /// The URL of `demo`.
     pub fn url(&self) -> String {
         format!("{}/demo", self.base)
+    }
+
+    /// Adds `rules` to `demo`'s `policy.toml`, landing them on `policy` as
+    /// the server's own user, who runs its node, through the repository's
+    /// path.
+    pub fn add_policy(&self, rules: &str) {
+        let operator = User::anonymous("operator");
+        fs::write(
+            operator.config().join("config.toml"),
+            "user = \"operator\"\nnode = \"hosted\"\n",
+        )
+        .unwrap();
+        fs::copy(
+            self.dir().join("node.key"),
+            operator.config().join("node.key"),
+        )
+        .unwrap();
+        let path = self.dir().join("repos/demo");
+        let policy = Repo::clone(&operator, path.to_str().unwrap(), &["--target", "policy"]);
+        let mut toml = policy.read("policy.toml");
+        toml.push_str(rules);
+        policy.write("policy.toml", &toml);
+        policy.ok(&["describe", "Change the rules"]);
+        let landed = policy.ok(&["land"]);
+        assert!(landed.contains("Landed change"), "{landed}");
+    }
+
+    /// Signs a token for `principal` with `scope` with the server's key.
+    pub fn issue_token(&self, principal: &str, scope: &[&str]) -> String {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_origin"));
+        command
+            .args(["token", "issue", "--as", principal, "--config"])
+            .arg(self.dir().join("origin-server.toml"));
+        for capability in scope {
+            command.args(["--scope", capability]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 }
 

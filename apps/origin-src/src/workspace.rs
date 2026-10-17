@@ -8,6 +8,7 @@
 //!   workspace                  the revision the working copy is
 //!   state                      the stat cache of the last snapshot
 //!   moving                     the move in progress, if a checkout is
+//!   remote, access             the remote, and what it lets the user do
 //! ```
 //!
 //! A repository can have several working copies, its workspaces, which
@@ -31,6 +32,7 @@
 //! disk is lost, checks the revision out over them, and points `workspace`
 //! at it.
 
+mod access;
 mod annotate;
 mod land;
 mod ops;
@@ -47,7 +49,7 @@ use std::sync::{Arc, OnceLock};
 use origin_platform::{LockedFile, Native};
 use origin_shared::api::{LogQuery, RevisionEntry, Revisions};
 use origin_shared::{
-    AcceptanceId, Base, BlobId, ChangeId, EncodedObject, Kind, Principal, Record, RecordId,
+    AcceptanceId, AttachmentId, Base, ChangeId, EncodedObject, Kind, Principal, Record, RecordId,
     RepoPath, Revision, RevisionId, Source, Statement, TargetId, TargetName, Tree, TreeId,
 };
 
@@ -143,7 +145,7 @@ impl Workspace {
         let policy = Policy::initial(config.node(), &key.public());
         let main = Queue::new(&store, &key, config.node().clone()).init(&policy)?;
         let empty_tree = Tree::default().encode();
-        let empty_description = EncodedObject::blob(b"");
+        let empty_description = EncodedObject::attachment(b"");
 
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
@@ -202,7 +204,7 @@ impl Workspace {
         let revision =
             Self::read_pointer(root)?.ok_or_else(|| WorkspaceError::Incomplete(root.to_owned()))?;
         let store = Store::open_writable(store, Native::default())?;
-        let store = store.with_actor(actor.in_workspace(root));
+        let store = Self::withholding(store.with_actor(actor.in_workspace(root)))?;
         let mut workspace = Self::at(root.to_owned(), store, config, revision);
         workspace.finish_move()?;
         Ok(workspace)
@@ -244,7 +246,7 @@ impl Workspace {
                 .map_err(|source| WorkspaceError::io(&state, source))?;
         }
         let revision: Revision = self.store.get(to)?;
-        self.checkout(files, revision.snapshot)?;
+        self.checkout(files, RecordId::Revision(to))?;
         if self.revision != to {
             self.point_at(to, why)?;
         }
@@ -310,12 +312,17 @@ impl Workspace {
         let held = self.store.hold_objects()?;
         let revision: Revision = self.store.get(self.revision)?;
         let path = self.meta(Self::STATE);
-        let (tree, cache) =
+        let (files, cache) =
             Worktree::new(&self.root, &self.store).snapshot(&StatCache::load(&path))?;
         if let Some(cache) = cache {
             cache
                 .save(&path)
                 .map_err(|source| WorkspaceError::io(&path, source))?;
+        }
+        // What the user cannot read stays as the revision has it.
+        let (tree, trees) = self.store.keep_withheld(files, revision.snapshot)?;
+        if !trees.is_empty() {
+            self.store.write_all(&trees)?;
         }
         let mut index = Index::open(&self.store)?;
         if self.catch_up(&index, &revision, tree)? {
@@ -461,20 +468,14 @@ impl Workspace {
         Ok(())
     }
 
-    /// Moves the working copy, whose files are `files`, to `to`, whose files
-    /// are `tree`: checks them out, then points at it. A crash in between
-    /// leaves `moving` behind, so the next command finishes the move.
-    fn switch_to(
-        &mut self,
-        files: TreeId,
-        to: RevisionId,
-        tree: TreeId,
-        why: Why,
-    ) -> Result<(), WorkspaceError> {
+    /// Moves the working copy, whose files are `files`, to `to`: checks its
+    /// files out, then points at it. A crash in between leaves `moving`
+    /// behind, so the next command finishes the move.
+    fn switch_to(&mut self, files: TreeId, to: RevisionId, why: Why) -> Result<(), WorkspaceError> {
         let moving = self.meta(Self::MOVING);
         fs::write(&moving, format!("{to} {why}\n"))
             .map_err(|source| WorkspaceError::io(&moving, source))?;
-        self.checkout(files, tree)?;
+        self.checkout(files, RecordId::Revision(to))?;
         self.point_at(to, why)?;
         fs::remove_file(&moving).map_err(|source| WorkspaceError::io(&moving, source))
     }
@@ -489,12 +490,32 @@ impl Workspace {
         Ok(())
     }
 
-    /// Makes the files match `to`, given that they match `from`, cloning
-    /// those the other workspaces have, and fetching it if the repository
-    /// lacks it.
-    fn checkout(&self, from: TreeId, to: TreeId) -> Result<(), WorkspaceError> {
+    /// Makes the files match the snapshot of `to`, a revision or an
+    /// acceptance, given that they match `from`, cloning those the other
+    /// workspaces have, and fetching what the repository lacks of it. The
+    /// paths the remote withholds stay as they are.
+    fn checkout(&self, from: TreeId, to: RecordId) -> Result<(), WorkspaceError> {
         self.need(&[to])?;
-        let changes = self.store.diff(from, to)?;
+        let tree = self
+            .store
+            .snapshot_of(to)?
+            .ok_or(SyncError::NoSnapshot(to))?;
+        let changes = self.store.diff(from, tree)?;
+        // A clone may lack files its snapshots name: those it could not
+        // read when it fetched them.
+        if let Some(remote) = self.remote()? {
+            let mut missing = Vec::new();
+            for change in &changes {
+                if let Some(new) = change.new
+                    && !self.store.contains(new.id)?
+                {
+                    missing.push(change.path.clone());
+                }
+            }
+            if !missing.is_empty() {
+                self.sync(remote).need_paths(to, missing)?;
+            }
+        }
         let sources: Vec<_> = self
             .workspaces()?
             .into_iter()
@@ -558,7 +579,7 @@ impl Workspace {
     /// cannot be read.
     pub fn diff(&mut self) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
-        self.print_diff(&working_copy.revision)
+        self.print_diff(working_copy.id, &working_copy.revision)
     }
 
     /// `origin show [<change>]`: prints a change's head, or each of them if
@@ -598,14 +619,14 @@ impl Workspace {
                 println!("    {line}");
             }
             println!();
-            self.print_diff(&revision)?;
+            self.print_diff(id, &revision)?;
         }
         Ok(())
     }
 
-    fn print_diff(&self, revision: &Revision) -> Result<(), WorkspaceError> {
+    fn print_diff(&self, id: RevisionId, revision: &Revision) -> Result<(), WorkspaceError> {
         let base = self.base_tree(revision.base)?;
-        self.need(&[revision.snapshot])?;
+        self.need(&[RecordId::Revision(id)])?;
         for change in self.store.diff(base, revision.snapshot)? {
             print!("{}", FileDiff::new(&self.store, &change)?);
         }
@@ -622,7 +643,7 @@ impl Workspace {
     pub fn new_change(&mut self, description: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
         self.log_snapshot(&working_copy)?;
-        let description = EncodedObject::blob(description.as_bytes());
+        let description = EncodedObject::attachment(description.as_bytes());
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
@@ -651,7 +672,7 @@ impl Workspace {
     pub fn describe(&mut self, description: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
         self.log_snapshot(&working_copy)?;
-        let description = EncodedObject::blob(description.as_bytes());
+        let description = EncodedObject::attachment(description.as_bytes());
         let revision = Revision {
             predecessors: vec![working_copy.id],
             description: description.id().into(),
@@ -680,12 +701,7 @@ impl Workspace {
         let head = Self::single_head(index, change)?;
         let revision: Revision = self.store.get(head)?;
         if head != working_copy.id {
-            self.switch_to(
-                working_copy.revision.snapshot,
-                head,
-                revision.snapshot,
-                Why::Command,
-            )?;
+            self.switch_to(working_copy.revision.snapshot, head, Why::Command)?;
         }
         println!("Working copy: {}", self.headline(&revision)?);
         Ok(())
@@ -708,7 +724,7 @@ impl Workspace {
             None => working_copy.revision.change,
         };
         let head = Self::single_head(index, change)?;
-        let reason = EncodedObject::blob(reason.as_bytes());
+        let reason = EncodedObject::attachment(reason.as_bytes());
         let statement = Statement {
             subject: RecordId::Revision(head),
             kind: Kind::ABANDON,
@@ -727,7 +743,7 @@ impl Workspace {
         }
 
         let abandoned: Revision = self.store.get(head)?;
-        let empty = EncodedObject::blob(b"");
+        let empty = EncodedObject::attachment(b"");
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
@@ -742,7 +758,6 @@ impl Workspace {
         self.switch_to(
             working_copy.revision.snapshot,
             encoded.id().into(),
-            revision.snapshot,
             Why::Command,
         )?;
         println!("Abandoned change {}", change.short());
@@ -779,11 +794,8 @@ impl Workspace {
             heads[heads.len() - 1]
         };
         let kept_revision: Revision = self.store.get(kept)?;
-        let snapshots = heads
-            .iter()
-            .map(|&head| Ok(self.store.get(head)?.snapshot))
-            .collect::<Result<Vec<_>, WorkspaceError>>()?;
-        self.need(&snapshots)?;
+        let records: Vec<_> = heads.iter().copied().map(RecordId::Revision).collect();
+        self.need(&records)?;
         let base = match self.common_predecessor(&heads, kept)? {
             Some(base) => Some(self.store.get(base)?.snapshot),
             None => None,
@@ -819,12 +831,7 @@ impl Workspace {
             self.write(&[vec![payload], vec![statement.encode()]])?;
         }
         if change == working_copy.revision.change {
-            self.switch_to(
-                working_copy.revision.snapshot,
-                id,
-                revision.snapshot,
-                Why::Command,
-            )?;
+            self.switch_to(working_copy.revision.snapshot, id, Why::Command)?;
         }
         println!(
             "Converged change {}: revision {} evolves from {}, merging their files",
@@ -1015,14 +1022,13 @@ impl Workspace {
         self.text(revision.description)
     }
 
-    /// A blob's content, as text.
-    fn text(&self, blob: BlobId) -> Result<String, WorkspaceError> {
-        let id = blob.into();
-        let blob = self.store.read(id)?;
-        let content = blob
-            .blob_content()
-            .map_err(|source| StoreError::Decode { id, source })?;
-        Ok(String::from_utf8_lossy(content).into_owned())
+    /// An attachment's content, as text.
+    fn text(&self, attachment: AttachmentId) -> Result<String, WorkspaceError> {
+        let content = self
+            .store
+            .try_attachment(attachment)?
+            .ok_or(StoreError::NotFound(attachment.into()))?;
+        Ok(String::from_utf8_lossy(&content).into_owned())
     }
 
     /// The first line of a revision's description.
@@ -1101,12 +1107,8 @@ impl Workspace {
     /// The snapshot a revision was made on top of, fetched if the
     /// repository lacks it.
     fn base_tree(&self, base: Base) -> Result<TreeId, WorkspaceError> {
-        let tree = match base {
-            Base::Acceptance(id) => self.store.get(id)?.body().state,
-            Base::Revision(id) => self.store.get(id)?.snapshot,
-        };
-        self.need(&[tree])?;
-        Ok(tree)
+        self.need(&[base.into()])?;
+        Ok(self.store.base_snapshot(base)?)
     }
 
     fn describe_base(&self, base: Base) -> Result<String, WorkspaceError> {

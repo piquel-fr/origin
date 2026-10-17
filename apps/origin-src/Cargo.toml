@@ -18,12 +18,14 @@ fixture = []
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+blake3.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 origin-client.workspace = true
 origin-platform.workspace = true
 origin-shared.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 similar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -38,7 +40,6 @@ zstd.workspace = true
 divan.workspace = true
 # The benchmarks build their working trees with the fixtures.
 origin-src = { workspace = true, features = ["fixture"] }
-serde_json.workspace = true
 tempfile.workspace = true
 
 [[bench]]
@@ -47,6 +48,10 @@ harness = false
 
 [[bench]]
 name = "land"
+harness = false
+
+[[bench]]
+name = "permissions"
 harness = false
 
 [[bench]]

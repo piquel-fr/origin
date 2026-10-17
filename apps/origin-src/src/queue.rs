@@ -17,9 +17,12 @@
 //!    statement about the revision lists the paths, and the change waits,
 //!    blocked, until a new revision of it merges.
 //! 3. **Policy.** The policy in force now must name this node as the
-//!    target's authority. On `policy`, that's the policy of the acceptance
-//!    before, never the one landing ([`Policy::governing`]). Each of the
-//!    target's requirements needs a [claim](crate::annotations::Claim)
+//!    target's authority, and the submitter must write every path the
+//!    landing changes on the target, whatever it lands: a revision made on
+//!    an old acceptance, or another target, never reverts or deletes what
+//!    they may not change. On `policy`, the policy is the acceptance
+//!    before's, never the one landing's ([`Policy::governing`]). Each of
+//!    the target's requirements needs a [claim](crate::annotations::Claim)
 //!    about the revision that lands: results with the same input digest
 //!    are promoted to it first, and a valid promotion claims what its
 //!    original does, as its original's issuer.
@@ -44,6 +47,7 @@ use std::path::PathBuf;
 use std::slice;
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Native, Platform};
+use origin_shared::access::{Level, PathAccess};
 use origin_shared::landing::{Blocked, Landing, Pending, Proposal};
 use origin_shared::policy::Requirement;
 use origin_shared::{
@@ -55,6 +59,7 @@ use origin_shared::{
 use crate::annotations::{AnnotateError, Annotations, Claim};
 use crate::conflict::Conflict;
 use crate::oplog::Effect;
+use crate::permissions::Forbidden;
 use crate::policy::{Policy, PolicyError};
 use crate::store::{Store, StoreError};
 
@@ -64,6 +69,8 @@ pub struct Queue<'a, P = Native> {
     store: &'a Store<P>,
     key: &'a NodeKey,
     node: PrincipalName,
+    /// What the submitter may do with each path.
+    submitter: PathAccess,
 }
 
 /// Landings onto one target, holding its queue's lock.
@@ -102,7 +109,22 @@ impl<'a, P: Platform> Queue<'a, P> {
     /// The queues of `store`, run by the node `node`, which signs with
     /// `key`.
     pub fn new(store: &'a Store<P>, key: &'a NodeKey, node: PrincipalName) -> Self {
-        Self { store, key, node }
+        Self {
+            store,
+            key,
+            node,
+            submitter: PathAccess::uniform(Level::Write),
+        }
+    }
+
+    /// The queues, landing for a submitter who may do `paths`: everything,
+    /// by default.
+    #[must_use]
+    pub fn submitted_by(self, paths: PathAccess) -> Self {
+        Self {
+            submitter: paths,
+            ..self
+        }
     }
 
     /// This node, which issues the statements and revisions the queue
@@ -429,7 +451,9 @@ impl<P: Platform> Session<'_, '_, P> {
             let claims = self.annotations.claims(RecordId::Revision(head))?;
             for claim in &claims {
                 let statement = claim.statement();
-                if statement.kind == Kind::ABANDON && self.store().authorizes(statement)? {
+                if statement.kind == Kind::ABANDON
+                    && self.policy.authorizes(self.store(), statement)?
+                {
                     return Err(LandError::Abandoned(change));
                 }
             }
@@ -511,6 +535,13 @@ impl<P: Platform> Session<'_, '_, P> {
         let store = self.queue.store;
         if !candidate.trees.is_empty() {
             store.write_all(&candidate.trees)?;
+        }
+        if !self.queue.submitter.writes_all() {
+            for change in store.diff(self.state, candidate.state)? {
+                if !self.queue.submitter.writes(&change.path) {
+                    return Err(Forbidden::Write(change.path).into());
+                }
+            }
         }
         // What a landing on `policy` lands governs the next one, which
         // this node must still be the authority of.
@@ -864,6 +895,9 @@ pub enum LandError {
     /// The policy in force cannot be read.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// The submitter may not change what the landing changes.
+    #[error(transparent)]
+    Forbidden(#[from] Forbidden),
     /// A conflict cannot be recorded.
     #[error(transparent)]
     Annotate(#[from] AnnotateError),
@@ -877,7 +911,7 @@ pub(crate) mod tests {
     use std::sync::Mutex;
     use std::thread;
 
-    use origin_shared::{BlobId, Digest, Inputs, Statement, Verdict};
+    use origin_shared::{AttachmentId, Digest, Inputs, Statement, Verdict};
 
     use super::*;
     use crate::tree::tests::build;
@@ -954,7 +988,7 @@ pub(crate) mod tests {
                 base,
                 deps: Vec::new(),
                 snapshot: self.files(files),
-                description: BlobId::from(EncodedObject::blob(b"").id()),
+                description: AttachmentId::from(EncodedObject::attachment(b"").id()),
                 author: "user:ada".parse().unwrap(),
             }
             .encode();
@@ -1378,7 +1412,7 @@ pub(crate) mod tests {
             base: tip,
             deps: Vec::new(),
             snapshot: repo.files(&[("policy.toml", &requiring)]),
-            description: BlobId::from(EncodedObject::blob(b"").id()),
+            description: AttachmentId::from(EncodedObject::attachment(b"").id()),
             author: "user:ada".parse().unwrap(),
         }
         .encode();
@@ -1505,9 +1539,13 @@ pub(crate) mod tests {
 
     #[test]
     fn only_those_who_worked_on_a_change_abandon_it() {
-        let repo = Repo::new("[targets.main]\nauthority = \"node:queue\"\n");
+        let repo = Repo::new(
+            "[targets.main]\nauthority = \"node:queue\"\n\
+             [grants]\nall = [\"land *\", \"annotate *\"]\n\"user:root\" = [\"admin\"]\n",
+        );
         let revision = repo.change_on_main(1, &[("file", "work")]);
-        let abandon = |issuer: &str| Statement {
+        let given_up = repo.change_on_main(2, &[("other", "work")]);
+        let abandon = |issuer: &str, revision| Statement {
             subject: RecordId::Revision(revision),
             kind: Kind::ABANDON,
             verdict: None,
@@ -1518,9 +1556,24 @@ pub(crate) mod tests {
             promoted_from: None,
         };
         repo.store
-            .write_all(&[abandon("user:eve").encode()])
+            .write_all(&[
+                abandon("user:eve", revision).encode(),
+                abandon("user:root", given_up).encode(),
+            ])
             .unwrap();
         assert!(matches!(repo.land(1)[..], [Landing::Landed { .. }]));
+        let error = repo
+            .queue()
+            .land_change(
+                &mut repo.annotations(),
+                ChangeId::from_bytes([2; 16]),
+                &TargetName::MAIN,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, LandError::Abandoned(_)),
+            "an admin may: {error}"
+        );
     }
 
     #[test]

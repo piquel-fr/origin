@@ -98,7 +98,7 @@ impl Conflict {
             list.push_str(path.as_str());
             list.push('\n');
         }
-        let payload = EncodedObject::blob(list.as_bytes());
+        let payload = EncodedObject::attachment(list.as_bytes());
         let statement = Statement {
             subject,
             kind: Kind::CONFLICT,
@@ -125,7 +125,7 @@ impl Conflict {
         let Some(payload) = statement.payload else {
             return Ok(Vec::new());
         };
-        let content = store.try_blob(payload.into())?.unwrap_or_default();
+        let content = store.try_attachment(payload)?.unwrap_or_default();
         Ok(String::from_utf8_lossy(&content)
             .lines()
             .filter_map(|line| RepoPath::new(line).ok())

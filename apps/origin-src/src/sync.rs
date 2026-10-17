@@ -7,12 +7,16 @@
 //!   change are compared with the remote's, by id, and those missing
 //!   fetched, with the records they refer to. Snapshots don't come with
 //!   them: [`Sync::need`] fetches one when something reads it, such as a
-//!   checkout, so a clone fetches one snapshot, its target's tip.
-//! - **Pushing** shares revisions, with their snapshots, and statements. It
-//!   never lands anything. It first compares each change's heads with the
-//!   remote's, and refuses before uploading anything when the remote has a
-//!   revision this node lacks: the change is stale. Revisions only go to a
-//!   remote that has the acceptance they're based on.
+//!   checkout, so a clone fetches one snapshot, its target's tip. The
+//!   remote withholds the content of the paths the user may not read: the
+//!   trees keep their place, and nothing reads them (see
+//!   [`Store::with_withheld`]).
+//! - **Pushing** shares revisions, with their snapshots, and the user's
+//!   statements. It never lands anything. It first compares each change's
+//!   heads with the remote's, and refuses before uploading anything when
+//!   the remote has a revision this node lacks: the change is stale, or a
+//!   revision changes a path the user may not write. Revisions only go to
+//!   a remote that has the acceptance they're based on.
 //!
 //! Fetched records are written before the chains that refer to them, and
 //! the op log's `writers` lock is held from the first write until the last
@@ -24,16 +28,19 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::mem;
 
 use origin_platform::Native;
+use origin_shared::access::{Level, PathAccess};
 use origin_shared::api::{ErrorCode, FetchRecords, FetchSnapshot, InventoryRequest, LogQuery};
 use origin_shared::object::{BadSignature, DecodeError};
 use origin_shared::pack::Pack;
 use origin_shared::{
     Acceptance, AcceptanceId, Base, ChangeId, EncodedObject, Head, Object, ObjectId, ObjectKind,
-    Principal, PrincipalName, Record, RecordId, Revision, RevisionId, Source, TargetName, TreeId,
+    Principal, PrincipalName, Record, RecordId, RepoPath, Revision, RevisionId, Source, TargetName,
+    TreeId,
 };
 
 use crate::annotations::Annotations;
 use crate::index::Index;
+use crate::permissions::Forbidden;
 use crate::policy::{Policy, PolicyError};
 use crate::remote::{Remote, RemoteError};
 use crate::service::Dependencies;
@@ -45,6 +52,10 @@ pub struct Sync<'a> {
     remote: &'a Remote,
     /// This node, which flags the divergence fetched revisions reveal.
     node: Principal,
+    /// The user, whose statements pushes share.
+    user: Principal,
+    /// What the user may write on the remote, as of the last fetch.
+    writes: PathAccess,
 }
 
 /// A target whose chain a fetch extended.
@@ -90,12 +101,25 @@ struct Chain {
 }
 
 impl<'a> Sync<'a> {
-    /// Syncs `store` with `remote`, as the node `node`.
-    pub fn new(store: &'a Store, remote: &'a Remote, node: PrincipalName) -> Self {
+    /// Syncs `store` with `remote`, as the node `node`, for `user`, who
+    /// writes everything until [`Sync::writing`] says otherwise.
+    pub fn new(store: &'a Store, remote: &'a Remote, node: PrincipalName, user: Principal) -> Self {
         Self {
             store,
             remote,
             node: Principal::Node(node),
+            user,
+            writes: PathAccess::uniform(Level::Write),
+        }
+    }
+
+    /// Syncs knowing the user may only write `paths`, so pushes that would
+    /// be refused fail before sending anything.
+    #[must_use]
+    pub fn writing(self, paths: PathAccess) -> Self {
+        Self {
+            writes: paths,
+            ..self
         }
     }
 
@@ -240,7 +264,7 @@ impl<'a> Sync<'a> {
                 let body = acceptance.body();
                 // Small, and the policy in force once it's the tip.
                 if chain.target == TargetName::POLICY {
-                    self.need(body.state, &[])?;
+                    self.fetch_snapshot(RecordId::Acceptance(*id), body.state, &[])?;
                 }
                 let unverified = |why| SyncError::Unverified {
                     target: chain.target.clone(),
@@ -259,7 +283,7 @@ impl<'a> Sync<'a> {
                             Some(policy) => policy.body().state,
                             None => self.store.get(policy_id)?.body().state,
                         };
-                        self.need(state, &[])?;
+                        self.fetch_snapshot(RecordId::Acceptance(policy_id), state, &[])?;
                         let policy = Policy::of_snapshot(self.store, state)?
                             .ok_or(unverified(Unverified::NoPolicy))?;
                         vacant.insert(policy)
@@ -374,26 +398,62 @@ impl<'a> Sync<'a> {
         Ok(objects)
     }
 
-    /// Fetches the trees and blobs of `snapshot`, unless the store has it,
+    /// Fetches the trees and blobs of the snapshot of `record`, a revision
+    /// or an acceptance this node has, unless the store has its root,
     /// skipping what the snapshots `have`, which it holds whole, hold at
     /// the same path. Returns whether it fetched.
     ///
     /// # Errors
     ///
-    /// Fails if the remote doesn't have the snapshot, or the remote or the
-    /// store fails.
-    pub fn need(&self, snapshot: TreeId, have: &[TreeId]) -> Result<bool, SyncError> {
+    /// Fails if the record has no snapshot, the remote doesn't have it, or
+    /// the remote or the store fails.
+    pub fn need(&self, record: RecordId, have: &[TreeId]) -> Result<bool, SyncError> {
+        let snapshot = self
+            .store
+            .snapshot_of(record)?
+            .ok_or(SyncError::NoSnapshot(record))?;
+        self.fetch_snapshot(record, snapshot, have)
+    }
+
+    /// [`Sync::need`], given the snapshot of `record`.
+    fn fetch_snapshot(
+        &self,
+        record: RecordId,
+        snapshot: TreeId,
+        have: &[TreeId],
+    ) -> Result<bool, SyncError> {
         if self.store.contains(snapshot.into())? {
             return Ok(false);
         }
-        let request = FetchSnapshot {
-            snapshot,
-            have: self.store.present(have.iter().copied())?,
+        let have = self.store.present(have.iter().copied())?;
+        self.fetch(&FetchSnapshot {
+            of: record,
+            have,
             paths: Vec::new(),
-        };
-        let pack = self.remote.snapshot(&request)?;
-        self.store.write_all(&pack.objects)?;
+        })?;
         Ok(true)
+    }
+
+    /// Fetches what the snapshot of `record` holds under `paths`, whatever
+    /// the store has: files a checkout lacks, such as those whose content
+    /// was withheld until the user could read them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote doesn't have the record, or the remote or the
+    /// store fails.
+    pub fn need_paths(&self, record: RecordId, paths: Vec<RepoPath>) -> Result<(), SyncError> {
+        self.fetch(&FetchSnapshot {
+            of: record,
+            have: Vec::new(),
+            paths,
+        })
+    }
+
+    fn fetch(&self, request: &FetchSnapshot) -> Result<(), SyncError> {
+        let pack = self.remote.snapshot(request)?;
+        self.store.write_all(&pack.objects)?;
+        Ok(())
     }
 
     /// Shares `changes`, and the changes below them, with the remote, as
@@ -438,6 +498,7 @@ impl<'a> Sync<'a> {
             {
                 self.check_shared(*id, revision, base)?;
             }
+            self.check_writes(revision)?;
         }
 
         let mut ids = Vec::new();
@@ -450,17 +511,14 @@ impl<'a> Sync<'a> {
         for (id, revision) in &revisions {
             shared.insert((*id).into());
             // The remote has these snapshots, or gets them first.
-            let mut have = vec![match revision.base {
-                Base::Acceptance(base) => self.store.get(base)?.body().state,
-                Base::Revision(base) => self.store.get(base)?.snapshot,
-            }];
+            let mut have = vec![self.store.base_snapshot(revision.base)?];
             for &predecessor in &revision.predecessors {
                 if shared.contains(&predecessor.into()) {
                     have.push(self.store.get(predecessor)?.snapshot);
                 }
             }
             let have = self.store.present(have)?;
-            for placed in self.store.added(revision.snapshot, &have, &[])? {
+            for placed in self.store.added(revision.snapshot, &have, &[], None)? {
                 send(placed.entry.id, &mut ids);
             }
             send(revision.description.into(), &mut ids);
@@ -479,6 +537,11 @@ impl<'a> Sync<'a> {
                     continue;
                 }
                 let statement = self.store.get(id)?;
+                // Others' statements are theirs to share, and this node's
+                // own, like divergence, the remote finds itself.
+                if statement.issuer != self.user {
+                    continue;
+                }
                 let payload = statement.payload;
                 // A statement promoted from one the remote lacks stays:
                 // the remote's queue promotes results itself.
@@ -506,6 +569,20 @@ impl<'a> Sync<'a> {
             statements,
             objects: ids.len(),
         })
+    }
+
+    /// Checks that the user may write every path `revision` changes.
+    fn check_writes(&self, revision: &Revision) -> Result<(), SyncError> {
+        if self.writes.writes_all() {
+            return Ok(());
+        }
+        let base = self.store.base_snapshot(revision.base)?;
+        for change in self.store.diff(base, revision.snapshot)? {
+            if !self.writes.writes(&change.path) {
+                return Err(Forbidden::Write(change.path).into());
+            }
+        }
+        Ok(())
     }
 
     /// `changes`, and every change below their revisions, following their
@@ -597,6 +674,12 @@ pub enum SyncError {
     /// The remote has no such target.
     #[error("the remote has no target `{0}`")]
     UnknownTarget(TargetName),
+    /// A snapshot was needed of a record that has none.
+    #[error("{0} has no snapshot")]
+    NoSnapshot(RecordId),
+    /// A push would change what the user may not.
+    #[error("the remote would refuse the push")]
+    Forbidden(#[from] Forbidden),
     /// The change has no revision to push.
     #[error("change {} has no revisions", .0.short())]
     UnknownChange(ChangeId),
@@ -709,7 +792,12 @@ mod tests {
         }
 
         fn sync(&self) -> Sync<'_> {
-            Sync::new(&self.store, &self.remote, "laptop".parse().unwrap())
+            Sync::new(
+                &self.store,
+                &self.remote,
+                "laptop".parse().unwrap(),
+                "user:ada".parse().unwrap(),
+            )
         }
 
         /// Writes a revision of `change` with `files` on `base`, with every
@@ -725,7 +813,7 @@ mod tests {
                 .iter()
                 .map(|(_, content)| EncodedObject::blob(content.as_bytes()))
                 .collect();
-            let description = EncodedObject::blob(b"work");
+            let description = EncodedObject::attachment(b"work");
             let revision = Revision {
                 change: ChangeId::from_bytes([change; 16]),
                 predecessors: predecessors.to_vec(),
@@ -777,8 +865,9 @@ mod tests {
             !client.store.contains(state.into()).unwrap(),
             "snapshots are lazy"
         );
-        assert!(client.sync().need(state, &[]).unwrap());
-        assert!(!client.sync().need(state, &[]).unwrap(), "once");
+        let tip = RecordId::Acceptance(server.tip(&TargetName::MAIN).acceptance);
+        assert!(client.sync().need(tip, &[]).unwrap());
+        assert!(!client.sync().need(tip, &[]).unwrap(), "once");
         assert_eq!(client.store.diff(state, state).unwrap(), []);
         assert_eq!(client.sync().fetch_chains(&[]).unwrap(), []);
     }

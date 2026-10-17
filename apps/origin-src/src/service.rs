@@ -11,43 +11,41 @@
 //! reading it whole, and wakes the event long-polls waiting on it whenever
 //! it writes.
 //!
-//! Every method takes the [`Caller`]. Nothing is checked yet: every caller
-//! may read and write everything.
+//! Every method takes the [`Caller`], and does only what their [`Rights`]
+//! allow, as [`permissions`](crate::permissions) explains: what each
+//! caller reads is filtered, and what they write is checked.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use origin_platform::Native;
+use origin_shared::access::{PathAccess, Rights, Token};
 use origin_shared::api::{
-    Annotation, ErrorCode, EventsQuery, FetchSnapshot, Inventory, InventoryRequest, LandRequest,
-    Landings, LogEntry, LogQuery, NewTarget, RevisionEntry, Revisions, Stored, TargetInfo,
+    Annotation, At, BrowseQuery, ErrorCode, EventsQuery, FetchSnapshot, Inventory,
+    InventoryRequest, IssuedToken, LandRequest, Landings, Listed, Listing, LogEntry, LogQuery,
+    NewTarget, RevisionEntry, Revisions, Stored, TargetInfo, TokenRequest,
 };
-use origin_shared::event::{Filter, Page};
+use origin_shared::event::{EventKind, Filter, Page};
 use origin_shared::landing::{Pending, Proposal};
 use origin_shared::object::DecodeError;
 use origin_shared::pack::Pack;
 use origin_shared::{
-    Base, ChangeId, EncodedObject, Head, NodeKey, Object, ObjectId, ObjectKind, Principal,
-    PrincipalName, RecordId, StatementId, TargetName, TreeId,
+    AcceptanceId, Base, ChangeId, EncodedObject, Head, NodeKey, Object, ObjectId, ObjectKind,
+    Principal, PrincipalName, RecordId, RepoPath, Statement, StatementId, TargetName, TreeEntry,
+    TreeId,
 };
 
 use crate::annotations::{AnnotateError, Annotations};
 use crate::events::{Events, Wakeup};
 use crate::index::Index;
+pub use crate::permissions::Caller;
+use crate::permissions::{Forbidden, PutError, Reader, Writer};
 use crate::policy::{Policy, PolicyError};
 use crate::queue::{LandError, Queue};
 use crate::store::{Store, StoreError};
-
-/// Who calls the service. Permissions will decide what each may do by it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Caller {
-    /// The node's own user, through the command line.
-    Owner,
-    /// A client of a server that didn't authenticate.
-    Anonymous,
-}
+use crate::tree::Snapshots;
 
 /// A node: its name, and the key it signs acceptances with as the
 /// authority of the targets its repositories' policies name it for. A
@@ -74,12 +72,18 @@ pub struct OriginService {
     node: Node,
     /// The record index, once read: see the module.
     index: Mutex<Option<Index>>,
+    /// The policy in force, and the acceptance of `policy` holding it, once
+    /// read.
+    policy: Mutex<Option<(AcceptanceId, Arc<Policy>)>>,
     wakeup: Wakeup,
 }
 
 impl OriginService {
     /// The most events a page holds, and how many by default.
     const MAX_EVENTS: u32 = 1024;
+
+    /// The longest a token issued lasts.
+    pub const MAX_TOKEN_TTL: Duration = Duration::from_hours(7 * 24);
 
     /// The longest an event long-poll waits.
     pub const MAX_WAIT: Duration = Duration::from_mins(1);
@@ -91,6 +95,7 @@ impl OriginService {
             store,
             node,
             index: Mutex::default(),
+            policy: Mutex::default(),
             wakeup: Wakeup::default(),
         }
     }
@@ -164,119 +169,352 @@ impl OriginService {
         result
     }
 
-    /// The records `ids` name, in their order, as a pack: revisions,
-    /// statements and acceptances, each followed by the blob it carries, if
-    /// the repository has it: a revision's description, a statement's
-    /// payload. Snapshots only leave through [`OriginService::snapshot`].
+    /// The policy in force, read again only once `policy` moved.
+    fn policy(&self) -> Result<Arc<Policy>, ServiceError> {
+        let mut kept = self.policy.lock().unwrap_or_else(PoisonError::into_inner);
+        let head = self.store.head(&TargetName::POLICY)?;
+        if let (Some(head), Some((at, policy))) = (head, &*kept)
+            && head.acceptance == *at
+        {
+            return Ok(Arc::clone(policy));
+        }
+        let (at, policy) = match Policy::in_force(&self.store) {
+            Ok((at, policy)) => (at, Arc::new(policy)),
+            Err(PolicyError::Missing) => return Ok(Arc::new(Policy::default())),
+            Err(error) => return Err(error.into()),
+        };
+        *kept = Some((at, Arc::clone(&policy)));
+        Ok(policy)
+    }
+
+    /// What `caller` may do, under the policy in force.
     ///
     /// # Errors
     ///
-    /// Fails if the repository doesn't have one, one is a blob or a tree, or
-    /// it cannot read one.
-    pub fn records(&self, _caller: &Caller, ids: &[ObjectId]) -> Result<Pack, ServiceError> {
+    /// Fails if the policy cannot be read.
+    pub fn rights(&self, caller: &Caller) -> Result<Rights, ServiceError> {
+        Ok(match caller {
+            Caller::Owner => Rights::all(),
+            Caller::Anonymous => self.policy()?.rights(None),
+            Caller::Principal { principal, scope } => {
+                let rights = self.policy()?.rights(Some(principal));
+                match scope {
+                    Some(scope) => rights.narrowed(scope.clone()),
+                    None => rights,
+                }
+            }
+        })
+    }
+
+    /// `whoami`: what the caller may do, and who they are.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the policy cannot be read.
+    pub fn whoami(&self, caller: &Caller) -> Result<Rights, ServiceError> {
+        self.rights(caller)
+    }
+
+    /// Issues a token acting for the caller, with the request's scope, which
+    /// their rights must cover, for its `ttl`, at most
+    /// [`OriginService::MAX_TOKEN_TTL`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the caller isn't signed in, or the scope reaches beyond
+    /// their rights.
+    pub fn issue_token(
+        &self,
+        caller: &Caller,
+        request: &TokenRequest,
+    ) -> Result<IssuedToken, ServiceError> {
+        let Some(principal) = caller.principal() else {
+            return Err(Forbidden::NoPrincipal.into());
+        };
+        let rights = self.rights(caller)?;
+        if let Some(beyond) = request
+            .scope
+            .iter()
+            .find(|&capability| !rights.cover(std::slice::from_ref(capability)))
+        {
+            return Err(Forbidden::Scope(beyond.clone()).into());
+        }
+        let token = Token::new(
+            principal.clone(),
+            request.scope.clone(),
+            request.ttl.0.min(Self::MAX_TOKEN_TTL),
+        );
+        Ok(IssuedToken {
+            token: token.sign(&self.node.key),
+            principal: token.principal,
+            expires: token.expires,
+        })
+    }
+
+    /// The records `ids` name, in their order, as a pack: revisions,
+    /// statements and acceptances the caller sees, the others left out,
+    /// each followed by the attachment it carries, if the repository has
+    /// it: a revision's description, a statement's payload. Snapshots only
+    /// leave through [`OriginService::snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the repository doesn't have one, one is a blob, a tree or
+    /// an attachment, or it cannot read one.
+    pub fn records(&self, caller: &Caller, ids: &[ObjectId]) -> Result<Pack, ServiceError> {
+        let rights = self.rights(caller)?;
+        let mut reader = Reader::new(&self.store, &rights);
         let mut objects = Vec::with_capacity(ids.len());
         for &id in ids {
             let object = self.store.read(id)?;
-            let carried = match object
+            let (record, carried) = match object
                 .decode()
                 .map_err(|source| StoreError::Decode { id, source })?
             {
-                Object::Blob(_) | Object::Tree(_) => return Err(ServiceError::NotARecord(id)),
-                Object::Revision(revision) => Some(revision.description.into()),
-                Object::Statement(statement) => statement.payload.map(Into::into),
-                Object::Acceptance(_) => None,
+                Object::Blob(_) | Object::Tree(_) | Object::Attachment(_) => {
+                    return Err(ServiceError::NotARecord(id));
+                }
+                Object::Revision(revision) => {
+                    (RecordId::Revision(id.into()), Some(revision.description))
+                }
+                Object::Statement(statement) => (RecordId::Statement(id.into()), statement.payload),
+                Object::Acceptance(_) => (RecordId::Acceptance(id.into()), None),
             };
+            if !reader.sees(record)? {
+                continue;
+            }
             objects.push(object);
-            objects.extend(
-                carried
-                    .map(|id| self.store.try_read(id))
-                    .transpose()?
-                    .flatten(),
-            );
+            // Only an attachment goes with a record: never a blob, a file's
+            // content, whose id a record names instead.
+            let carried = carried
+                .map(|id| self.store.try_read(id.into()))
+                .transpose()?
+                .flatten()
+                .filter(|object| object.kind().ok() == Some(ObjectKind::Attachment));
+            objects.extend(carried);
         }
         Ok(Pack { objects })
     }
 
-    /// The objects of the snapshot the request names that the caller lacks,
-    /// as a pack, parents before children: those none of the snapshots it
-    /// has holds at the same path, under the paths it asks for. See
+    /// The snapshot of a record the caller sees, a revision or an
+    /// acceptance, if it is one.
+    fn snapshot_of(
+        &self,
+        reader: &mut Reader<'_, Native>,
+        record: RecordId,
+    ) -> Result<TreeId, ServiceError> {
+        let unknown = || ServiceError::UnknownRecord(record);
+        let snapshot = match record {
+            RecordId::Revision(id) => self.store.get(id).map(|revision| revision.snapshot),
+            RecordId::Acceptance(id) => {
+                self.store.get(id).map(|acceptance| acceptance.body().state)
+            }
+            RecordId::Statement(_) | RecordId::Snapshot(_) => {
+                return Err(ServiceError::NotASnapshot(record));
+            }
+        };
+        let snapshot = match snapshot {
+            // Not a record of the kind it's named as.
+            Err(StoreError::NotFound(_) | StoreError::Decode { .. }) => return Err(unknown()),
+            snapshot => snapshot?,
+        };
+        if !reader.sees(record)? {
+            return Err(unknown());
+        }
+        Ok(snapshot)
+    }
+
+    /// The objects of the snapshot of the record the request names that the
+    /// caller lacks, as a pack, parents before children: those none of the
+    /// snapshots it has holds at the same path, under the paths it asks
+    /// for. The content of paths the caller may not read is withheld. See
     /// [`Store::added`].
     ///
     /// # Errors
     ///
-    /// Fails if the repository doesn't have the snapshot, or cannot read
-    /// it.
-    pub fn snapshot(
-        &self,
-        _caller: &Caller,
-        request: &FetchSnapshot,
-    ) -> Result<Pack, ServiceError> {
-        let is_tree = |id: TreeId| -> Result<bool, StoreError> {
-            let object = self.store.try_read(id.into())?;
-            Ok(object.is_some_and(|object| object.kind().ok() == Some(ObjectKind::Tree)))
-        };
-        if !is_tree(request.snapshot)? {
-            return Err(ServiceError::UnknownSnapshot(request.snapshot));
-        }
+    /// Fails if the record isn't a revision or an acceptance the caller
+    /// sees, or the repository cannot read its snapshot.
+    pub fn snapshot(&self, caller: &Caller, request: &FetchSnapshot) -> Result<Pack, ServiceError> {
+        let rights = self.rights(caller)?;
+        let snapshot = self.snapshot_of(&mut Reader::new(&self.store, &rights), request.of)?;
         let mut have = Vec::new();
         for &id in &request.have {
-            if is_tree(id)? {
+            let object = self.store.try_read(id.into())?;
+            if object.is_some_and(|object| object.kind().ok() == Some(ObjectKind::Tree)) {
                 have.push(id);
             }
         }
-        let added = self.store.added(request.snapshot, &have, &request.paths)?;
+        let added = self.store.added(
+            snapshot,
+            &have,
+            &request.paths,
+            self.filter(&rights, request.of)?,
+        )?;
         let ids: Vec<ObjectId> = added.iter().map(|placed| placed.entry.id).collect();
         Ok(Pack {
             objects: self.store.read_all(&ids)?,
         })
     }
 
-    /// What the repository holds of each change: its revisions and heads,
-    /// and the statements about them, by id. A change it never heard of
-    /// has none.
+    /// What a walk of the snapshot of `record` withholds from a caller with
+    /// `rights`, if anything. Everyone who sees the repository reads the
+    /// snapshots of `policy`: what each may do, and the keys that sign
+    /// acceptances, so they can verify every target.
+    fn filter<'r>(
+        &self,
+        rights: &'r Rights,
+        record: RecordId,
+    ) -> Result<Option<&'r PathAccess>, ServiceError> {
+        if rights.paths.reads_all() {
+            return Ok(None);
+        }
+        if let RecordId::Acceptance(id) = record
+            && self.store.get(id)?.body().target == TargetName::POLICY.id()
+        {
+            return Ok(None);
+        }
+        Ok(Some(&rights.paths))
+    }
+
+    /// What `query` names, a directory or file of a snapshot the caller
+    /// sees, the snapshot, and what it withholds from the caller.
+    fn browse(
+        &self,
+        caller: &Caller,
+        query: &BrowseQuery,
+    ) -> Result<(Option<PathAccess>, TreeId, TreeEntry), ServiceError> {
+        let rights = self.rights(caller)?;
+        let record = match &query.at {
+            At::Target(target) => {
+                let head = self
+                    .store
+                    .head(target)?
+                    .ok_or_else(|| ServiceError::UnknownTarget(target.clone()))?;
+                RecordId::Acceptance(head.acceptance)
+            }
+            &At::Record(record) => record,
+        };
+        let snapshot = self.snapshot_of(&mut Reader::new(&self.store, &rights), record)?;
+        let withheld = self.filter(&rights, record)?.cloned();
+        let entry = Snapshots::new(&self.store)
+            .entry_at(snapshot, &query.path)?
+            .ok_or_else(|| ServiceError::NoSuchPath(query.path.clone()))?;
+        if withheld
+            .as_ref()
+            .is_some_and(|access| !access.reads_entry(&query.path, &entry))
+        {
+            return Err(Forbidden::Read(query.path.clone()).into());
+        }
+        Ok((withheld, snapshot, entry))
+    }
+
+    /// Lists a directory of a snapshot: of a target's tip, or of a revision
+    /// or an acceptance the caller sees. Entries whose content is withheld
+    /// from the caller keep their place, marked.
     ///
     /// # Errors
     ///
-    /// Fails if the index cannot be read.
-    pub fn inventory(
-        &self,
-        _caller: &Caller,
-        request: &InventoryRequest,
-    ) -> Result<Vec<Inventory>, ServiceError> {
-        self.annotations(|annotations| {
-            let index = annotations.index();
-            Ok(request
-                .changes
-                .iter()
-                .map(|&change| {
-                    let revisions = index.revisions(change).to_vec();
-                    let mut subjects: Vec<_> =
-                        revisions.iter().copied().map(RecordId::Revision).collect();
-                    let mut statements = Vec::new();
-                    while let Some(subject) = subjects.pop() {
-                        for &statement in index.statements(subject) {
-                            statements.push(statement);
-                            subjects.push(RecordId::Statement(statement));
-                        }
-                    }
-                    Inventory {
-                        change,
-                        heads: index.heads(change),
-                        revisions,
-                        statements,
-                    }
-                })
-                .collect())
+    /// Fails if the target or record doesn't exist or isn't seen, the path
+    /// isn't a directory, the caller reads nothing under it, or a tree
+    /// cannot be read.
+    pub fn tree(&self, caller: &Caller, query: &BrowseQuery) -> Result<Listing, ServiceError> {
+        let (withheld, snapshot, entry) = self.browse(caller, query)?;
+        let tree = entry
+            .subtree()
+            .ok_or_else(|| ServiceError::NotADirectory(query.path.clone()))?;
+        let entries = self
+            .store
+            .get(tree)?
+            .iter()
+            .map(|(name, &entry)| Listed {
+                name: name.clone(),
+                kind: entry.kind,
+                id: entry.id,
+                withheld: withheld
+                    .as_ref()
+                    .is_some_and(|access| !access.reads_entry(&query.path.join(name), &entry)),
+            })
+            .collect();
+        Ok(Listing {
+            snapshot,
+            path: query.path.clone(),
+            entries,
         })
     }
 
-    /// Writes the objects of `pack`: snapshots, revisions and statements.
-    /// Each must be well formed, and the repository must have, or the
-    /// pack hold, everything it needs: a tree's entries, a revision's
-    /// snapshot, description, base and dependencies, a statement's subject
-    /// and the statements it supersedes or promotes. So the repository
-    /// never holds a record it cannot use. Acceptances are
-    /// refused: only a target's authority writes them, by landing. The
+    /// The content of a file of a snapshot, as [`OriginService::tree`]
+    /// finds it, which the caller must read.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`OriginService::tree`], or if the path isn't a file.
+    pub fn file(&self, caller: &Caller, query: &BrowseQuery) -> Result<Vec<u8>, ServiceError> {
+        let (_, _, entry) = self.browse(caller, query)?;
+        if entry.kind.is_tree() {
+            return Err(ServiceError::NotAFile(query.path.clone()));
+        }
+        Ok(self
+            .store
+            .try_blob(entry.id)?
+            .ok_or(StoreError::NotFound(entry.id))?)
+    }
+
+    /// What the repository holds of each change that the caller sees: its
+    /// revisions and heads, and the statements about them, by id. A change
+    /// it never heard of has none.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the index or a record cannot be read.
+    pub fn inventory(
+        &self,
+        caller: &Caller,
+        request: &InventoryRequest,
+    ) -> Result<Vec<Inventory>, ServiceError> {
+        let rights = self.rights(caller)?;
+        let mut reader = Reader::new(&self.store, &rights);
+        self.annotations(|annotations| {
+            let index = annotations.index();
+            let mut inventories = Vec::new();
+            for &change in &request.changes {
+                let mut revisions = Vec::new();
+                for &id in index.revisions(change) {
+                    if reader.sees(RecordId::Revision(id))? {
+                        revisions.push(id);
+                    }
+                }
+                let mut heads = index.heads(change);
+                heads.retain(|head| revisions.contains(head));
+                let mut subjects: Vec<_> =
+                    revisions.iter().copied().map(RecordId::Revision).collect();
+                let mut statements = Vec::new();
+                while let Some(subject) = subjects.pop() {
+                    for &statement in index.statements(subject) {
+                        statements.push(statement);
+                        subjects.push(RecordId::Statement(statement));
+                    }
+                }
+                inventories.push(Inventory {
+                    change,
+                    heads,
+                    revisions,
+                    statements,
+                });
+            }
+            Ok(inventories)
+        })
+    }
+
+    /// Writes the objects of `pack`: snapshots, attachments, revisions and
+    /// statements. Each must be well formed, and the repository must have,
+    /// or the pack hold, everything it needs: a tree's entries, a
+    /// revision's snapshot, description, base and dependencies, a
+    /// statement's subject and the statements it supersedes or promotes.
+    /// So the repository never holds a record it cannot use. Descriptions
+    /// and payloads must be attachments. Acceptances are refused: only a
+    /// target's authority writes them, by landing. The records a caller
+    /// other than the owner puts must be theirs, and may only change what
+    /// they write, as [`permissions`](crate::permissions) explains. The
     /// blobs and trees are durable before the records that refer to them,
     /// and promotions come last, each checked against its original by
     /// [`Store::claim`], once the original and both subjects are stored.
@@ -284,68 +522,95 @@ impl OriginService {
     ///
     /// # Errors
     ///
-    /// Fails if an object is malformed, an acceptance, or needs an object
-    /// neither the pack nor the repository has, if a promotion doesn't
+    /// Fails if the caller is anonymous, an object is malformed, an
+    /// acceptance, or needs an object neither the pack nor the repository
+    /// has, if the caller may not put a record, if a promotion doesn't
     /// match its original, which leaves the other records stored, or if
     /// the objects cannot be written.
-    pub fn put_records(&self, _caller: &Caller, pack: Pack) -> Result<Stored, ServiceError> {
+    pub fn put_records(&self, caller: &Caller, pack: Pack) -> Result<Stored, ServiceError> {
+        if *caller == Caller::Anonymous {
+            return Err(Forbidden::Anonymous.into());
+        }
         // Objects this finds stored stay until what refers to them is.
         let _held = self.store.hold_objects()?;
-        let held: HashSet<ObjectId> = pack.objects.iter().map(EncodedObject::id).collect();
+        let held: HashMap<ObjectId, Option<ObjectKind>> = pack
+            .objects
+            .iter()
+            .map(|object| (object.id(), object.kind().ok()))
+            .collect();
+        let kind = |id: ObjectId| -> Result<Option<ObjectKind>, StoreError> {
+            match held.get(&id) {
+                Some(&kind) => Ok(kind),
+                None => Ok(self
+                    .store
+                    .try_read(id)?
+                    .and_then(|object| object.kind().ok())),
+            }
+        };
         // Makes what the repository has of the dependencies durable before
         // anything refers to them: their writers may not have yet.
         let dependencies = self.store.batch();
         let mut snapshots = Vec::new();
         let mut records = Vec::new();
         let mut promotions = Vec::new();
+        let mut decoded = Vec::new();
         let mut changes = HashSet::new();
         for object in pack.objects {
             let id = object.id();
-            let decoded = object
+            let record = object
                 .decode()
                 .map_err(|source| ServiceError::Malformed { id, source })?;
-            for needed in Dependencies::of(&decoded).all() {
-                if !held.contains(&needed) && !dependencies.depend(needed)? {
+            for needed in Dependencies::of(&record).all() {
+                if !held.contains_key(&needed) && !dependencies.depend(needed)? {
                     return Err(ServiceError::Missing { id, needed });
                 }
             }
-            match decoded {
+            Self::check_attachment(id, &record, kind)?;
+            match record {
                 Object::Acceptance(_) => return Err(ServiceError::Acceptance(id.into())),
-                Object::Blob(_) | Object::Tree(_) => snapshots.push(object),
-                Object::Revision(revision) => {
+                Object::Blob(_) | Object::Tree(_) | Object::Attachment(_) => snapshots.push(object),
+                Object::Revision(ref revision) => {
                     if !revision.predecessors.is_empty() {
                         changes.insert(revision.change);
                     }
                     records.push(object);
+                    decoded.push((id, record));
                 }
-                Object::Statement(statement) if statement.promoted_from.is_some() => {
-                    promotions.push((object, statement));
+                Object::Statement(ref statement) if statement.promoted_from.is_some() => {
+                    promotions.push((object, statement.clone()));
+                    decoded.push((id, record));
                 }
-                Object::Statement(_) => records.push(object),
+                Object::Statement(_) => {
+                    records.push(object);
+                    decoded.push((id, record));
+                }
             }
         }
         dependencies.commit()?;
         let mut new = 0;
-        for layer in [snapshots, records] {
-            if !layer.is_empty() {
-                new += self.store.write_all(&layer)?;
+        if !snapshots.is_empty() {
+            new += self.store.write_all(&snapshots)?;
+        }
+        if let Caller::Principal { principal, .. } = caller {
+            let rights = self.rights(caller)?;
+            let supplied: HashSet<ObjectId> = held.keys().copied().collect();
+            let writer = Writer::new(&self.store, principal, &rights, &supplied);
+            for (id, record) in &decoded {
+                // Re-putting a record changes nothing.
+                if self.store.contains(*id)? {
+                    continue;
+                }
+                match record {
+                    Object::Revision(revision) => writer.revision((*id).into(), revision)?,
+                    Object::Statement(statement) => writer.statement(statement)?,
+                    _ => {}
+                }
             }
         }
-        // An original is never a promotion, so it's stored by now.
-        let mut checked = Vec::new();
-        for (object, statement) in promotions {
-            let id = object.id().into();
-            self.store
-                .claim(id, statement)?
-                .map_err(|invalid| ServiceError::Statement {
-                    id,
-                    source: Box::new(invalid.into()),
-                })?;
-            checked.push(object);
+        if !records.is_empty() {
+            new += self.store.write_all(&records)?;
         }
-        if !checked.is_empty() {
-            new += self.store.write_all(&checked)?;
-        }
+        new += self.put_promotions(promotions)?;
         if !changes.is_empty() {
             self.annotations(|annotations| {
                 for &change in &changes {
@@ -358,35 +623,95 @@ impl OriginService {
         Ok(Stored { new: new as u64 })
     }
 
+    /// Checks that the description or payload `record`, `id`, refers to,
+    /// if any, is an attachment, as far as `kind` knows the object.
+    fn check_attachment(
+        id: ObjectId,
+        record: &Object,
+        kind: impl Fn(ObjectId) -> Result<Option<ObjectKind>, StoreError>,
+    ) -> Result<(), ServiceError> {
+        let attachment = match record {
+            Object::Revision(revision) => Some(revision.description),
+            Object::Statement(statement) => statement.payload,
+            _ => None,
+        };
+        if let Some(attachment) = attachment
+            && kind(attachment.into())?.is_some_and(|kind| kind != ObjectKind::Attachment)
+        {
+            return Err(ServiceError::NotAnAttachment {
+                id,
+                attachment: attachment.into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Writes the `promotions` [`OriginService::put_records`] puts, once
+    /// [`Store::claim`] accepts each, returning how many were new. Their
+    /// originals are never promotions, so they're stored by now.
+    fn put_promotions(
+        &self,
+        promotions: Vec<(EncodedObject, Statement)>,
+    ) -> Result<usize, ServiceError> {
+        let mut checked = Vec::new();
+        for (object, statement) in promotions {
+            let id = object.id().into();
+            self.store
+                .claim(id, statement)?
+                .map_err(|invalid| ServiceError::Statement {
+                    id,
+                    source: Box::new(invalid.into()),
+                })?;
+            checked.push(object);
+        }
+        if checked.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.store.write_all(&checked)?)
+    }
+
     /// The statements about `subject`, in the order the repository received
-    /// them.
+    /// them: none if the caller doesn't see it.
     ///
     /// # Errors
     ///
     /// Fails if the index or a statement cannot be read.
     pub fn statements(
         &self,
-        _caller: &Caller,
+        caller: &Caller,
         subject: RecordId,
     ) -> Result<Vec<Annotation>, ServiceError> {
+        let rights = self.rights(caller)?;
+        if !Reader::new(&self.store, &rights).sees(subject)? {
+            return Ok(Vec::new());
+        }
         self.annotations(|annotations| Ok(annotations.about(subject)?))
     }
 
-    /// The revisions of `change`, and its heads.
+    /// The revisions of `change` the caller sees, and its heads among them.
     ///
     /// # Errors
     ///
-    /// Fails if the repository has no revision of the change, or cannot
-    /// read one.
-    pub fn revisions(&self, _caller: &Caller, change: ChangeId) -> Result<Revisions, ServiceError> {
-        let (ids, heads) = self.annotations(|annotations| {
+    /// Fails if the repository has no revision of the change the caller
+    /// sees, or cannot read one.
+    pub fn revisions(&self, caller: &Caller, change: ChangeId) -> Result<Revisions, ServiceError> {
+        let rights = self.rights(caller)?;
+        let mut reader = Reader::new(&self.store, &rights);
+        let (mut ids, mut heads) = self.annotations(|annotations| {
             let index = annotations.index();
             Ok((index.revisions(change).to_vec(), index.heads(change)))
         })?;
-        if ids.is_empty() {
+        let mut seen = Vec::with_capacity(ids.len());
+        for id in ids.drain(..) {
+            if reader.sees(RecordId::Revision(id))? {
+                seen.push(id);
+            }
+        }
+        heads.retain(|head| seen.contains(head));
+        if seen.is_empty() {
             return Err(ServiceError::UnknownChange(change));
         }
-        let revisions = ids
+        let revisions = seen
             .into_iter()
             .map(|id| {
                 Ok(RevisionEntry {
@@ -452,16 +777,29 @@ impl OriginService {
     /// Lands what `request` proposes, with this node as the authority: a
     /// change with the changes below it the target doesn't have yet, or
     /// another target's tip. A change lands by default on the target its
-    /// stack is on.
+    /// stack is on. The caller must be signed in, may land on the target,
+    /// and must write every path the landing changes on it.
     ///
     /// # Errors
     ///
     /// Fails if the change or a target doesn't exist, a target was given
-    /// no target to land on, this node isn't the target's authority, the
-    /// change can't land as it is (see [`LandError`]), or the records
-    /// cannot be read or written.
-    pub fn land(&self, _caller: &Caller, request: &LandRequest) -> Result<Landings, ServiceError> {
-        let queue = Queue::new(&self.store, &self.node.key, self.node.name.clone());
+    /// no target to land on, the caller may not land there, this node isn't
+    /// the target's authority, the change can't land as it is (see
+    /// [`LandError`]), or the records cannot be read or written.
+    pub fn land(&self, caller: &Caller, request: &LandRequest) -> Result<Landings, ServiceError> {
+        if *caller == Caller::Anonymous {
+            return Err(Forbidden::Anonymous.into());
+        }
+        let rights = self.rights(caller)?;
+        let may_land = |onto: &TargetName| {
+            if rights.may_land(onto) {
+                Ok(())
+            } else {
+                Err(ServiceError::from(Forbidden::Land(onto.clone())))
+            }
+        };
+        let queue = Queue::new(&self.store, &self.node.key, self.node.name.clone())
+            .submitted_by(rights.paths.clone());
         let landed = self.annotations(|annotations| {
             let landed = match &request.proposal {
                 Proposal::Change(change) => {
@@ -469,11 +807,13 @@ impl OriginService {
                         Some(onto) => onto.clone(),
                         None => self.target_of(annotations.index(), *change)?,
                     };
+                    may_land(&onto)?;
                     let landings = queue.land_change(annotations, *change, &onto)?;
                     Landings { onto, landings }
                 }
                 Proposal::Target(source) => {
                     let onto = request.onto.clone().ok_or(ServiceError::NoTarget)?;
+                    may_land(&onto)?;
                     let landing = queue.land_target(annotations, source, &onto)?;
                     Landings {
                         onto,
@@ -505,43 +845,61 @@ impl OriginService {
         Ok(self.store.stack_target(head)?)
     }
 
-    /// Every landing that waits, on every target, and why.
+    /// Every landing that waits, on every target, and why: those about what
+    /// the caller sees.
     ///
     /// # Errors
     ///
-    /// Fails if the queues cannot be read.
-    pub fn landings(&self, _caller: &Caller) -> Result<Vec<Pending>, ServiceError> {
-        Ok(Queue::pending(&self.store)?)
+    /// Fails if the queues or a record cannot be read.
+    pub fn landings(&self, caller: &Caller) -> Result<Vec<Pending>, ServiceError> {
+        let rights = self.rights(caller)?;
+        let mut reader = Reader::new(&self.store, &rights);
+        let mut seen = Vec::new();
+        for pending in Queue::pending(&self.store)? {
+            if reader.sees(pending.subject)? {
+                seen.push(pending);
+            }
+        }
+        Ok(seen)
     }
 
     /// Creates a target at the tip of another, with this node as its
-    /// authority.
+    /// authority. The caller must be signed in, and may land on it.
     ///
     /// # Errors
     ///
-    /// Fails if the name is taken, the other target doesn't exist, the
-    /// policy wouldn't make this node the new target's authority, or the
-    /// records cannot be written.
+    /// Fails if the caller may not land on the target, the name is taken,
+    /// the other target doesn't exist, the policy wouldn't make this node
+    /// the new target's authority, or the records cannot be written.
     pub fn create_target(
         &self,
-        _caller: &Caller,
+        caller: &Caller,
         request: &NewTarget,
     ) -> Result<Head, ServiceError> {
+        if *caller == Caller::Anonymous {
+            return Err(Forbidden::Anonymous.into());
+        }
+        if !self.rights(caller)?.may_land(&request.name) {
+            return Err(Forbidden::Land(request.name.clone()).into());
+        }
         let queue = Queue::new(&self.store, &self.node.key, self.node.name.clone());
         let head = queue.create_target(&request.name, &request.from)?;
         self.wakeup.notify();
         Ok(head)
     }
 
-    /// The events after the query's cursor that pass its filter, waiting
-    /// up to its `wait`, at most [`OriginService::MAX_WAIT`], for some to
-    /// come. Without a cursor, only events from now on come.
+    /// The events after the query's cursor that pass its filter, about what
+    /// the caller sees, waiting up to its `wait`, at most
+    /// [`OriginService::MAX_WAIT`], for some to come. Without a cursor, only
+    /// events from now on come.
     ///
     /// # Errors
     ///
     /// Fails if the op log no longer keeps the events after the cursor, or
     /// it or a record cannot be read.
-    pub fn events(&self, _caller: &Caller, query: &EventsQuery) -> Result<Page, ServiceError> {
+    pub fn events(&self, caller: &Caller, query: &EventsQuery) -> Result<Page, ServiceError> {
+        let rights = self.rights(caller)?;
+        let mut reader = Reader::new(&self.store, &rights);
         let events = Events::new(&self.store).waking_on(&self.wakeup);
         let cursor = match query.cursor {
             Some(cursor) => cursor,
@@ -556,7 +914,8 @@ impl OriginService {
             .unwrap_or(Self::MAX_EVENTS)
             .min(Self::MAX_EVENTS) as usize;
         let wait = query.wait.map_or(Duration::ZERO, |wait| wait.0);
-        Ok(events.wait(cursor, &filter, limit, wait.min(Self::MAX_WAIT))?)
+        let accept = |event: &EventKind| Ok(filter.matches(event) && reader.sees_event(event)?);
+        Ok(events.wait(cursor, accept, limit, wait.min(Self::MAX_WAIT))?)
     }
 }
 
@@ -577,7 +936,7 @@ pub(crate) struct Dependencies {
 impl Dependencies {
     pub(crate) fn of(object: &Object) -> Self {
         match object {
-            Object::Blob(_) | Object::Acceptance(_) => Self::default(),
+            Object::Blob(_) | Object::Attachment(_) | Object::Acceptance(_) => Self::default(),
             Object::Tree(tree) => Self {
                 records: Vec::new(),
                 content: tree.iter().map(|(_, entry)| entry.id).collect(),
@@ -638,9 +997,36 @@ pub enum ServiceError {
     /// The repository has no such snapshot.
     #[error("snapshot {0} not found")]
     UnknownSnapshot(TreeId),
-    /// A blob or a tree was fetched as a record.
+    /// A blob, a tree or an attachment was fetched as a record.
     #[error("{0} is not a record: fetch snapshots by walking them")]
     NotARecord(ObjectId),
+    /// The repository has no such record, or the caller doesn't see it.
+    #[error("record {0} not found")]
+    UnknownRecord(RecordId),
+    /// A snapshot was asked of a record that has none.
+    #[error("{0} has no snapshot: name a revision or an acceptance")]
+    NotASnapshot(RecordId),
+    /// A snapshot has nothing at a path.
+    #[error("nothing is at `{0}`")]
+    NoSuchPath(RepoPath),
+    /// A path listed is a file.
+    #[error("`{0}` is not a directory")]
+    NotADirectory(RepoPath),
+    /// A path read is a directory.
+    #[error("`{0}` is not a file")]
+    NotAFile(RepoPath),
+    /// A record put names an object that isn't an attachment as its
+    /// description or payload.
+    #[error("record {id} names {attachment} as its attachment, which is not one")]
+    NotAnAttachment {
+        /// The record.
+        id: ObjectId,
+        /// What it names.
+        attachment: ObjectId,
+    },
+    /// The caller may not do this.
+    #[error(transparent)]
+    Forbidden(#[from] Forbidden),
     /// A target was proposed for landing without a target to land on.
     #[error("landing a target needs a target to land on")]
     NoTarget,
@@ -685,6 +1071,15 @@ pub enum ServiceError {
     Store(#[from] StoreError),
 }
 
+impl From<PutError> for ServiceError {
+    fn from(error: PutError) -> Self {
+        match error {
+            PutError::Forbidden(error) => Self::Forbidden(error),
+            PutError::Store(error) => Self::Store(error),
+        }
+    }
+}
+
 impl ServiceError {
     /// What kind of failure it is, for clients to tell apart.
     #[must_use]
@@ -693,9 +1088,15 @@ impl ServiceError {
             Self::UnknownRepository(_)
             | Self::UnknownChange(_)
             | Self::UnknownTarget(_)
-            | Self::UnknownSnapshot(_) => ErrorCode::NotFound,
+            | Self::UnknownSnapshot(_)
+            | Self::UnknownRecord(_)
+            | Self::NoSuchPath(_) => ErrorCode::NotFound,
             Self::NoTarget
             | Self::NotARecord(_)
+            | Self::NotASnapshot(_)
+            | Self::NotADirectory(_)
+            | Self::NotAFile(_)
+            | Self::NotAnAttachment { .. }
             | Self::Malformed { .. }
             | Self::Acceptance(_)
             | Self::Missing { .. } => ErrorCode::BadRequest,
@@ -703,6 +1104,7 @@ impl ServiceError {
                 AnnotateError::Store(error) => Self::store_code(error),
                 _ => ErrorCode::BadRequest,
             },
+            Self::Forbidden(_) => ErrorCode::Forbidden,
             Self::Land(error) => match error {
                 LandError::UnknownTarget(_) | LandError::UnknownChange(_) => ErrorCode::NotFound,
                 LandError::TargetExists(_)
@@ -714,6 +1116,7 @@ impl ServiceError {
                 | LandError::Abandoned(_)
                 | LandError::Unresolved { .. }
                 | LandError::InvalidPolicy(_) => ErrorCode::Conflict,
+                LandError::Forbidden(_) => ErrorCode::Forbidden,
                 LandError::Store(error) => Self::store_code(error),
                 LandError::Policy(_) | LandError::Annotate(_) => ErrorCode::Internal,
             },

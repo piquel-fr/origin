@@ -235,13 +235,13 @@ impl Workspace {
             .store
             .head(target)?
             .ok_or_else(|| WorkspaceError::UnknownTarget(target.clone()))?;
+        self.need(&[RecordId::Acceptance(tip.acceptance)])?;
         let state = self.store.get(tip.acceptance)?.body().state;
-        self.need(&[state])?;
         let merge = self.store.merge(Some(base), files, state)?;
         if !merge.conflicts.is_empty() {
             return Ok(merge.conflicts);
         }
-        let description = EncodedObject::blob(description.as_bytes());
+        let description = EncodedObject::attachment(description.as_bytes());
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
@@ -255,7 +255,7 @@ impl Workspace {
         let mut first = merge.trees;
         first.push(description);
         self.write(&[first, vec![encoded.clone()]])?;
-        self.switch_to(files, encoded.id().into(), revision.snapshot, Why::Command)?;
+        self.switch_to(files, encoded.id().into(), Why::Command)?;
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
         Ok(Vec::new())
@@ -326,12 +326,7 @@ impl Workspace {
                 && *rebased != working_copy.id
             {
                 let rebased = *rebased;
-                self.switch_to(
-                    files,
-                    rebased,
-                    self.store.get(rebased)?.snapshot,
-                    Why::Command,
-                )?;
+                self.switch_to(files, rebased, Why::Command)?;
                 println!(
                     "Working copy: {}",
                     self.headline(&self.store.get(rebased)?)?
@@ -361,8 +356,8 @@ impl Workspace {
             .store
             .head(onto)?
             .ok_or_else(|| WorkspaceError::UnknownTarget(onto.clone()))?;
+        self.need(&[RecordId::Acceptance(tip.acceptance)])?;
         let state = self.store.get(tip.acceptance)?.body().state;
-        self.need(&[state])?;
         let current = &working_copy.revision;
         let merge = self.store.merge(Some(base), current.snapshot, state)?;
         if !merge.conflicts.is_empty() {
@@ -381,12 +376,7 @@ impl Workspace {
         };
         let encoded = revision.encode();
         self.write(&[merge.trees, vec![encoded.clone()]])?;
-        self.switch_to(
-            current.snapshot,
-            encoded.id().into(),
-            revision.snapshot,
-            Why::Command,
-        )?;
+        self.switch_to(current.snapshot, encoded.id().into(), Why::Command)?;
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
         Ok(())

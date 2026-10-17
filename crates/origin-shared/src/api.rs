@@ -7,12 +7,14 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use crate::access::Capability;
 use crate::landing::{Landing, Proposal};
 use crate::policy::{KindPattern, Requirement};
 use crate::text::Period;
 use crate::{
-    Acceptance, AcceptanceId, ChangeId, Head, ObjectId, PrincipalName, RecordId, RepoPath,
-    Revision, RevisionId, Statement, StatementId, TargetName, TreeId,
+    Acceptance, AcceptanceId, ChangeId, EntryKind, EntryName, Head, ObjectId, Principal,
+    PrincipalName, RecordId, RepoPath, Revision, RevisionId, Statement, StatementId, TargetName,
+    TreeId,
 };
 
 /// The name of a repository on a server: ASCII letters, digits, `.`, `_`
@@ -96,22 +98,28 @@ pub struct RepoSummary {
 }
 
 /// Asks for records by id: revisions, statements and acceptances. Each
-/// comes with the blob it carries, if the repository has it: a revision's
-/// description, a statement's payload. Snapshots are fetched with
-/// [`FetchSnapshot`] instead.
+/// comes with the attachment it carries, if the repository has it: a
+/// revision's description, a statement's payload. Snapshots are fetched
+/// with [`FetchSnapshot`] instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct FetchRecords {
-    /// The records, returned in this order, each followed by its blob.
+    /// The records, returned in this order, each followed by its
+    /// attachment. Those the caller may not read are left out.
     pub ids: Vec<ObjectId>,
 }
 
 /// Asks for the objects of a snapshot that the caller lacks: its trees and
 /// blobs, walked from its root. This is the only way blobs and trees leave
-/// a repository, so what each caller may read can be checked by path.
+/// a repository, so what each caller may read is checked by path: the
+/// content of paths they may not read is withheld, though it keeps its
+/// place in the trees.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct FetchSnapshot {
-    /// The snapshot.
-    pub snapshot: TreeId,
+    /// The record whose snapshot it is: a revision or an acceptance. Only a
+    /// record's snapshot is walked, never a tree within one, whose paths
+    /// would be read as others.
+    #[schema(value_type = String)]
+    pub of: RecordId,
     /// Snapshots the caller holds whole. Whatever one of them holds at the
     /// same path is skipped, so only what changed since comes. Those the
     /// repository doesn't have are ignored.
@@ -326,6 +334,104 @@ where
     }
 }
 
+/// Asks a server for a token with a narrower scope, for an agent or a CI
+/// runner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TokenRequest {
+    /// What it may do: a part of what the caller may do.
+    pub scope: Vec<Capability>,
+    /// How long it lasts, such as `1h`.
+    #[schema(value_type = String)]
+    pub ttl: Period,
+}
+
+/// A token a server issued.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct IssuedToken {
+    /// The token, to send as `Authorization: Bearer <token>`.
+    pub token: String,
+    /// Who it acts for.
+    pub principal: Principal,
+    /// When it expires, in seconds since the Unix epoch.
+    pub expires: u64,
+}
+
+/// A snapshot to browse: a target's tip, `main`, or a record's,
+/// `revision:<id>` or `acceptance:<id>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum At {
+    /// The tip of a target.
+    Target(TargetName),
+    /// The snapshot of a revision or an acceptance.
+    Record(RecordId),
+}
+
+impl FromStr for At {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if input.contains(':') {
+            input
+                .parse()
+                .map(Self::Record)
+                .map_err(|error: crate::ParseIdError| error.to_string())
+        } else {
+            input
+                .parse()
+                .map(Self::Target)
+                .map_err(|error: crate::InvalidName| error.to_string())
+        }
+    }
+}
+
+impl fmt::Display for At {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Target(target) => target.fmt(f),
+            Self::Record(record) => record.fmt(f),
+        }
+    }
+}
+
+/// Asks for a directory or a file of a snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BrowseQuery {
+    /// The snapshot: a target, such as `main`, or `revision:<id>` or
+    /// `acceptance:<id>`.
+    #[param(value_type = String)]
+    pub at: At,
+    /// The directory or file: the root by default.
+    #[serde(default)]
+    #[param(value_type = Option<String>)]
+    pub path: RepoPath,
+}
+
+/// A directory of a snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Listing {
+    /// The snapshot's root tree.
+    pub snapshot: TreeId,
+    /// The directory.
+    pub path: RepoPath,
+    /// Its entries, sorted by name.
+    pub entries: Vec<Listed>,
+}
+
+/// An entry of a [`Listing`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Listed {
+    /// Its name.
+    pub name: EntryName,
+    /// A file, an executable, a symlink or a directory.
+    pub kind: EntryKind,
+    /// Its object.
+    pub id: ObjectId,
+    /// Whether its content is withheld from the caller: it keeps its
+    /// place, but can't be read.
+    pub withheld: bool,
+}
+
 /// What went wrong with a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ApiError {
@@ -357,6 +463,10 @@ pub enum ErrorCode {
     Conflict,
     /// The event cursor is older than anything the server still keeps.
     Expired,
+    /// The credentials are invalid or expired.
+    Unauthorized,
+    /// The caller may not do this.
+    Forbidden,
     /// The server failed.
     Internal,
 }

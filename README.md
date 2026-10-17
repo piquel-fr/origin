@@ -45,6 +45,8 @@ origin remote [<url>]               # show or set the remote: http://host:port/<
 origin push [<change>...]           # share changes and the ones below them; lands nothing
 origin fetch [--target <t>] [--change <id>]  # new acceptances, and the records of known changes
 origin pull                         # fetch, then move the working copy onto its target's tip
+origin whoami | permissions         # who the remote thinks you are, and what you may do there
+origin token issue --scope "write src" [--ttl 1h]  # a short-lived token for an agent
 ```
 
 Landing rebases a change onto the target's tip, file by file, checks the
@@ -88,7 +90,41 @@ Changes are named by a unique prefix of their id, or `@` for the working
 copy's. A revision is `@`, a change (for its head), or a unique prefix of
 the revision's id. Your name and node key live in `~/.config/origin` (or
 `$ORIGIN_CONFIG_DIR`): set `user = "<name>"` in its `config.toml` if `$USER`
-isn't the name you want. See [the design](docs/design.md) for the model.
+isn't the name you want, and the token to send each server under
+`[tokens]`, by its URL (`"http://127.0.0.1:7878" = "<token>"`), or in
+`$ORIGIN_TOKEN`. See [the design](docs/design.md) for the model.
+
+## Permissions
+
+What each user may do lives in `policy.toml`, so changing it is a landing
+on `policy`, which only `admin` may make:
+
+```toml
+[grants]                       # capabilities: annotate, land, admin
+"group:maintainers" = ["admin", "land *", "annotate review"]
+"group:runners"     = ["annotate ci.*"]
+
+[[paths]]                      # path access: none, read or write
+path   = "secrets"
+grants = { all = "none", "group:maintainers" = "write" }
+```
+
+Under a path, the most specific rule that mentions you decides, and paths
+no rule mentions you for are writable. Without `[grants]`, everyone lands
+on every target but `policy` and issues every kind of statement. Content
+you may not read never reaches your clone: those files are missing from
+the working copy and stay as they were in your revisions, and fetching
+restores them once you may read them. Revisions that only change what you
+can't read, and the statements about them, are hidden from you. You may
+only push revisions that change paths you write, and land what changes
+only paths you write.
+
+`origin token issue --scope <capability>... --ttl <period>` asks the remote
+for a token acting for you with a narrower scope, such as `write src`,
+`read /`, `annotate ci.*`, `land main` or `admin`; the server verifies it
+without storing it. A server's operator signs one for any principal with
+`origin token issue --config origin-server.toml --as user:agent-1 --scope
+...`. A token never grants more than its principal's rights.
 
 `converge` merges the files of a change's heads. A text file two heads
 changed holds both versions between conflict markers (`<<<<<<<`, `=======`,
@@ -116,18 +152,24 @@ key = "node.key"         # its secret key, created if missing
 
 [repos]
 demo = "repos/demo"
+
+[tokens]                 # static tokens, by principal
+"user:alice" = "a long random secret"
 ```
 
 The HTTP API, under `/api/v1`, puts records in batches and fetches them by
 id, walks snapshots for the trees and blobs a client lacks (the only way
 files leave a server), compares the records of changes, lists statements,
-revisions, targets and their logs, lands changes and targets, and streams
+revisions, targets and their logs, lists the directories and reads the
+files of a target's tip or any revision, without its history, issues
+scoped tokens, lands changes and targets, and streams
 events by long-poll: `GET
 /api/v1/repos/<repo>/events?cursor=<n>&wait=30s` answers as soon as there
 are events after the cursor, with a JSON batch and the next cursor.
 [`docs/openapi.json`](docs/openapi.json) describes it, and
-[`origin-client`](crates/origin-client) is its Rust SDK. Nothing
-authenticates callers yet.
+[`origin-client`](crates/origin-client) is its Rust SDK. Callers send
+`Authorization: Bearer <token>`; without one, they are anonymous, and only
+read what everyone may.
 
 ## Development
 

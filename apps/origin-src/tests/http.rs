@@ -1,39 +1,52 @@
 //! The HTTP API, driven through the SDK against a real server: every SDK
 //! method, over the server's own repositories.
 
+use std::collections::BTreeMap;
 use std::slice;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use origin_client::{Client, Error, Repo};
 use origin_shared::api::{
-    ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, InventoryRequest, LandRequest, List,
-    LogQuery, NewTarget, RepoName, StatementsQuery,
+    BrowseQuery, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, InventoryRequest,
+    LandRequest, List, LogQuery, NewTarget, RepoName, StatementsQuery, TokenRequest,
 };
 use origin_shared::event::EventKind;
 use origin_shared::landing::{Blocked, Landing, Proposal};
 use origin_shared::pack::Pack;
 use origin_shared::{
-    Base, BlobId, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind, NodeKey,
-    Period, Record, RecordId, RepoPath, Revision, RevisionId, Source, Statement, TargetName, Tree,
-    TreeEntry, TreeId, Verdict,
+    AttachmentId, Base, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind,
+    NodeKey, Period, Record, RecordId, RepoPath, Revision, RevisionId, Source, Statement,
+    TargetName, Tree, TreeEntry, TreeId, Verdict,
 };
+use origin_src::auth::{Credentials, StaticTokens};
 use origin_src::http::Api;
 use origin_src::policy::Policy;
 use origin_src::server::Repositories;
 use origin_src::service::{Node, OriginService};
 
 /// A server hosting `demo`, whose policy requires nothing, and `strict`,
-/// whose `main` requires a passing `ci.test` from `user:ci`. The server's
-/// node, `hosted`, orders both.
+/// whose `main` requires a passing `ci.test` from `user:ci`, and where
+/// only `user:ci` issues `ci.*` statements, `secrets` is withheld from
+/// everyone but `user:ada`, and only she lands. The server's node,
+/// `hosted`, orders both. `user:ada` and `user:ci` have static tokens.
 struct Server {
     _dir: tempfile::TempDir,
+    /// The server's base URL.
+    base: String,
     client: Client,
+    /// `demo` and `strict`, as `user:ada`.
     demo: Repo,
     strict: Repo,
+    /// `strict`, as `user:ci`.
+    ci: Repo,
+    /// `strict`, anonymously.
+    anonymous: Repo,
 }
 
 impl Server {
+    const TOKENS: &str = "\"user:ada\" = \"ada-token\"\n\"user:ci\" = \"ci-token\"\n";
+
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let node = Node {
@@ -44,10 +57,15 @@ impl Server {
         let strict = format!(
             "[nodes]\nhosted = \"{}\"\n[targets.policy]\nauthority = \"node:hosted\"\n\
              [targets.main]\nauthority = \"node:hosted\"\n\
-             require = [{{ kind = \"ci.test\", verdict = \"pass\", issuer = \"user:ci\" }}]\n",
+             require = [{{ kind = \"ci.test\", verdict = \"pass\", issuer = \"user:ci\" }}]\n\
+             [grants]\n\"user:ada\" = [\"land *\", \"annotate review\"]\n\
+             \"user:ci\" = [\"annotate ci.*\"]\n\
+             [[paths]]\npath = \"/\"\ngrants = {{ all = \"read\", \"user:ada\" = \"write\" }}\n\
+             [[paths]]\npath = \"secrets\"\ngrants = {{ all = \"none\", \"user:ada\" = \"write\" }}\n",
             node.key.public()
         );
-        let mut repositories = Repositories::default();
+        let tokens: StaticTokens = toml::from_str(Self::TOKENS).unwrap();
+        let mut repositories = Repositories::new(Credentials::new(node.clone(), Box::new(tokens)));
         for (name, policy) in [("demo", open), ("strict", strict)] {
             let service =
                 OriginService::create(dir.path().join(name), node.clone(), &policy).unwrap();
@@ -57,11 +75,16 @@ impl Server {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, Api::router(repositories)).await });
-        let client = Client::new(&format!("http://{address}"));
+        let anonymous = Client::new(&format!("http://{address}"));
+        let client = anonymous.clone().with_token("ada-token");
+        let ci = anonymous.clone().with_token("ci-token");
         Self {
             _dir: dir,
+            base: format!("http://{address}"),
             demo: client.repo("demo".parse().unwrap()),
             strict: client.repo("strict".parse().unwrap()),
+            ci: ci.repo("strict".parse().unwrap()),
+            anonymous: anonymous.repo("strict".parse().unwrap()),
             client,
         }
     }
@@ -97,20 +120,71 @@ impl Made {
             })
             .collect();
         let tree = tree.encode();
-        let description = EncodedObject::blob(b"A change");
+        let description = EncodedObject::attachment(b"A change");
         let revision = Revision {
             change,
             predecessors,
             base,
             deps: Vec::new(),
             snapshot: tree.id().into(),
-            description: BlobId::from(description.id()),
+            description: AttachmentId::from(description.id()),
             author: "user:ada".parse().unwrap(),
         }
         .encode();
         let id = revision.id().into();
         objects.extend([tree, description, revision]);
         Self { id, objects }
+    }
+
+    /// A revision whose files may be in directories, such as
+    /// `src/lib.rs`.
+    fn nested(change: ChangeId, base: Base, files: &[(&str, &str)]) -> Self {
+        let mut objects = Vec::new();
+        let tree = Self::tree(files, &mut objects);
+        let description = EncodedObject::attachment(b"A change");
+        let revision = Revision {
+            change,
+            predecessors: Vec::new(),
+            base,
+            deps: Vec::new(),
+            snapshot: tree,
+            description: description.id().into(),
+            author: "user:ada".parse().unwrap(),
+        }
+        .encode();
+        let id = revision.id().into();
+        objects.extend([description, revision]);
+        Self { id, objects }
+    }
+
+    /// The tree of `files`, pushing its objects, children first.
+    fn tree(files: &[(&str, &str)], objects: &mut Vec<EncodedObject>) -> TreeId {
+        let mut dirs: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+        let mut tree = Tree::default();
+        for &(path, content) in files {
+            if let Some((dir, rest)) = path.split_once('/') {
+                dirs.entry(dir).or_default().push((rest, content));
+                continue;
+            }
+            let blob = EncodedObject::blob(content.as_bytes());
+            let entry = TreeEntry {
+                kind: EntryKind::File,
+                id: blob.id(),
+            };
+            tree.insert(EntryName::new(path).unwrap(), entry);
+            objects.push(blob);
+        }
+        for (dir, files) in dirs {
+            let entry = TreeEntry {
+                kind: EntryKind::Tree,
+                id: Self::tree(&files, objects).into(),
+            };
+            tree.insert(EntryName::new(dir).unwrap(), entry);
+        }
+        let encoded = tree.encode();
+        let id = encoded.id().into();
+        objects.push(encoded);
+        id
     }
 
     fn pack(&self) -> Pack {
@@ -130,12 +204,12 @@ async fn main_tip(repo: &Repo) -> Base {
     Base::Acceptance(main.head.acceptance)
 }
 
-fn ci_test(subject: RevisionId) -> EncodedObject {
+fn ci_test(subject: RevisionId, issuer: &str) -> EncodedObject {
     Statement {
         subject: RecordId::Revision(subject),
         kind: Kind::new("ci.test").unwrap(),
         verdict: Some(Verdict::Pass),
-        issuer: "user:ci".parse().unwrap(),
+        issuer: issuer.parse().unwrap(),
         inputs: None,
         payload: None,
         supersedes: None,
@@ -267,7 +341,7 @@ async fn promotions_must_match_their_original() {
         subject: RecordId::Revision(made.id),
         kind: Kind::new("ci.test").unwrap(),
         verdict: Some(Verdict::Pass),
-        issuer: "user:ci".parse().unwrap(),
+        issuer: "user:ada".parse().unwrap(),
         inputs: Some(Inputs {
             paths: vec!["a.txt".parse().unwrap()],
             definition: Digest::of(b"test"),
@@ -280,7 +354,6 @@ async fn promotions_must_match_their_original() {
     };
     let promotion = Statement {
         subject: RecordId::Revision(same.id),
-        issuer: "user:eve".parse().unwrap(),
         promoted_from: Some(original.encode().id().into()),
         ..original.clone()
     };
@@ -320,7 +393,7 @@ async fn fetches_snapshots_by_walking_them() {
     };
 
     let snapshot = |have: Vec<TreeId>, paths: &[&str]| FetchSnapshot {
-        snapshot: tree.id().into(),
+        of: RecordId::Revision(made.id),
         have,
         paths: paths
             .iter()
@@ -343,7 +416,7 @@ async fn fetches_snapshots_by_walking_them() {
     repo.put_records(&edited.pack()).await.unwrap();
     let changed = repo
         .fetch_snapshot(&FetchSnapshot {
-            snapshot: edited.objects[2].id().into(),
+            of: RecordId::Revision(edited.id),
             have: vec![tree.id().into()],
             paths: Vec::new(),
         })
@@ -354,13 +427,23 @@ async fn fetches_snapshots_by_walking_them() {
         [edited.objects[2].clone(), edited.objects[1].clone()],
         "the new tree and the edited file"
     );
-    let missing = FetchSnapshot {
-        snapshot: description.id().into(),
+    let subtree = FetchSnapshot {
+        of: RecordId::Snapshot(tree.id().into()),
         have: Vec::new(),
         paths: Vec::new(),
     };
+    let error = repo.fetch_snapshot(&subtree).await.unwrap_err();
+    assert_eq!(
+        code(error),
+        ErrorCode::BadRequest,
+        "only a record's snapshot, not a tree within one"
+    );
+    let missing = FetchSnapshot {
+        of: RecordId::Revision(description.id().into()),
+        ..subtree
+    };
     let error = repo.fetch_snapshot(&missing).await.unwrap_err();
-    assert_eq!(code(error), ErrorCode::NotFound, "a blob is no snapshot");
+    assert_eq!(code(error), ErrorCode::NotFound);
 }
 
 #[tokio::test]
@@ -369,7 +452,7 @@ async fn reads_statements_and_revisions() {
     let repo = &server.demo;
     let base = main_tip(repo).await;
     let first = Made::revision(change(1), base, vec![], &[("a.txt", "1")]);
-    let statement = ci_test(first.id);
+    let statement = ci_test(first.id, "user:ada");
     let mut pack = first.pack();
     pack.objects.push(statement.clone());
     repo.put_records(&pack).await.unwrap();
@@ -539,11 +622,22 @@ async fn landings_wait_for_evidence() {
         "{page:?}"
     );
 
-    repo.put_records(&Pack {
-        objects: vec![ci_test(made.id)],
-    })
-    .await
-    .unwrap();
+    // Only `user:ci` issues them, and only as itself.
+    let forged = Pack {
+        objects: vec![ci_test(made.id, "user:ci")],
+    };
+    assert_eq!(
+        code(repo.put_records(&forged).await.unwrap_err()),
+        ErrorCode::Forbidden
+    );
+    let own = Pack {
+        objects: vec![ci_test(made.id, "user:ada")],
+    };
+    assert_eq!(
+        code(repo.put_records(&own).await.unwrap_err()),
+        ErrorCode::Forbidden
+    );
+    server.ci.put_records(&forged).await.unwrap();
     let landed = repo.land(&land).await.unwrap();
     assert!(matches!(landed.landings[..], [Landing::Landed { .. }]));
     assert_eq!(repo.landings().await.unwrap(), []);
@@ -594,6 +688,266 @@ async fn events_long_poll() {
         matches!(&all.events[..], [event] if event.kind.name() == "target.advanced"),
         "the first event is `policy`'s first acceptance: {all:?}"
     );
+}
+
+/// Lands a change of `user:ada` with `files` on `strict`'s `main`, with the
+/// `ci.test` it requires.
+async fn land_on_strict(server: &Server, seed: u8, files: &[(&str, &str)]) -> Made {
+    let made = Made::nested(change(seed), main_tip(&server.strict).await, files);
+    server.strict.put_records(&made.pack()).await.unwrap();
+    server
+        .ci
+        .put_records(&Pack {
+            objects: vec![ci_test(made.id, "user:ci")],
+        })
+        .await
+        .unwrap();
+    let land = LandRequest {
+        proposal: Proposal::Change(change(seed)),
+        onto: None,
+    };
+    let landed = server.strict.land(&land).await.unwrap();
+    assert!(
+        matches!(landed.landings[..], [Landing::Landed { .. }]),
+        "{landed:?}"
+    );
+    made
+}
+
+#[tokio::test]
+async fn tells_callers_what_they_may_do_and_issues_narrower_tokens() {
+    let server = Server::start().await;
+    let path = |path: &str| RepoPath::new(path).unwrap();
+    let ada = server.strict.whoami().await.unwrap();
+    assert_eq!(ada.principal, Some("user:ada".parse().unwrap()));
+    assert!(ada.paths.writes(&path("secrets/key")) && ada.may_land(&TargetName::MAIN));
+    let anonymous = server.anonymous.whoami().await.unwrap();
+    assert_eq!(anonymous.principal, None);
+    assert!(anonymous.paths.reads(&path("README.md")));
+    assert!(!anonymous.paths.reads(&path("secrets/key")));
+    let stranger = Client::new(&server.base).with_token("nope");
+    assert_eq!(
+        code(stranger.repos().await.unwrap_err()),
+        ErrorCode::Unauthorized
+    );
+
+    // Ada hands an agent a token that only writes `src`.
+    let scope = |scope: &[&str]| TokenRequest {
+        scope: scope
+            .iter()
+            .map(|capability| capability.parse().unwrap())
+            .collect(),
+        ttl: Period(Duration::from_hours(1)),
+    };
+    let issued = server
+        .strict
+        .issue_token(&scope(&["write src"]))
+        .await
+        .unwrap();
+    assert_eq!(issued.principal, "user:ada".parse().unwrap());
+    let agent = Client::new(&server.base)
+        .with_token(issued.token)
+        .repo("strict".parse().unwrap());
+    let rights = agent.whoami().await.unwrap();
+    assert!(rights.paths.writes(&path("src/lib.rs")));
+    assert!(!rights.paths.reads(&path("README.md")));
+    assert!(rights.land.is_empty() && !rights.admin);
+    // Its token only narrows: what it lacks, it cannot pass on.
+    for wider in [&["write /"][..], &["land main"], &["read secrets"]] {
+        let error = agent.issue_token(&scope(wider)).await.unwrap_err();
+        assert_eq!(code(error), ErrorCode::Forbidden, "{wider:?}");
+    }
+    assert!(agent.issue_token(&scope(&["write src/net"])).await.is_ok());
+    let error = server
+        .anonymous
+        .issue_token(&scope(&["read /"]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), ErrorCode::Forbidden);
+
+    // The agent proposes changes to `src`, and nothing else, and lands
+    // nothing.
+    let base = main_tip(&server.strict).await;
+    let in_src = Made::nested(change(1), base, &[("src/lib.rs", "fn a() {}")]);
+    agent.put_records(&in_src.pack()).await.unwrap();
+    let outside = Made::nested(change(2), base, &[("README.md", "hi")]);
+    let error = agent.put_records(&outside.pack()).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::Forbidden);
+    let land = LandRequest {
+        proposal: Proposal::Change(change(1)),
+        onto: None,
+    };
+    assert_eq!(
+        code(agent.land(&land).await.unwrap_err()),
+        ErrorCode::Forbidden
+    );
+    // Anonymous callers only read.
+    let error = server
+        .anonymous
+        .put_records(&in_src.pack())
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), ErrorCode::Forbidden);
+}
+
+#[tokio::test]
+async fn browses_snapshots_without_their_history() {
+    let server = Server::start().await;
+    let made = land_on_strict(
+        &server,
+        1,
+        &[
+            ("README.md", "hello"),
+            ("secrets/key", "hunter2"),
+            ("src/lib.rs", "fn a() {}"),
+        ],
+    )
+    .await;
+    let at = |at: &str, path: &str| BrowseQuery {
+        at: at.parse().unwrap(),
+        path: RepoPath::new(path).unwrap(),
+    };
+    let root = server.strict.tree(&at("main", "/")).await.unwrap();
+    let names: Vec<_> = root
+        .entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.kind, entry.withheld))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("README.md", EntryKind::File, false),
+            ("secrets", EntryKind::Tree, false),
+            ("src", EntryKind::Tree, false),
+        ]
+    );
+    let revision = format!("revision:{}", made.id);
+    assert_eq!(
+        server
+            .strict
+            .file(&at(&revision, "secrets/key"))
+            .await
+            .unwrap(),
+        b"hunter2"
+    );
+
+    // Others see that the secret is there, but not what it is.
+    let anonymous = &server.anonymous;
+    let root = anonymous.tree(&at("main", "")).await.unwrap();
+    assert!(root.entries[1].withheld, "{root:?}");
+    assert_eq!(
+        anonymous.file(&at("main", "README.md")).await.unwrap(),
+        b"hello"
+    );
+    for path in ["secrets/key", "secrets"] {
+        let error = anonymous.file(&at("main", path)).await.unwrap_err();
+        assert_eq!(code(error), ErrorCode::Forbidden, "{path}");
+    }
+    let error = anonymous.tree(&at("main", "secrets")).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::Forbidden);
+    let error = anonymous.tree(&at("main", "README.md")).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::BadRequest);
+    let error = anonymous.file(&at("main", "missing")).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound);
+    let error = anonymous.tree(&at("nowhere", "")).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn reads_only_what_the_caller_may() {
+    let server = Server::start().await;
+    let public = land_on_strict(
+        &server,
+        1,
+        &[("README.md", "hello"), ("secrets/key", "hunter2")],
+    )
+    .await;
+    let secret = Made::nested(
+        change(2),
+        main_tip(&server.strict).await,
+        &[("README.md", "hello"), ("secrets/key", "rotated")],
+    );
+    server.strict.put_records(&secret.pack()).await.unwrap();
+    let anonymous = &server.anonymous;
+
+    // The walk withholds the secret, but keeps its place in the tree.
+    let walked = anonymous
+        .fetch_snapshot(&FetchSnapshot {
+            of: RecordId::Revision(public.id),
+            have: Vec::new(),
+            paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let ids: Vec<_> = walked.objects.iter().map(EncodedObject::id).collect();
+    let hunter2 = EncodedObject::blob(b"hunter2").id();
+    assert!(!ids.contains(&hunter2), "the secret's content is withheld");
+    assert_eq!(ids.len(), 2, "the root and README.md, not `secrets`'s tree");
+    let root: Tree = walked.objects[0].decode_as().unwrap();
+    assert!(root.get("secrets").is_some());
+
+    // A revision that only changes what they can't read is hidden, with
+    // everything about it.
+    let records = anonymous
+        .fetch_records(&FetchRecords {
+            ids: vec![public.id.into(), secret.id.into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(records.objects[0].id(), public.id.into());
+    assert!(
+        records
+            .objects
+            .iter()
+            .all(|object| object.id() != secret.id.into())
+    );
+    let error = anonymous.revisions(change(2)).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound);
+    let query = StatementsQuery {
+        subject: RecordId::Revision(secret.id),
+    };
+    server
+        .strict
+        .put_records(&Pack {
+            objects: vec![review(secret.id)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(server.strict.statements(&query).await.unwrap().len(), 1);
+    assert_eq!(anonymous.statements(&query).await.unwrap(), []);
+    let error = anonymous
+        .fetch_snapshot(&FetchSnapshot {
+            of: RecordId::Revision(secret.id),
+            have: Vec::new(),
+            paths: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound);
+    let everything = EventsQuery {
+        cursor: Some(0),
+        ..EventsQuery::default()
+    };
+    let hidden = |page: &origin_shared::event::Page| {
+        page.events.iter().any(|event| {
+            matches!(event.kind,
+                EventKind::RevisionCreated { revision, .. } if revision == secret.id)
+                || matches!(event.kind,
+                    EventKind::StatementIssued { subject, .. } if subject == RecordId::Revision(secret.id))
+        })
+    };
+    assert!(hidden(&server.strict.events(&everything).await.unwrap()));
+    assert!(!hidden(&anonymous.events(&everything).await.unwrap()));
+}
+
+/// A passing review from `user:ada` about `subject`.
+fn review(subject: RevisionId) -> EncodedObject {
+    Statement {
+        kind: Kind::new("review").unwrap(),
+        issuer: "user:ada".parse().unwrap(),
+        ..ci_test(subject, "user:ada").decode_as().unwrap()
+    }
+    .encode()
 }
 
 #[tokio::test]

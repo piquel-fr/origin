@@ -75,6 +75,29 @@ impl Wakeup {
     }
 }
 
+/// Which events a reader takes: those a [`Filter`] passes, or a closure
+/// accepts, such as one that also checks what a caller sees.
+pub trait Accept {
+    /// Whether the reader takes `event`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if what decides cannot be read.
+    fn accept(&mut self, event: &EventKind) -> Result<bool, StoreError>;
+}
+
+impl Accept for &Filter {
+    fn accept(&mut self, event: &EventKind) -> Result<bool, StoreError> {
+        Ok(self.matches(event))
+    }
+}
+
+impl<F: FnMut(&EventKind) -> Result<bool, StoreError>> Accept for F {
+    fn accept(&mut self, event: &EventKind) -> Result<bool, StoreError> {
+        self(event)
+    }
+}
+
 impl<'a, P: Platform> Events<'a, P> {
     /// How often [`Events::wait`] reads the op log.
     pub const POLL: Duration = Duration::from_millis(50);
@@ -106,14 +129,19 @@ impl<'a, P: Platform> Events<'a, P> {
         self.store.oplog().last_seq()
     }
 
-    /// The events after `cursor` that pass `filter`, oldest first: those
+    /// The events after `cursor` that `accept` takes, oldest first: those
     /// of whole entries, until there are `limit` or more.
     ///
     /// # Errors
     ///
     /// Fails with [`StoreError::Expired`] if the op log no longer keeps the
     /// entries after `cursor`, or if it or a record cannot be read.
-    pub fn after(&self, cursor: u64, filter: &Filter, limit: usize) -> Result<Page, StoreError> {
+    pub fn after(
+        &self,
+        cursor: u64,
+        mut accept: impl Accept,
+        limit: usize,
+    ) -> Result<Page, StoreError> {
         let mut page = Page {
             events: Vec::new(),
             next: cursor,
@@ -133,16 +161,14 @@ impl<'a, P: Platform> Events<'a, P> {
                 // have changed since the first look.
                 derived = self.derive(&entry, &mut waiting)?;
             }
-            page.events.extend(
-                derived
-                    .events
-                    .into_iter()
-                    .filter(|kind| filter.matches(kind))
-                    .map(|kind| Event {
+            for kind in derived.events {
+                if accept.accept(&kind)? {
+                    page.events.push(Event {
                         cursor: entry.seq,
                         kind,
-                    }),
-            );
+                    });
+                }
+            }
             page.next = entry.seq;
             if page.events.len() >= limit {
                 break;
@@ -161,7 +187,7 @@ impl<'a, P: Platform> Events<'a, P> {
     pub fn wait(
         &self,
         cursor: u64,
-        filter: &Filter,
+        mut accept: impl Accept,
         limit: usize,
         timeout: Duration,
     ) -> Result<Page, StoreError> {
@@ -170,7 +196,7 @@ impl<'a, P: Platform> Events<'a, P> {
         loop {
             // Read before the op log, so no write after it is missed.
             let seen = self.wakeup.map(Wakeup::writes);
-            let page = self.after(cursor, filter, limit)?;
+            let page = self.after(cursor, |event: &EventKind| accept.accept(event), limit)?;
             let left = timeout.saturating_sub(start.elapsed());
             if !page.events.is_empty() || left.is_zero() {
                 return Ok(page);
@@ -284,7 +310,7 @@ impl<'a, P: Platform> Events<'a, P> {
                         }
                     }
                 }
-                Object::Blob(_) | Object::Tree(_) => None,
+                Object::Blob(_) | Object::Tree(_) | Object::Attachment(_) => None,
             });
         }
         Ok(derived)

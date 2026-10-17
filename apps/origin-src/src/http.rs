@@ -2,8 +2,10 @@
 //! calls on the repository they name. Every route is documented with
 //! `utoipa`, which generates the OpenAPI document; `origin-client` is the
 //! Rust SDK for it.
+//!
+//! Callers authenticate with `Authorization: Bearer <token>` (see
+//! [`Credentials`](crate::auth::Credentials)); without it, they are anonymous.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Json;
@@ -14,10 +16,11 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use origin_shared::ChangeId;
 use origin_shared::Head;
+use origin_shared::access::{InvalidToken, Rights};
 use origin_shared::api::{
-    Annotation, ApiError, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, Inventory,
-    InventoryRequest, LandRequest, Landings, LogEntry, LogQuery, NewTarget, RepoName, RepoSummary,
-    Revisions, StatementsQuery, Stored, TargetInfo,
+    Annotation, ApiError, BrowseQuery, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot,
+    Inventory, InventoryRequest, IssuedToken, LandRequest, Landings, Listing, LogEntry, LogQuery,
+    NewTarget, RepoName, RepoSummary, Revisions, StatementsQuery, Stored, TargetInfo, TokenRequest,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
@@ -62,6 +65,10 @@ impl Api {
             .routes(routes!(land))
             .routes(routes!(landings))
             .routes(routes!(events))
+            .routes(routes!(whoami))
+            .routes(routes!(issue_token))
+            .routes(routes!(tree))
+            .routes(routes!(file))
             .routes(routes!(openapi_document))
     }
 
@@ -78,15 +85,23 @@ impl Api {
     }
 }
 
-/// Every request is anonymous: nothing authenticates callers yet.
+/// The caller of a request, by its bearer token.
 impl FromRequestParts<Arc<Repositories>> for Caller {
-    type Rejection = Infallible;
+    type Rejection = HttpError;
 
     fn from_request_parts(
-        _parts: &mut Parts,
-        _repositories: &Arc<Repositories>,
-    ) -> impl Future<Output = Result<Self, Infallible>> + Send {
-        std::future::ready(Ok(Self::Anonymous))
+        parts: &mut Parts,
+        repositories: &Arc<Repositories>,
+    ) -> impl Future<Output = Result<Self, HttpError>> + Send {
+        let authorization = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .map(|value| value.to_str().map_err(|_| InvalidToken::Malformed))
+            .transpose();
+        let caller = authorization
+            .and_then(|authorization| repositories.credentials().caller(authorization))
+            .map_err(HttpError::Unauthorized);
+        std::future::ready(caller)
     }
 }
 
@@ -106,9 +121,14 @@ async fn call<T: Send + 'static>(
 }
 
 /// A failed request, rendered as an [`ApiError`].
-enum HttpError {
+pub enum HttpError {
+    /// The service refused or failed.
     Service(ServiceError),
+    /// The request's pack is invalid.
     Pack(PackError),
+    /// The caller's credentials are invalid.
+    Unauthorized(InvalidToken),
+    /// The service panicked.
     Panicked(String),
 }
 
@@ -121,6 +141,7 @@ impl IntoResponse for HttpError {
             }
             Self::Service(error) => (error.code(), error.to_string()),
             Self::Pack(error) => (ErrorCode::BadRequest, format!("invalid pack: {error}")),
+            Self::Unauthorized(error) => (ErrorCode::Unauthorized, error.to_string()),
             Self::Panicked(message) => {
                 tracing::error!(%message, "request panicked");
                 (ErrorCode::Internal, "internal server error".to_owned())
@@ -131,6 +152,8 @@ impl IntoResponse for HttpError {
             ErrorCode::NotFound => StatusCode::NOT_FOUND,
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::Expired => StatusCode::GONE,
+            ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+            ErrorCode::Forbidden => StatusCode::FORBIDDEN,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(ApiError { code, message })).into_response()
@@ -152,15 +175,25 @@ impl utoipa::PartialSchema for Binary {
 
 impl utoipa::ToSchema for Binary {}
 
-/// Lists the repositories on the server.
+/// Lists the repositories on the server that the caller sees.
 #[utoipa::path(
     get,
     path = "/api/v1/repos",
     operation_id = "list_repos",
-    responses((status = 200, description = "The repositories, by name", body = Vec<RepoSummary>))
+    responses(
+        (status = 200, description = "The repositories, by name", body = Vec<RepoSummary>),
+        (status = 401, description = "The token is invalid or expired", body = ApiError)
+    )
 )]
-async fn list_repos(State(repositories): Repos, caller: Caller) -> Json<Vec<RepoSummary>> {
-    Json(repositories.list(&caller))
+async fn list_repos(
+    State(repositories): Repos,
+    caller: Caller,
+) -> Result<Json<Vec<RepoSummary>>, HttpError> {
+    tokio::task::spawn_blocking(move || repositories.list(&caller))
+        .await
+        .map_err(|error| HttpError::Panicked(error.to_string()))?
+        .map(Json)
+        .map_err(HttpError::Service)
 }
 
 /// A pack, as a response.
@@ -477,6 +510,112 @@ async fn events(
     })
     .await
     .map(Json)
+}
+
+/// Tells the caller who they are and what they may do in the repository.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{repo}/whoami",
+    operation_id = "whoami",
+    params(("repo" = String, Path, description = "The repository")),
+    responses(
+        (status = 200, description = "The caller's rights", body = Rights),
+        (status = 401, description = "The token is invalid or expired", body = ApiError),
+        (status = 404, description = "The repository does not exist", body = ApiError)
+    )
+)]
+async fn whoami(
+    repos: Repos,
+    Path(repo): Path<RepoName>,
+    caller: Caller,
+) -> Result<Json<Rights>, HttpError> {
+    call(repos, repo, caller, OriginService::whoami)
+        .await
+        .map(Json)
+}
+
+/// Issues a token acting for the caller, with a scope narrowing their
+/// rights, signed by the server, which verifies it without storing it.
+#[utoipa::path(
+    post,
+    path = "/api/v1/repos/{repo}/tokens",
+    operation_id = "issue_token",
+    params(("repo" = String, Path, description = "The repository whose policy the scope is checked against")),
+    request_body = TokenRequest,
+    responses(
+        (status = 200, description = "The token", body = IssuedToken),
+        (status = 403, description = "The caller isn't signed in, or the scope reaches beyond their rights", body = ApiError),
+        (status = 404, description = "The repository does not exist", body = ApiError)
+    )
+)]
+async fn issue_token(
+    repos: Repos,
+    Path(repo): Path<RepoName>,
+    caller: Caller,
+    Json(request): Json<TokenRequest>,
+) -> Result<Json<IssuedToken>, HttpError> {
+    call(repos, repo, caller, move |service, caller| {
+        service.issue_token(caller, &request)
+    })
+    .await
+    .map(Json)
+}
+
+/// Lists a directory of a snapshot: a target's tip, or a revision's or an
+/// acceptance's. Withheld entries keep their place.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{repo}/tree",
+    operation_id = "tree",
+    params(("repo" = String, Path, description = "The repository"), BrowseQuery),
+    responses(
+        (status = 200, description = "The directory's entries", body = Listing),
+        (status = 400, description = "The path is a file, or the record has no snapshot", body = ApiError),
+        (status = 403, description = "The caller reads nothing under the path", body = ApiError),
+        (status = 404, description = "The repository, the target, the record or the path does not exist", body = ApiError)
+    )
+)]
+async fn tree(
+    repos: Repos,
+    Path(repo): Path<RepoName>,
+    caller: Caller,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<Listing>, HttpError> {
+    call(repos, repo, caller, move |service, caller| {
+        service.tree(caller, &query)
+    })
+    .await
+    .map(Json)
+}
+
+/// Reads a file of a snapshot, as `tree` finds it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repos/{repo}/file",
+    operation_id = "file",
+    params(("repo" = String, Path, description = "The repository"), BrowseQuery),
+    responses(
+        (status = 200, description = "The file's content", content_type = "application/octet-stream", body = Binary),
+        (status = 400, description = "The path is a directory, or the record has no snapshot", body = ApiError),
+        (status = 403, description = "The caller may not read the file", body = ApiError),
+        (status = 404, description = "The repository, the target, the record or the path does not exist", body = ApiError)
+    )
+)]
+async fn file(
+    repos: Repos,
+    Path(repo): Path<RepoName>,
+    caller: Caller,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Response, HttpError> {
+    let content = call(repos, repo, caller, move |service, caller| {
+        service.file(caller, &query)
+    })
+    .await?;
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        content,
+    )
+        .into_response())
 }
 
 /// The OpenAPI document of this API.

@@ -5,7 +5,7 @@
 //! use origin_shared::api::RepoName;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = Client::new("http://127.0.0.1:7878");
+//! let client = Client::new("http://127.0.0.1:7878").with_token("a long random secret");
 //! let repo = client.repo(RepoName::new("demo")?);
 //! for target in repo.targets().await? {
 //!     println!("{} is at #{}", target.name, target.head.seq);
@@ -18,10 +18,11 @@
 //! the two cannot disagree on a contract. The server also describes its API
 //! in `docs/openapi.json`, for other languages.
 
+use origin_shared::access::Rights;
 use origin_shared::api::{
-    Annotation, ApiError, EventsQuery, FetchRecords, FetchSnapshot, Inventory, InventoryRequest,
-    LandRequest, Landings, LogEntry, LogQuery, NewTarget, RepoName, RepoSummary, Revisions,
-    StatementsQuery, Stored, TargetInfo,
+    Annotation, ApiError, BrowseQuery, EventsQuery, FetchRecords, FetchSnapshot, Inventory,
+    InventoryRequest, IssuedToken, LandRequest, Landings, Listing, LogEntry, LogQuery, NewTarget,
+    RepoName, RepoSummary, Revisions, StatementsQuery, Stored, TargetInfo, TokenRequest,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
@@ -66,13 +67,14 @@ endpoints! {
     }
 
     impl Repo {
-        /// Fetches records by id, in the order asked, each followed by the
-        /// blob it carries if the server has it: a revision's description,
-        /// a statement's payload.
+        /// Fetches the records the caller sees by id, in the order asked,
+        /// each followed by the attachment it carries if the server has
+        /// it: a revision's description, a statement's payload.
         fn fetch_records(request: &FetchRecords) -> Pack =
             POST "records/fetch", json(request) => pack;
-        /// Fetches the trees and blobs of a snapshot that none of the
-        /// request's snapshots holds at the same path, parents first.
+        /// Fetches the trees and blobs of a record's snapshot that none of
+        /// the request's snapshots holds at the same path, parents first,
+        /// but the content the caller may not read.
         fn fetch_snapshot(request: &FetchSnapshot) -> Pack =
             POST "snapshots/fetch", json(request) => pack;
         /// Puts a batch of objects: snapshots, revisions and statements,
@@ -102,16 +104,38 @@ endpoints! {
         /// The events after a cursor, waiting up to the query's `wait` for
         /// some: pass the page's `next` as the next query's cursor.
         fn events(query: &EventsQuery) -> Page = GET "events", query(query) => json;
+        /// Who the server thinks the caller is, and what they may do.
+        fn whoami() -> Rights = GET "whoami" => json;
+        /// Issues a token acting for the caller, with a narrower scope.
+        fn issue_token(request: &TokenRequest) -> IssuedToken =
+            POST "tokens", json(request) => json;
+        /// Lists a directory of a target's tip, or of a revision's or an
+        /// acceptance's snapshot.
+        fn tree(query: &BrowseQuery) -> Listing = GET "tree", query(query) => json;
+        /// Reads a file of a snapshot, as `tree` finds it.
+        fn file(query: &BrowseQuery) -> Vec<u8> = GET "file", query(query) => bytes;
     }
 }
 
 /// A connection to an origin server. Cloning it is cheap, and clones share
 /// their connections.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     /// The API's base URL, ending with a `/`.
     api: String,
+    /// The bearer token every request carries, if any.
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the token.
+        f.debug_struct("Client")
+            .field("api", &self.api)
+            .field("authenticated", &self.token.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -121,6 +145,18 @@ impl Client {
         Self {
             http: reqwest::Client::new(),
             api: format!("{}/api/v1/", url.trim_end_matches('/')),
+            token: None,
+        }
+    }
+
+    /// The client, authenticating every request with `token`: a static
+    /// one from the server's configuration, or one it issued. Without one,
+    /// the server treats requests as anonymous, which only read.
+    #[must_use]
+    pub fn with_token(self, token: impl Into<String>) -> Self {
+        Self {
+            token: Some(token.into()),
+            ..self
         }
     }
 
@@ -135,7 +171,11 @@ impl Client {
 
     /// Starts a request to `path`, relative to the API's base URL.
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        self.http.request(method, format!("{}{path}", self.api))
+        let request = self.http.request(method, format!("{}{path}", self.api));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 }
 
@@ -183,6 +223,10 @@ impl Response {
 
     async fn pack(self) -> Result<Pack, Error> {
         Ok(Pack::decode(&self.0.bytes().await?)?)
+    }
+
+    async fn bytes(self) -> Result<Vec<u8>, Error> {
+        Ok(self.0.bytes().await?.to_vec())
     }
 }
 

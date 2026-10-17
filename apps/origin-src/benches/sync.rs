@@ -12,7 +12,11 @@ use origin_platform::Native;
 use origin_shared::api::LandRequest;
 use origin_shared::landing::{Landing, Proposal};
 use origin_shared::pack::Pack;
-use origin_shared::{Base, ChangeId, EncodedObject, NodeKey, Record, Revision, TargetName, TreeId};
+use origin_shared::{
+    Base, ChangeId, EncodedObject, NodeKey, Principal, Record, RecordId, Revision, TargetName,
+    TreeId,
+};
+use origin_src::auth::{Credentials, StaticTokens};
 use origin_src::fixture::FixtureTree;
 use origin_src::http::Api;
 use origin_src::policy::Policy;
@@ -47,8 +51,8 @@ struct Setup {
     /// The tip of `main`, the whole fixture, and its snapshot.
     tip: Base,
     snapshot: TreeId,
-    /// Edits only the server has.
-    theirs: Vec<TreeId>,
+    /// Revisions of the server's, each with its own edits.
+    theirs: Vec<RecordId>,
     client: Store,
     /// Edits only the client has.
     ours: Vec<TreeId>,
@@ -74,12 +78,24 @@ static SETUP: LazyLock<Setup> = LazyLock::new(|| {
     };
     let snapshot = snapshot_into(service.store(), None);
     let tip = land(&service, snapshot);
+    let mut records = Vec::new();
     let theirs = (1..=u64::from(SAMPLES))
-        .map(|version| snapshot_into(service.store(), Some(version)))
+        .map(|version| {
+            let snapshot = snapshot_into(service.store(), Some(version));
+            let (description, revision) = revision(tip, snapshot);
+            let id = RecordId::Revision(revision.id().into());
+            records.extend([description.clone(), revision.clone()]);
+            let pack = Pack {
+                objects: vec![description, revision],
+            };
+            service.put_records(&Caller::Owner, pack).unwrap();
+            id
+        })
         .collect();
 
     let runtime = Runtime::new().unwrap();
-    let mut repositories = Repositories::default();
+    let tokens: StaticTokens = toml::from_str("\"user:bench\" = \"bench\"").unwrap();
+    let mut repositories = Repositories::new(Credentials::new(node.clone(), Box::new(tokens)));
     repositories.insert("demo".parse().unwrap(), service);
     let base = runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -94,10 +110,12 @@ static SETUP: LazyLock<Setup> = LazyLock::new(|| {
 
     let store = Store::new(client.path().join(".origin"), Native::default());
     store.init().unwrap();
-    let remote = Remote::open(&url, node.clone()).unwrap();
-    let sync = Sync::new(&store, &remote, "laptop".parse().unwrap());
+    let remote = Remote::open(&url, node.clone(), Some("bench".to_owned())).unwrap();
+    let sync = Sync::new(&store, &remote, "laptop".parse().unwrap(), bench_user());
     sync.fetch_chains(&[TargetName::MAIN]).unwrap();
-    sync.need(snapshot, &[]).unwrap();
+    sync.need(tip.into(), &[]).unwrap();
+    // The client knows the records, as a fetch would have brought them.
+    store.write_all(&records).unwrap();
     // Versions the server's edits never reach.
     let ours = (1..=u64::from(SAMPLES))
         .map(|version| snapshot_into(&store, Some(1_000 + version)))
@@ -139,7 +157,7 @@ fn land(service: &OriginService, snapshot: TreeId) -> Base {
 /// A revision of a new change with `snapshot`, on `base`, and its
 /// description.
 fn revision(base: Base, snapshot: TreeId) -> (EncodedObject, EncodedObject) {
-    let description = EncodedObject::blob(b"bench");
+    let description = EncodedObject::attachment(b"bench");
     let revision = Revision {
         change: ChangeId::random().unwrap(),
         predecessors: Vec::new(),
@@ -155,8 +173,13 @@ fn revision(base: Base, snapshot: TreeId) -> (EncodedObject, EncodedObject) {
 
 impl Setup {
     fn remote(&self) -> Remote {
-        Remote::open(&self.url, self.node.clone()).unwrap()
+        Remote::open(&self.url, self.node.clone(), Some("bench".to_owned())).unwrap()
     }
+}
+
+/// The user the benchmarks push as.
+fn bench_user() -> Principal {
+    "user:bench".parse().unwrap()
 }
 
 /// The snapshot a clone fetches: every file, into an empty repository.
@@ -169,11 +192,18 @@ fn clone_snapshot(bencher: Bencher<'_, '_>) {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::new(dir.path().join(".origin"), Native::default());
             store.init().unwrap();
+            // A clone fetches the chain first.
+            let Base::Acceptance(tip) = setup.tip else {
+                unreachable!("the tip is an acceptance")
+            };
+            store
+                .write_all(&[setup.client.read(tip.into()).unwrap()])
+                .unwrap();
             (dir, store)
         })
         .bench_local_refs(|(_, store)| {
-            let sync = Sync::new(store, &remote, "laptop".parse().unwrap());
-            assert!(sync.need(setup.snapshot, &[]).unwrap());
+            let sync = Sync::new(store, &remote, "laptop".parse().unwrap(), bench_user());
+            assert!(sync.need(setup.tip.into(), &[]).unwrap());
         });
 }
 
@@ -183,12 +213,17 @@ fn clone_snapshot(bencher: Bencher<'_, '_>) {
 fn fetch_100_edited(bencher: Bencher<'_, '_>) {
     let setup = &*SETUP;
     let remote = setup.remote();
-    let sync = Sync::new(&setup.client, &remote, "laptop".parse().unwrap());
+    let sync = Sync::new(
+        &setup.client,
+        &remote,
+        "laptop".parse().unwrap(),
+        bench_user(),
+    );
     let next = AtomicUsize::new(0);
     bencher
         .with_inputs(|| setup.theirs[next.fetch_add(1, Ordering::Relaxed) % SAMPLES as usize])
-        .bench_local_values(|snapshot| {
-            sync.need(snapshot, &[setup.snapshot]).unwrap();
+        .bench_local_values(|revision| {
+            sync.need(revision, &[setup.snapshot]).unwrap();
         });
 }
 
@@ -198,7 +233,12 @@ fn fetch_100_edited(bencher: Bencher<'_, '_>) {
 fn push_100_edited(bencher: Bencher<'_, '_>) {
     let setup = &*SETUP;
     let remote = setup.remote();
-    let sync = Sync::new(&setup.client, &remote, "laptop".parse().unwrap());
+    let sync = Sync::new(
+        &setup.client,
+        &remote,
+        "laptop".parse().unwrap(),
+        bench_user(),
+    );
     let next = AtomicUsize::new(0);
     bencher
         .with_inputs(|| {
