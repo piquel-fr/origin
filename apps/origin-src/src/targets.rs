@@ -25,8 +25,8 @@ use std::slice;
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Platform};
 use origin_shared::{
-    Acceptance, AcceptanceId, Base, Head, Record, Revision, RevisionId, Source, TargetId,
-    TargetName,
+    Acceptance, AcceptanceId, Base, EncodedObject, Head, Record, Revision, RevisionId, Source,
+    TargetId, TargetName,
 };
 
 use crate::oplog::Effect;
@@ -102,6 +102,20 @@ impl TargetFiles {
                     .ok_or_else(|| StoreError::Malformed(self.log()))
             })
             .collect()
+    }
+
+    /// The complete entries of a locked log from position `since` on.
+    fn entries_since(&self, log: &File, since: u64) -> Result<Vec<Head>, StoreError> {
+        let mut bytes = Vec::new();
+        let mut reader = log;
+        reader
+            .seek(SeekFrom::Start(since * Self::LINE as u64))
+            .and_then(|_| reader.read_to_end(&mut bytes))
+            .map_err(|source| StoreError::io(&self.log(), source))?;
+        Ok((since..)
+            .zip(self.parse_log(&bytes)?)
+            .map(|(seq, acceptance)| Head { seq, acceptance })
+            .collect())
     }
 
     /// The last complete entry of a locked log, after cutting off a partial
@@ -244,6 +258,26 @@ impl<P: Platform> Store<P> {
             .then_some(next))
     }
 
+    /// The target the stack of `revision` is on: that of the acceptance at
+    /// the bottom of its stack, found by following bases.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a record of the stack cannot be read, or the store doesn't
+    /// know the target's name.
+    pub fn stack_target(&self, revision: RevisionId) -> Result<TargetName, StoreError> {
+        let mut base = self.get(revision)?.base;
+        let acceptance = loop {
+            match base {
+                Base::Revision(id) => base = self.get(id)?.base,
+                Base::Acceptance(id) => break id,
+            }
+        };
+        let target = self.get(acceptance)?.body().target;
+        self.target_name(target)?
+            .ok_or(StoreError::NotFound(acceptance.into()))
+    }
+
     /// The name of the target `id`, or `None` if it doesn't exist.
     ///
     /// # Errors
@@ -290,34 +324,67 @@ impl<P: Platform> Store<P> {
     }
 
     /// Appends `acceptance` to the chain of `target`, creating the target
-    /// with its first acceptance.
-    ///
-    /// This is a compare-and-swap: the acceptance must follow the target's
-    /// latest one, with the next sequence number and naming it as `prev`.
-    /// Concurrent appends are serialized, and all but one of those following
-    /// the same acceptance fail. Verifying the signature is the caller's job,
-    /// since only it knows the target's authority.
+    /// with its first acceptance. See [`Store::append_all`].
     ///
     /// # Errors
     ///
-    /// Fails with [`StoreError::Conflict`] if the acceptance doesn't follow
-    /// the latest one, [`StoreError::WrongTarget`] if it belongs to another
-    /// target, or if the target's files cannot be locked, read or written.
+    /// Fails like [`Store::append_all`].
     pub fn append(
         &self,
         target: &TargetName,
         acceptance: &Acceptance,
     ) -> Result<AcceptanceId, StoreError> {
-        let body = acceptance.body();
-        if body.target != target.id() {
-            return Err(StoreError::WrongTarget(target.clone()));
-        }
-        let encoded = acceptance.encode();
-        // The acceptance is durable before the log refers to it.
-        self.write_all(slice::from_ref(&encoded))?;
-        let id = AcceptanceId::from(encoded.id());
+        self.append_all(target, slice::from_ref(acceptance), &[])?;
+        Ok(acceptance.encode().id().into())
+    }
 
-        let files = self.target_files(body.target);
+    /// Appends `acceptances`, in order, to the chain of `target`, creating
+    /// the target with its first acceptance.
+    /// `with`, the records the acceptances rely on, such as promoted
+    /// statements, are written in the same batch, so that costs no extra
+    /// sync.
+    ///
+    /// This is a compare-and-swap: the first acceptance must follow the
+    /// target's latest one, with the next sequence number and naming it as
+    /// `prev`, and each the one before it. Concurrent appends are
+    /// serialized, and all but one of those following the same acceptance
+    /// fail. Verifying the signatures is the caller's job, since only it
+    /// knows the target's authority.
+    ///
+    /// The op log says the target advanced to each acceptance appended,
+    /// even one the store already had, such as one fetched before as
+    /// another target's landing: its `target.advanced` event comes from
+    /// that entry.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Conflict`] if an acceptance doesn't follow
+    /// the one before it, [`StoreError::WrongTarget`] if one belongs to
+    /// another target, or if the target's files cannot be locked, read or
+    /// written.
+    pub fn append_all(
+        &self,
+        target: &TargetName,
+        acceptances: &[Acceptance],
+        with: &[EncodedObject],
+    ) -> Result<(), StoreError> {
+        let Some(first) = acceptances.first() else {
+            return Ok(());
+        };
+        let mut records = with.to_vec();
+        let mut ids = Vec::with_capacity(acceptances.len());
+        for acceptance in acceptances {
+            if acceptance.body().target != target.id() {
+                return Err(StoreError::WrongTarget(target.clone()));
+            }
+            let encoded = acceptance.encode();
+            ids.push(AcceptanceId::from(encoded.id()));
+            records.push(encoded);
+        }
+        // The acceptances are durable before the log refers to them.
+        self.write_all(&records)?;
+
+        let files = self.target_files(target.id());
         fs::create_dir_all(&files.dir).map_err(|source| StoreError::io(&files.dir, source))?;
         let log = LockedFile::open(&self.platform, &files.log(), LockMode::Exclusive)?;
         let latest = files.last_entry(&log)?;
@@ -329,61 +396,108 @@ impl<P: Platform> Store<P> {
                 // durable acceptances, but may not be durable themselves.
                 Some(latest) if head.is_none_or(|head| head.seq < latest.seq) => {
                     self.platform.sync_file(&log).map_err(log_error)?;
-                    self.publish(&files, target, latest)?;
+                    let next = head.map_or(0, |head| head.seq + 1);
+                    let advanced = files.entries_since(&log, next)?;
+                    self.publish(&files, target, head.is_none(), &advanced)?;
                 }
                 _ => return Err(StoreError::Malformed(files.log())),
             }
         }
-        let follows = match latest {
-            None => body.seq == 0 && body.prev.is_none(),
-            Some(latest) => body.seq == latest.seq + 1 && body.prev == Some(latest.acceptance),
-        };
-        if !follows {
-            return Err(StoreError::Conflict {
-                target: target.clone(),
-                expected: body.seq,
-                actual: latest,
+        let mut previous = latest;
+        for (acceptance, &id) in acceptances.iter().zip(&ids) {
+            let body = acceptance.body();
+            let follows = match previous {
+                None => body.seq == 0 && body.prev.is_none(),
+                Some(previous) => {
+                    body.seq == previous.seq + 1 && body.prev == Some(previous.acceptance)
+                }
+            };
+            if !follows {
+                return Err(StoreError::Conflict {
+                    target: target.clone(),
+                    expected: body.seq,
+                    actual: latest,
+                });
+            }
+            previous = Some(Head {
+                seq: body.seq,
+                acceptance: id,
             });
         }
 
+        let mut lines = String::with_capacity(ids.len() * TargetFiles::LINE);
+        for id in &ids {
+            lines.push_str(&id.to_hex());
+            lines.push('\n');
+        }
         let mut writer = &*log;
         writer
-            .seek(SeekFrom::Start(body.seq * TargetFiles::LINE as u64))
-            .and_then(|_| writeln!(writer, "{id}"))
+            .seek(SeekFrom::Start(first.body().seq * TargetFiles::LINE as u64))
+            .and_then(|_| writer.write_all(lines.as_bytes()))
             .map_err(log_error)?;
         self.platform.sync_file(&log).map_err(log_error)?;
 
-        let head = Head {
-            seq: body.seq,
-            acceptance: id,
-        };
-        self.publish(&files, target, head)?;
-        Ok(id)
+        let advanced: Vec<Head> = acceptances
+            .iter()
+            .zip(&ids)
+            .map(|(acceptance, &id)| Head {
+                seq: acceptance.body().seq,
+                acceptance: id,
+            })
+            .collect();
+        self.publish(&files, target, latest.is_none(), &advanced)
     }
 
-    /// Durably replaces the head of a target, logging that it advanced, from
-    /// which its event comes. Publishing the first
-    /// acceptance creates the target: its name is written too, and its
-    /// directory made durable.
+    /// Remembers the name of `target`, which this store doesn't follow, so
+    /// that acceptances of it it holds, such as another target's landings,
+    /// can be described. The target doesn't exist for this store until its
+    /// first acceptance is appended.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the name cannot be written.
+    pub fn name_target(&self, target: &TargetName) -> Result<(), StoreError> {
+        let files = self.target_files(target.id());
+        if files.name().exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(&files.dir).map_err(|source| StoreError::io(&files.dir, source))?;
+        let write = self.durable_write();
+        write.stage(files.name(), target.as_str().as_bytes())?;
+        write.commit()?;
+        self.sync_dir(&self.targets_dir())
+    }
+
+    /// Durably replaces the head of a target with the last of `advanced`,
+    /// the acceptances appended, logging that it advanced to each, which
+    /// their events come from. Publishing its first head, `created`, which
+    /// may name a later acceptance than the first, creates the target: its
+    /// name is written too, and its directory made durable.
     fn publish(
         &self,
         files: &TargetFiles,
         target: &TargetName,
-        head: Head,
+        created: bool,
+        advanced: &[Head],
     ) -> Result<(), StoreError> {
+        let Some(&head) = advanced.last() else {
+            return Ok(());
+        };
         let write = self.durable_write();
         let line = format!("{} {}\n", head.seq, head.acceptance);
         write.stage(files.head(), line.as_bytes())?;
-        let created = head.seq == 0;
         if created {
             write.stage(files.name(), target.as_str().as_bytes())?;
         }
-        let advanced = Effect::Advanced {
-            target: target.clone(),
-            seq: head.seq,
-            acceptance: head.acceptance,
-        };
-        self.commit_logged(write, &[advanced])?;
+        let advanced: Vec<_> = advanced
+            .iter()
+            .map(|advanced| Effect::Advanced {
+                target: target.clone(),
+                seq: advanced.seq,
+                acceptance: advanced.acceptance,
+            })
+            .collect();
+        self.commit_logged(write, &advanced)?;
         if created {
             self.sync_dir(&self.targets_dir())?;
         }
@@ -435,6 +549,23 @@ mod tests {
                 store.append(target, &acceptance(target, head)).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn appending_several_acceptances_creates_the_target() {
+        let (_dir, store) = store();
+        let main = TargetName::MAIN;
+        let first = acceptance(&main, None);
+        let second = acceptance(
+            &main,
+            Some(Head {
+                seq: 0,
+                acceptance: first.encode().id().into(),
+            }),
+        );
+        store.append_all(&main, &[first, second], &[]).unwrap();
+        assert_eq!(store.targets().unwrap(), [TargetName::MAIN]);
+        assert_eq!(store.head(&main).unwrap().unwrap().seq, 1);
     }
 
     #[test]
@@ -564,6 +695,50 @@ mod tests {
         assert_eq!(store.head(&main).unwrap(), Some(repaired));
         land(&store, &main, 1);
         assert_eq!(store.log(&main).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn repairs_advance_the_target_to_every_acceptance_left_unpublished() {
+        let (_dir, store) = store();
+        let main = TargetName::MAIN;
+        let ids = land(&store, &main, 1);
+        let before = store.oplog().last_seq().unwrap();
+        // A crash after appending three acceptances to the log at once,
+        // before publishing the head.
+        let files = store.target_files(main.id());
+        let mut log = fs::OpenOptions::new()
+            .append(true)
+            .open(files.log())
+            .unwrap();
+        let mut head = Head {
+            seq: 0,
+            acceptance: ids[0],
+        };
+        for _ in 0..3 {
+            let next = acceptance(&main, Some(head)).encode();
+            store.write_all(slice::from_ref(&next)).unwrap();
+            head = Head {
+                seq: head.seq + 1,
+                acceptance: next.id().into(),
+            };
+            writeln!(log, "{}", head.acceptance).unwrap();
+        }
+
+        let stale = acceptance(&main, store.head(&main).unwrap());
+        assert!(store.append(&main, &stale).is_err(), "repaired first");
+        let advanced: Vec<_> = store
+            .oplog()
+            .after(before)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry.effect {
+                Effect::Advanced { seq, .. } => Some(seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(advanced, [1, 2, 3], "one event per acceptance");
+        assert_eq!(store.head(&main).unwrap(), Some(head));
     }
 
     #[test]

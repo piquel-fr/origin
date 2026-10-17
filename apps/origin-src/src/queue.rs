@@ -41,6 +41,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::slice;
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Native, Platform};
 use origin_shared::landing::{Blocked, Landing, Pending, Proposal};
@@ -484,6 +485,9 @@ impl<P: Platform> Session<'_, '_, P> {
                 revision: None,
             });
         }
+        // Held until the rebased revision is published, so no push makes
+        // the change diverge meanwhile.
+        let _publishing = self.publishing(revision.change, id)?;
         let rebased = Revision {
             predecessors: vec![id],
             base: tip,
@@ -502,6 +506,18 @@ impl<P: Platform> Session<'_, '_, P> {
             trees: merge.trees,
             revision: Some(rebased),
         })
+    }
+
+    /// Takes the lock every publication of revisions takes (see
+    /// [`Store::lock_pushes`]), once `head` is still the only head of
+    /// `change`.
+    fn publishing(&mut self, change: ChangeId, head: RevisionId) -> Result<LockedFile, LandError> {
+        let lock = self.store().lock_pushes()?;
+        self.annotations.refresh()?;
+        if self.annotations.index().heads(change) != [head] {
+            return Err(LandError::Moved(change));
+        }
+        Ok(lock)
     }
 
     /// Checks the policy for `candidate`, and lands it if its evidence is
@@ -573,9 +589,8 @@ impl<P: Platform> Session<'_, '_, P> {
         if Policy::governing(encoded.id().into(), acceptance.body())? != self.policy_head {
             return Err(PolicyError::NotPredecessor(acceptance.body().seq).into());
         }
-        records.push(encoded);
-        store.write_all(&records)?;
-        let id = store.append(&self.onto, &acceptance)?;
+        let id = encoded.id().into();
+        store.append_all(&self.onto, slice::from_ref(&acceptance), &records)?;
         self.tip = Head {
             seq: acceptance.body().seq,
             acceptance: id,
@@ -841,6 +856,9 @@ pub enum LandError {
         /// Its heads.
         heads: Vec<RevisionId>,
     },
+    /// A revision of the change was published while it was rebased.
+    #[error("change {} moved while it was landing: land it again", .0.short())]
+    Moved(ChangeId),
     /// The change was given up.
     #[error("change {} was abandoned, so it cannot land", .0.short())]
     Abandoned(ChangeId),

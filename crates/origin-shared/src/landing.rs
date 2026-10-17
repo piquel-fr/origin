@@ -65,6 +65,18 @@ pub enum Blocked {
     },
 }
 
+impl Landing {
+    /// What the landing lands.
+    #[must_use]
+    pub fn proposal(&self) -> &Proposal {
+        match self {
+            Self::Landed { proposal, .. }
+            | Self::Unchanged(proposal)
+            | Self::Pending(Pending { proposal, .. }) => proposal,
+        }
+    }
+}
+
 impl fmt::Display for Proposal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
