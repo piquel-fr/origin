@@ -11,8 +11,8 @@ use crate::landing::{Landing, Proposal};
 use crate::policy::{KindPattern, Requirement};
 use crate::text::Period;
 use crate::{
-    Acceptance, AcceptanceId, Head, ObjectId, PrincipalName, RecordId, Revision, RevisionId,
-    Statement, StatementId, TargetName,
+    Acceptance, AcceptanceId, ChangeId, Head, ObjectId, PrincipalName, RecordId, RepoPath,
+    Revision, RevisionId, Statement, StatementId, TargetName, TreeId,
 };
 
 /// The name of a repository on a server: ASCII letters, digits, `.`, `_`
@@ -95,11 +95,130 @@ pub struct RepoSummary {
     pub name: RepoName,
 }
 
-/// Asks for records, and any other objects, by id.
+/// The response header saying a fetch stopped short of what it asked for,
+/// to stay within [`Pack::LIMIT`](crate::pack::Pack::LIMIT): see
+/// [`Part`](crate::pack::Part).
+pub const MORE: &str = "origin-more";
+
+/// Asks for records by id: revisions, statements and acceptances. Each
+/// comes with the blob it carries, if the repository has it: a revision's
+/// description, a statement's payload. Snapshots are fetched with
+/// [`FetchSnapshot`] instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct FetchRecords {
-    /// The objects, returned in this order.
+    /// The records, returned in this order, each followed by its blob. A
+    /// response that stops short, with the [`MORE`] header, holds those up
+    /// to the last record it has: ask again for those after it.
     pub ids: Vec<ObjectId>,
+}
+
+/// Asks for the objects of a snapshot that the caller lacks: its trees and
+/// blobs, walked from its root. This is the only way blobs and trees leave
+/// a repository, so what each caller may read can be checked by path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct FetchSnapshot {
+    /// The snapshot.
+    pub snapshot: TreeId,
+    /// Snapshots the caller holds whole. Whatever one of them holds at the
+    /// same path is skipped, so only what changed since comes. Those the
+    /// repository doesn't have are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub have: Vec<TreeId>,
+    /// Only these files and directories, with everything under them, and
+    /// the trees on the way to them. Everything by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<RepoPath>,
+    /// Skip this many of the objects, which earlier parts brought: a
+    /// response that stops short has the [`MORE`] header.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skip: u64,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes a reference"
+)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Asks what a repository holds of some changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct InventoryRequest {
+    /// The changes.
+    pub changes: Vec<ChangeId>,
+}
+
+/// What a repository holds of a change: its records, by id, to compare
+/// with another node's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Inventory {
+    /// The change.
+    pub change: ChangeId,
+    /// Its revisions, in the order the repository received them: none if it
+    /// has never heard of the change.
+    pub revisions: Vec<RevisionId>,
+    /// Those no other revision of the change evolves from.
+    pub heads: Vec<RevisionId>,
+    /// The statements about its revisions, and about those statements, in
+    /// no particular order.
+    pub statements: Vec<StatementId>,
+}
+
+/// Asks for a batch of objects to be put only if the changes named are where
+/// the caller saw them: a compare-and-swap, so a push made from a stale view
+/// of a change is refused instead of making it diverge.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PutQuery {
+    /// The heads of changes as the caller saw them, comma-separated, each
+    /// `<change>=<head>+<head>`, or `<change>=` for a change the repository
+    /// didn't have. The batch is refused if one's heads differ now.
+    #[serde(default, skip_serializing_if = "List::is_empty")]
+    #[param(value_type = Option<String>)]
+    pub expect: List<Expected>,
+}
+
+/// The heads of a change as someone saw them, written
+/// `<change>=<head>+<head>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Expected {
+    /// The change.
+    pub change: ChangeId,
+    /// Its heads: none if the repository didn't have it.
+    pub heads: Vec<RevisionId>,
+}
+
+impl fmt::Display for Expected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}=", self.change)?;
+        for (i, head) in self.heads.iter().enumerate() {
+            let separator = if i == 0 { "" } else { "+" };
+            write!(f, "{separator}{head}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Expected {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let invalid = |error: crate::ParseIdError| format!("invalid heads {input:?}: {error}");
+        let (change, heads) = input
+            .split_once('=')
+            .ok_or_else(|| format!("invalid heads {input:?}: expected <change>=<head>+<head>"))?;
+        let heads = heads
+            .split('+')
+            .filter(|head| !head.is_empty())
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .map_err(invalid)?;
+        Ok(Self {
+            change: change.parse().map_err(invalid)?,
+            heads,
+        })
+    }
 }
 
 /// What putting a batch of records did.
@@ -172,6 +291,8 @@ pub struct LogQuery {
     /// default.
     #[serde(default)]
     pub since: u64,
+    /// Return at most this many acceptances: all by default.
+    pub limit: Option<u64>,
 }
 
 /// One acceptance of a target's log.
@@ -220,6 +341,10 @@ pub struct EventsQuery {
     /// The cursor to read after: the `next` of the previous page. By
     /// default, the end of the stream, so only new events come.
     pub cursor: Option<u64>,
+    /// The generation of the op log the cursor is of, as its page said. A
+    /// cursor of another generation, such as from before the repository
+    /// was restored, has expired.
+    pub generation: Option<String>,
     /// How long to wait for events, such as `30s`. Without it, the answer
     /// comes at once, possibly empty.
     #[param(value_type = Option<String>)]
@@ -327,6 +452,23 @@ mod tests {
         for invalid in ["", ".hidden", "a/b", "sp ace"] {
             assert!(RepoName::new(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn expected_heads_round_trip() {
+        let change = ChangeId::from_bytes([1; 16]);
+        let heads = [
+            RevisionId::from_bytes([2; 32]),
+            RevisionId::from_bytes([3; 32]),
+        ];
+        for heads in [&heads[..], &heads[..1], &[]] {
+            let expected = Expected {
+                change,
+                heads: heads.to_vec(),
+            };
+            assert_eq!(expected.to_string().parse::<Expected>(), Ok(expected));
+        }
+        assert!("nonsense".parse::<Expected>().is_err());
     }
 
     #[test]

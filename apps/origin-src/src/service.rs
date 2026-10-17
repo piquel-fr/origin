@@ -19,22 +19,24 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::iter;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use origin_platform::Native;
 use origin_shared::api::{
-    Annotation, ErrorCode, EventsQuery, LandRequest, Landings, LogEntry, NewTarget, RevisionEntry,
-    Revisions, Stored, TargetInfo,
+    Annotation, ErrorCode, EventsQuery, Expected, FetchSnapshot, Inventory, InventoryRequest,
+    LandRequest, Landings, LogEntry, LogQuery, NewTarget, RevisionEntry, Revisions, Stored,
+    TargetInfo,
 };
 use origin_shared::event::{Filter, Page};
 use origin_shared::landing::{Pending, Proposal};
 use origin_shared::object::DecodeError;
-use origin_shared::pack::Pack;
+use origin_shared::pack::{Pack, Packer, Part};
 use origin_shared::{
     Base, ChangeId, Head, NodeKey, Object, ObjectId, ObjectKind, Principal, PrincipalName,
-    RecordId, Statement, StatementId, TargetName,
+    RecordId, Statement, StatementId, TargetName, TreeId,
 };
 
 use crate::annotations::{AnnotateError, Annotations};
@@ -79,6 +81,8 @@ pub struct OriginService {
     /// The record indexes kept open, but those in use: see the module.
     indexes: Mutex<Vec<Index>>,
     wakeup: Wakeup,
+    /// The most bytes a fetch's answer holds: [`Pack::LIMIT`], but in tests.
+    pack_limit: usize,
 }
 
 impl OriginService {
@@ -99,6 +103,16 @@ impl OriginService {
             node,
             indexes: Mutex::default(),
             wakeup: Wakeup::default(),
+            pack_limit: Pack::LIMIT,
+        }
+    }
+
+    /// The service, answering fetches in parts of at most `limit` bytes.
+    #[cfg(test)]
+    pub(crate) fn with_pack_limit(self, limit: usize) -> Self {
+        Self {
+            pack_limit: limit,
+            ..self
         }
     }
 
@@ -179,17 +193,138 @@ impl OriginService {
         self.indexes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The objects `ids` name, in their order, as a pack.
+    /// The records `ids` name, in their order, as a pack: revisions,
+    /// statements and acceptances, each followed by the blob it carries, if
+    /// the repository has it: a revision's description, a statement's
+    /// payload. Snapshots only leave through [`OriginService::snapshot`].
+    /// The pack stops short at [`Pack::LIMIT`], before a record that
+    /// doesn't fit with its blob: the rest comes from asking for the ids
+    /// after the last record it has.
     ///
     /// # Errors
     ///
-    /// Fails if the repository doesn't have one, or cannot read it.
-    pub fn records(&self, _caller: &Caller, ids: &[ObjectId]) -> Result<Pack, ServiceError> {
-        let objects = ids
+    /// Fails if the repository doesn't have one, one is a blob or a tree, or
+    /// it cannot read one.
+    pub fn records(&self, _caller: &Caller, ids: &[ObjectId]) -> Result<Part, ServiceError> {
+        let mut packer = Packer::new(self.pack_limit);
+        for &id in ids {
+            let object = self.store.read(id)?;
+            let carried = match object
+                .decode()
+                .map_err(|source| StoreError::Decode { id, source })?
+            {
+                Object::Blob(_) | Object::Tree(_) => return Err(ServiceError::NotARecord(id)),
+                Object::Revision(revision) => Some(revision.description.into()),
+                Object::Statement(statement) => statement.payload.map(Into::into),
+                Object::Acceptance(_) => None,
+            };
+            let carried = carried
+                .map(|id| self.store.try_read(id))
+                .transpose()?
+                .flatten();
+            let group: Vec<_> = iter::once(object).chain(carried).collect();
+            if !packer.fits(&group) {
+                return Ok(Part {
+                    pack: packer.finish(),
+                    more: true,
+                });
+            }
+            packer.extend(group);
+        }
+        Ok(Part {
+            pack: packer.finish(),
+            more: false,
+        })
+    }
+
+    /// The objects of the snapshot the request names that the caller lacks,
+    /// as a pack, parents before children: those none of the snapshots it
+    /// has holds at the same path, under the paths it asks for, but the
+    /// first `skip`. See [`Store::added`]. The pack stops short at
+    /// [`Pack::LIMIT`]: the rest comes from asking again, skipping what
+    /// came.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the repository doesn't have the snapshot, or cannot read
+    /// it.
+    pub fn snapshot(
+        &self,
+        _caller: &Caller,
+        request: &FetchSnapshot,
+    ) -> Result<Part, ServiceError> {
+        let is_tree = |id: TreeId| -> Result<bool, StoreError> {
+            let object = self.store.try_read(id.into())?;
+            Ok(object.is_some_and(|object| object.kind().ok() == Some(ObjectKind::Tree)))
+        };
+        if !is_tree(request.snapshot)? {
+            return Err(ServiceError::UnknownSnapshot(request.snapshot));
+        }
+        let mut have = Vec::new();
+        for &id in &request.have {
+            if is_tree(id)? {
+                have.push(id);
+            }
+        }
+        let added = self.store.added(request.snapshot, &have, &request.paths)?;
+        let skip = usize::try_from(request.skip).unwrap_or(usize::MAX);
+        let ids: Vec<ObjectId> = added
             .iter()
-            .map(|&id| self.store.read(id))
-            .collect::<Result<_, _>>()?;
-        Ok(Pack { objects })
+            .skip(skip)
+            .map(|placed| placed.entry.id)
+            .collect();
+        let mut packer = Packer::new(self.pack_limit);
+        let mut more = false;
+        self.store.read_each(&ids, |object| {
+            more = !packer.fits([&object]);
+            if !more {
+                packer.extend([object]);
+            }
+            Ok::<_, StoreError>(!more)
+        })?;
+        Ok(Part {
+            pack: packer.finish(),
+            more,
+        })
+    }
+
+    /// What the repository holds of each change: its revisions and heads,
+    /// and the statements about them, by id. A change it never heard of
+    /// has none.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the index cannot be read.
+    pub fn inventory(
+        &self,
+        _caller: &Caller,
+        request: &InventoryRequest,
+    ) -> Result<Vec<Inventory>, ServiceError> {
+        self.annotations(|annotations| {
+            let index = annotations.index();
+            Ok(request
+                .changes
+                .iter()
+                .map(|&change| {
+                    let revisions = index.revisions(change).to_vec();
+                    let mut subjects: Vec<_> =
+                        revisions.iter().copied().map(RecordId::Revision).collect();
+                    let mut statements = Vec::new();
+                    while let Some(subject) = subjects.pop() {
+                        for &statement in index.statements(subject) {
+                            statements.push(statement);
+                            subjects.push(RecordId::Statement(statement));
+                        }
+                    }
+                    Inventory {
+                        change,
+                        heads: index.heads(change),
+                        revisions,
+                        statements,
+                    }
+                })
+                .collect())
+        })
     }
 
     /// Writes the objects of `pack`: snapshots, revisions and statements.
@@ -210,10 +345,29 @@ impl OriginService {
     ///
     /// Fails if an object is malformed, an acceptance, or needs an object
     /// neither the pack nor the repository has, or one of another kind, if
-    /// a promotion doesn't
-    /// match its original, which leaves the other records stored, or if
-    /// the objects cannot be written.
-    pub fn put_records(&self, _caller: &Caller, pack: Pack) -> Result<Stored, ServiceError> {
+    /// a promotion doesn't match its original, which leaves the other
+    /// records stored, or if the objects cannot be written.
+    pub fn put_records(&self, caller: &Caller, pack: Pack) -> Result<Stored, ServiceError> {
+        self.push(caller, pack, &[])
+    }
+
+    /// Puts `pack` like [`OriginService::put_records`], if each change of
+    /// `expect` has the heads it names when its records are published: a
+    /// compare-and-swap, which every other publication of revisions waits
+    /// for, puts and the landing queue's rebases alike. So of two pushes
+    /// made from the same view of a change, or a push and a rebase, the
+    /// second is refused instead of making it diverge.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`OriginService::put_records`], or if a change of
+    /// `expect` moved, which publishes no record, only snapshots.
+    pub fn push(
+        &self,
+        _caller: &Caller,
+        pack: Pack,
+        expect: &[Expected],
+    ) -> Result<Stored, ServiceError> {
         // Objects this finds stored stay until what refers to them is.
         let _held = self.store.hold_objects()?;
         let held: HashMap<ObjectId, Option<ObjectKind>> = pack
@@ -237,7 +391,7 @@ impl OriginService {
             let decoded = object
                 .decode()
                 .map_err(|source| ServiceError::Malformed { id, source })?;
-            for (needed, kind) in Dependencies::of(&decoded) {
+            for (needed, kind) in Dependencies::of(&decoded).all() {
                 match held.get(&needed) {
                     Some(&held) if held != Some(kind) => {
                         return Err(ServiceError::WrongKind { id, needed, kind });
@@ -275,10 +429,22 @@ impl OriginService {
         self.check_kinds(&stored)?;
         dependencies.commit()?;
         let mut new = 0;
+        if !snapshots.is_empty() {
+            new += self.store.write_all(&snapshots)?;
+        }
+        // Held until the records are published, so nothing else moves the
+        // changes in between: see `Store::lock_pushes`.
+        let _pushing = if !revisions.is_empty() || !expect.is_empty() {
+            let lock = self.store.lock_pushes()?;
+            self.check_heads(expect)?;
+            Some(lock)
+        } else {
+            None
+        };
         // Each layer durable before the next, as a workspace writes them:
         // statements before the revisions they're about, so a crash never
         // publishes a revision without its `core.conflict`.
-        for layer in [snapshots, statements, revisions] {
+        for layer in [statements, revisions] {
             if !layer.is_empty() {
                 new += self.store.write_all(&layer)?;
             }
@@ -308,6 +474,23 @@ impl OriginService {
         }
         self.wakeup.notify();
         Ok(Stored { new: new as u64 })
+    }
+
+    /// Checks that each change of `expect` has the heads it names.
+    fn check_heads(&self, expect: &[Expected]) -> Result<(), ServiceError> {
+        self.annotations(|annotations| {
+            for expected in expect {
+                let heads = annotations.index().heads(expected.change);
+                let now: HashSet<_> = heads.iter().collect();
+                if now != expected.heads.iter().collect() {
+                    return Err(ServiceError::Moved {
+                        change: expected.change,
+                        heads,
+                    });
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Checks that each object of `stored`, which the repository has, is of
@@ -395,24 +578,23 @@ impl OriginService {
         Ok(targets)
     }
 
-    /// The acceptances of `target` from position `since` on, oldest first.
+    /// The acceptances of the query's target from position `since` on,
+    /// oldest first, up to its `limit`.
     ///
     /// # Errors
     ///
     /// Fails if the target doesn't exist, or its log or an acceptance
     /// cannot be read.
-    pub fn log(
-        &self,
-        _caller: &Caller,
-        target: &TargetName,
-        since: u64,
-    ) -> Result<Vec<LogEntry>, ServiceError> {
+    pub fn log(&self, _caller: &Caller, query: &LogQuery) -> Result<Vec<LogEntry>, ServiceError> {
+        let target = &query.target;
         if self.store.head(target)?.is_none() {
             return Err(ServiceError::UnknownTarget(target.clone()));
         }
-        self.store
-            .log_since(target, since)?
-            .into_iter()
+        let mut ids = self.store.log_since(target, query.since)?;
+        if let Some(limit) = query.limit {
+            ids.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        ids.into_iter()
             .map(|id| {
                 Ok(LogEntry {
                     id,
@@ -462,8 +644,7 @@ impl OriginService {
         landed
     }
 
-    /// The target the stack of `change` is on: that of the acceptance at
-    /// the bottom of its head's stack.
+    /// The target the stack of `change` is on: that of its head's.
     fn target_of(&self, index: &Index, change: ChangeId) -> Result<TargetName, ServiceError> {
         let head = match index.heads(change)[..] {
             [head] => head,
@@ -476,18 +657,7 @@ impl OriginService {
                 .into());
             }
         };
-        let mut base = self.store.get(head)?.base;
-        let acceptance = loop {
-            match base {
-                Base::Revision(id) => base = self.store.get(id)?.base,
-                Base::Acceptance(id) => break id,
-            }
-        };
-        let target = self.store.get(acceptance)?.body().target;
-        Ok(self
-            .store
-            .target_name(target)?
-            .ok_or(StoreError::NotFound(acceptance.into()))?)
+        Ok(self.store.stack_target(head)?)
     }
 
     /// Every landing that waits, on every target, and why.
@@ -525,8 +695,15 @@ impl OriginService {
     /// # Errors
     ///
     /// Fails if the op log no longer keeps the events after the cursor, or
-    /// it or a record cannot be read.
+    /// isn't of the generation the query names, or it or a record cannot
+    /// be read.
     pub fn events(&self, _caller: &Caller, query: &EventsQuery) -> Result<Page, ServiceError> {
+        let generation = self.store.oplog().generation()?;
+        if let Some(theirs) = &query.generation
+            && *theirs != generation
+        {
+            return Err(ServiceError::OtherLog(theirs.clone()));
+        }
         let events = Events::new(&self.store).waking_on(&self.wakeup);
         let cursor = match query.cursor {
             Some(cursor) => cursor,
@@ -541,42 +718,56 @@ impl OriginService {
             .unwrap_or(Self::MAX_EVENTS)
             .min(Self::MAX_EVENTS) as usize;
         let wait = query.wait.map_or(Duration::ZERO, |wait| wait.0);
-        Ok(events.wait(cursor, &filter, limit, wait.min(Self::MAX_WAIT))?)
+        let page = events.wait(cursor, &filter, limit, wait.min(Self::MAX_WAIT))?;
+        Ok(Page { generation, ..page })
     }
 }
 
 /// What an object needs the repository to have for it to be usable, as
-/// [`OriginService::put_records`] lists, and the kind each must be. A
+/// [`OriginService::put_records`] lists, and the kind each must be: the
+/// records it refers to, and the content, snapshots and blobs. A
 /// revision's predecessors and a statement's payload are history and
 /// details: the repository may lack them, and retention may have dropped a
-/// payload.
-struct Dependencies;
+/// payload. An acceptance needs nothing here: its chain brings what it
+/// refers to.
+#[derive(Debug, Default)]
+pub(crate) struct Dependencies {
+    /// Revisions, statements and acceptances.
+    pub records: Vec<(ObjectId, ObjectKind)>,
+    /// Trees and blobs.
+    pub content: Vec<(ObjectId, ObjectKind)>,
+}
 
 impl Dependencies {
-    fn of(object: &Object) -> Vec<(ObjectId, ObjectKind)> {
+    pub(crate) fn of(object: &Object) -> Self {
         match object {
-            Object::Blob(_) | Object::Acceptance(_) => Vec::new(),
-            Object::Tree(tree) => tree
-                .iter()
-                .map(|(_, entry)| (entry.id, entry.kind.object_kind()))
-                .collect(),
+            Object::Blob(_) | Object::Acceptance(_) => Self::default(),
+            Object::Tree(tree) => Self {
+                records: Vec::new(),
+                content: tree
+                    .iter()
+                    .map(|(_, entry)| (entry.id, entry.kind.object_kind()))
+                    .collect(),
+            },
             Object::Revision(revision) => {
                 let base = match revision.base {
                     Base::Acceptance(id) => (id.into(), ObjectKind::Acceptance),
                     Base::Revision(id) => (id.into(), ObjectKind::Revision),
                 };
-                let mut needed = vec![
-                    (revision.snapshot.into(), ObjectKind::Tree),
-                    (revision.description.into(), ObjectKind::Blob),
-                    base,
-                ];
-                needed.extend(
+                let mut records = vec![base];
+                records.extend(
                     revision
                         .deps
                         .iter()
                         .map(|&id| (id.into(), ObjectKind::Revision)),
                 );
-                needed
+                Self {
+                    records,
+                    content: vec![
+                        (revision.snapshot.into(), ObjectKind::Tree),
+                        (revision.description.into(), ObjectKind::Blob),
+                    ],
+                }
             }
             Object::Statement(statement) => Self::of_statement(statement),
         }
@@ -584,16 +775,25 @@ impl Dependencies {
 
     /// What a statement needs: its subject, and the statements it
     /// supersedes or promotes.
-    fn of_statement(statement: &Statement) -> Vec<(ObjectId, ObjectKind)> {
+    pub(crate) fn of_statement(statement: &Statement) -> Self {
+        let mut dependencies = Self::default();
         let subject = (statement.subject.into(), statement.subject.kind());
-        [Some(subject)]
-            .into_iter()
-            .chain(
-                [statement.supersedes, statement.promoted_from]
-                    .map(|id| id.map(|id| (id.into(), ObjectKind::Statement))),
-            )
-            .flatten()
-            .collect()
+        match statement.subject {
+            RecordId::Snapshot(_) => dependencies.content.push(subject),
+            _ => dependencies.records.push(subject),
+        }
+        dependencies.records.extend(
+            [statement.supersedes, statement.promoted_from]
+                .into_iter()
+                .flatten()
+                .map(|id| (id.into(), ObjectKind::Statement)),
+        );
+        dependencies
+    }
+
+    /// Every object needed, and the kind it must be.
+    pub(crate) fn all(&self) -> impl Iterator<Item = (ObjectId, ObjectKind)> {
+        self.records.iter().chain(&self.content).copied()
     }
 }
 
@@ -615,6 +815,12 @@ pub enum ServiceError {
     /// No target has this name.
     #[error("no target is named `{0}`")]
     UnknownTarget(TargetName),
+    /// The repository has no such snapshot.
+    #[error("snapshot {0} not found")]
+    UnknownSnapshot(TreeId),
+    /// A blob or a tree was fetched as a record.
+    #[error("{0} is not a record: fetch snapshots by walking them")]
+    NotARecord(ObjectId),
     /// A target was proposed for landing without a target to land on.
     #[error("landing a target needs a target to land on")]
     NoTarget,
@@ -650,6 +856,22 @@ pub enum ServiceError {
         /// The kind it must be.
         kind: ObjectKind,
     },
+    /// A push expected a change's heads to be where they no longer are.
+    #[error(
+        "change {} moved on the remote since it was fetched: run `origin fetch`, then \
+         `origin converge {}` if it diverged",
+        change.short(),
+        change.short()
+    )]
+    Moved {
+        /// The change.
+        change: ChangeId,
+        /// Its heads now.
+        heads: Vec<origin_shared::RevisionId>,
+    },
+    /// An events cursor is of another op log than the repository's.
+    #[error("the cursor is of another op log, generation {0}: read from the end")]
+    OtherLog(String),
     /// A statement put isn't one the repository accepts: a promotion that
     /// doesn't match its original.
     #[error("statement {} cannot be put", .id.short())]
@@ -675,10 +897,12 @@ impl ServiceError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::UnknownRepository(_) | Self::UnknownChange(_) | Self::UnknownTarget(_) => {
-                ErrorCode::NotFound
-            }
+            Self::UnknownRepository(_)
+            | Self::UnknownChange(_)
+            | Self::UnknownTarget(_)
+            | Self::UnknownSnapshot(_) => ErrorCode::NotFound,
             Self::NoTarget
+            | Self::NotARecord(_)
             | Self::Malformed { .. }
             | Self::Acceptance(_)
             | Self::Missing { .. }
@@ -687,6 +911,8 @@ impl ServiceError {
                 AnnotateError::Store(error) => Self::store_code(error),
                 _ => ErrorCode::BadRequest,
             },
+            Self::Moved { .. } => ErrorCode::Conflict,
+            Self::OtherLog(_) => ErrorCode::Expired,
             Self::Land(error) => match error {
                 LandError::UnknownTarget(_) | LandError::UnknownChange(_) => ErrorCode::NotFound,
                 LandError::TargetExists(_)
@@ -695,6 +921,7 @@ impl ServiceError {
                 | LandError::NotAuthority { .. }
                 | LandError::WrongKey(_)
                 | LandError::Divergent { .. }
+                | LandError::Moved(_)
                 | LandError::Abandoned(_)
                 | LandError::Unresolved { .. }
                 | LandError::InvalidPolicy(_) => ErrorCode::Conflict,

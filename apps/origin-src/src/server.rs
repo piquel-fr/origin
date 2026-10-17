@@ -66,7 +66,11 @@ impl ServerConfig {
             fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
         let mut config: Self = toml::from_str(&content)
             .with_context(|| format!("invalid configuration in {}", path.display()))?;
-        let base = path.parent().unwrap_or(Path::new("."));
+        // A file in the current directory has an empty parent.
+        let base = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         config.key = base.join(&config.key);
         for repo in config.repos.values_mut() {
             *repo = base.join(&*repo);
