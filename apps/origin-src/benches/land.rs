@@ -9,12 +9,13 @@ use std::thread;
 use divan::Bencher;
 use divan::counter::ItemsCount;
 use origin_platform::Native;
+use origin_shared::landing::Landing;
 use origin_shared::{
     AcceptanceId, Base, ChangeId, EncodedObject, EntryKind, EntryName, Kind, NodeKey,
     PrincipalName, Record, RecordId, Revision, Statement, TargetName, Tree, TreeEntry, Verdict,
 };
 use origin_src::annotations::Annotations;
-use origin_src::queue::{Landing, Queue};
+use origin_src::queue::Queue;
 use origin_src::store::Store;
 
 fn main() {
@@ -103,7 +104,11 @@ impl Repo {
     }
 
     fn land_on(&self, change: ChangeId, onto: &TargetName) {
-        let landings = self.queue().land_change(change, onto).unwrap();
+        let mut annotations = Annotations::open(&self.store).unwrap();
+        let landings = self
+            .queue()
+            .land_change(&mut annotations, change, onto)
+            .unwrap();
         assert!(
             matches!(landings[..], [Landing::Landed { .. }]),
             "{landings:?}"
@@ -193,9 +198,10 @@ fn land_target_after_long_histories(bencher: Bencher<'_, '_>) {
             repo.land_on(change, &feature);
         })
         .bench_local_values(|()| {
+            let mut annotations = Annotations::open(&repo.store).unwrap();
             let landing = repo
                 .queue()
-                .land_target(&feature, &TargetName::MAIN)
+                .land_target(&mut annotations, &feature, &TargetName::MAIN)
                 .unwrap();
             assert!(matches!(landing, Landing::Landed { .. }), "{landing:?}");
         });

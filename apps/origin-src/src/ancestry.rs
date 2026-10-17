@@ -183,6 +183,6 @@ mod tests {
     #[test]
     fn unrelated_histories_have_none() {
         let history = ancestry(&[(2, &[1]), (4, &[3])]);
-        assert_eq!(bases(&history, &[2, 4]), []);
+        assert_eq!(bases(&history, &[2, 4]), Vec::<u8>::new());
     }
 }

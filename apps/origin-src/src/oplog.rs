@@ -78,12 +78,12 @@ use std::sync::{Arc, OnceLock};
 use std::{fmt, iter};
 
 use origin_platform::{DurableWrite, LockMode, LockedFile, Platform};
+use origin_shared::landing::Proposal;
 use origin_shared::object::{DecodeError, Reader};
 use origin_shared::{AcceptanceId, ChangeId, ObjectId, RevisionId, TargetName};
 
 use crate::frames::{Frames, Tail, Writer};
 use crate::index;
-use crate::queue::Proposal;
 use crate::store::{Store, StoreError};
 
 /// Who a store writes for, as the op log records it: a command, and the
