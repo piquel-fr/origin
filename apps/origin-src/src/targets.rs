@@ -29,6 +29,7 @@ use origin_shared::{
     Acceptance, AcceptanceId, Base, Record, Revision, RevisionId, Source, TargetId, TargetName,
 };
 
+use crate::oplog::Effect;
 use crate::store::{Store, StoreError};
 
 /// The latest acceptance of a target.
@@ -233,6 +234,23 @@ impl<P: Platform> Store<P> {
             .then_some(next))
     }
 
+    /// The name of the target `id`, or `None` if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Fails if its name cannot be read or is malformed.
+    pub fn target_name(&self, id: TargetId) -> Result<Option<TargetName>, StoreError> {
+        let path = self.target_files(id).name();
+        TargetFiles::read(&path)?
+            .map(|bytes| {
+                String::from_utf8(bytes)
+                    .ok()
+                    .and_then(|name| TargetName::new(name).ok())
+                    .ok_or(StoreError::Malformed(path))
+            })
+            .transpose()
+    }
+
     /// The names of every target, in no particular order.
     ///
     /// # Errors
@@ -333,7 +351,8 @@ impl<P: Platform> Store<P> {
         Ok(id)
     }
 
-    /// Durably replaces the head of a target. Publishing the first
+    /// Durably replaces the head of a target, logging that it advanced, from
+    /// which its event comes. Publishing the first
     /// acceptance creates the target: its name is written too, and its
     /// directory made durable.
     fn publish(
@@ -349,7 +368,12 @@ impl<P: Platform> Store<P> {
         if created {
             write.stage(files.name(), target.as_str().as_bytes())?;
         }
-        write.commit()?;
+        let advanced = Effect::Advanced {
+            target: target.clone(),
+            seq: head.seq,
+            acceptance: head.acceptance,
+        };
+        self.commit_logged(write, &[advanced])?;
         if created {
             self.sync_dir(&self.targets_dir())?;
         }
@@ -561,11 +585,12 @@ mod tests {
                 Synced::Batch(0),
                 Synced::Dir(dir.path().join(".origin/objects/loose").join(shard)),
                 Synced::File,
-                Synced::Batch(1),
+                // The head, and the op log entry saying it advanced.
+                Synced::Batch(2),
                 Synced::Dir(targets),
                 Synced::Dir(target),
             ],
-            "the log, then the head"
+            "the log, then the head, with its op log entry"
         );
     }
 
@@ -585,13 +610,14 @@ mod tests {
         assert_eq!(
             store.platform.0.into_inner().unwrap(),
             [
-                // The acceptance and the index log, which costs no sync of
-                // its own.
+                // The acceptance and its op log entry, which costs no sync
+                // of its own.
                 Synced::Batch(2),
                 Synced::Dir(dir.path().join(".origin/objects/loose")),
                 Synced::Dir(dir.path().join(".origin/objects/loose").join(&hex[..2])),
                 Synced::File,
-                Synced::Batch(1),
+                // The head, and the op log entry saying it advanced.
+                Synced::Batch(2),
                 Synced::Dir(targets),
                 Synced::Dir(target),
             ],

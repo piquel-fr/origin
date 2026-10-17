@@ -2,9 +2,13 @@
 //! `origin` binary.
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 /// A temporary working copy, and a user configuration of its own.
 struct Repo {
@@ -32,6 +36,33 @@ impl Repo {
             .env("ORIGIN_CONFIG_DIR", self.config.path())
             .output()
             .unwrap()
+    }
+
+    /// Starts a long-running command, such as `watch`, returning it and its
+    /// output lines as they come.
+    fn spawn(&self, args: &[&str]) -> (Child, mpsc::Receiver<String>) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_origin"))
+            .args(args)
+            .current_dir(self.dir.path())
+            .env("ORIGIN_CONFIG_DIR", self.config.path())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            for line in stdout.lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        (child, receive)
+    }
+
+    /// The revision the working copy is, in full.
+    fn revision(&self) -> String {
+        self.read(".origin/workspace").trim_end().to_owned()
     }
 
     /// Runs a command that must succeed, returning its output.
@@ -226,6 +257,7 @@ fn a_directory_holding_untracked_files_refuses_to_become_a_file() {
     // The files it removed are back, and the working copy stays.
     assert_eq!(repo.read("a/b"), "in a directory\n");
     assert_eq!(repo.read("a/.git/HEAD"), "ref\n");
+    assert!(!repo.path(".origin/moving").exists());
     let status = repo.ok(&["status"]);
     assert!(status.contains(" Directory\n"), "{status}");
     assert_eq!(fs::read_to_string(&pointer).unwrap(), revision);
@@ -1125,4 +1157,315 @@ fn a_refused_pull_writes_nothing() {
     assert!(pulled.contains("On top of: main #1\n"), "{pulled}");
     let status = repo.ok_in(&other, &["status"]);
     assert!(!status.contains("divergent"), "{status}");
+}
+
+#[test]
+fn undo_moves_the_working_copy_back_one_operation_at_a_time() {
+    let repo = Repo::new();
+    let first = repo.change();
+    repo.write("a", "a\n");
+    repo.ok(&["describe", "Add a"]);
+    repo.ok(&["new", "Second"]);
+    assert_ne!(repo.change(), first);
+
+    let undone = repo.ok(&["undo"]);
+    assert!(undone.starts_with("Undid #"), "{undone}");
+    assert!(undone.contains(": origin new Second\n"), "{undone}");
+    assert_eq!(repo.change(), first);
+
+    // Describing makes a newer revision of the change: undoing it restores
+    // the description in another one, so the change keeps a single head.
+    repo.ok(&["describe", "Renamed"]);
+    repo.ok(&["undo"]);
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.starts_with(&format!("Working copy: {first} Add a\n")),
+        "{status}"
+    );
+    assert!(!repo.ok(&["evolog", &first]).contains("divergent"));
+
+    // Then the first description, back to the edits it was made on, and
+    // then nothing is left but creating the repository.
+    repo.ok(&["undo"]);
+    let status = repo.ok(&["status"]);
+    assert!(status.starts_with(&format!("Working copy: {first} (no description)\n")));
+    assert!(status.ends_with("A a\n"), "the edits stay: {status}");
+    assert!(
+        repo.fails(&["undo"])
+            .contains("nothing to undo but the creation")
+    );
+}
+
+#[test]
+fn undoing_a_resolution_restores_the_conflict() {
+    let repo = Repo::new();
+    repo.write("image", "base\0");
+    repo.ok(&["describe", "Shared work"]);
+    let change = repo.change();
+    let pointer = repo.path(".origin/workspace");
+    let started = fs::read_to_string(&pointer).unwrap();
+    repo.write("image", "left\0");
+    repo.ok(&["status"]);
+    fs::write(&pointer, started).unwrap();
+    repo.write("image", "right\0");
+    repo.ok(&["converge", &change]);
+    repo.ok(&["resolve", "image"]);
+    assert!(!repo.ok(&["status"]).contains("Conflicts"));
+
+    repo.ok(&["undo"]);
+    assert!(repo.ok(&["status"]).contains("Conflicts: image hold"));
+    assert!(repo.fails(&["land"]).contains("unresolved conflicts"));
+}
+
+#[test]
+fn undo_moves_only_its_own_workspace() {
+    let repo = Repo::new();
+    let others = tempfile::tempdir().unwrap();
+    let ws = others.path().join("ws");
+    repo.workspace(&ws, &[]);
+    repo.ok_in(&ws, &["new", "Agent work"]);
+    repo.ok(&["new", "Main work"]);
+    let main = repo.change();
+
+    // The latest operation is main's, but the workspace undoes its own.
+    let agent = repo.ok_in(&ws, &["undo"]);
+    assert!(agent.contains(": origin new Agent work\n"), "{agent}");
+    assert_eq!(repo.change(), main);
+
+    let log = repo.ok(&["op", "log"]);
+    let headers: Vec<_> = log
+        .lines()
+        .filter(|line| !line.starts_with("    "))
+        .collect();
+    assert!(
+        headers[0].starts_with("○ #") && headers[0].ends_with(": origin undo"),
+        "{log}"
+    );
+    assert!(headers[1].starts_with("@ #") && headers[1].ends_with(": origin new Main work"));
+    assert!(headers[1].contains(&repo.dir.path().display().to_string()));
+    assert!(log.contains("    undid #"), "{log}");
+    assert_eq!(
+        repo.ok(&["op", "log", "-n", "1"]).lines().count(),
+        2,
+        "the undo, and its move"
+    );
+}
+
+/// Makes a directory read-only, or writable again, so a checkout writing
+/// into it fails part of the way.
+fn read_only(dir: &Path, read_only: bool) {
+    let mode = if read_only { 0o555 } else { 0o755 };
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn a_move_cut_short_is_finished_without_losing_edits() {
+    let repo = Repo::new();
+    repo.write("a", "a\n");
+    repo.write("keep", "keep\n");
+    repo.write("ro/b", "b\n");
+    repo.ok(&["describe", "First"]);
+    let first = repo.change();
+    let revision = repo.revision();
+    repo.ok(&["new", "Second"]);
+    repo.write("a", "changed\n");
+    fs::remove_file(repo.path("ro/b")).unwrap();
+    repo.ok(&["status"]);
+
+    // `edit` back to the first change stops after writing `a`.
+    read_only(&repo.path("ro"), true);
+    repo.fails(&["edit", &first]);
+    assert!(repo.path(".origin/moving").exists());
+    assert_eq!(repo.read("a"), "a\n");
+    // Edits made before the next command finishes the move.
+    repo.write("notes", "mine\n");
+    repo.write("keep", "edited\n");
+    read_only(&repo.path("ro"), false);
+
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.starts_with("Finished moving the working copy to "),
+        "{status}"
+    );
+    assert!(
+        status.contains("Working copy: ") && status.contains("A notes\n"),
+        "{status}"
+    );
+    assert_eq!(repo.read("ro/b"), "b\n");
+    assert_eq!(repo.read("keep"), "edited\n");
+    assert_eq!(repo.read("notes"), "mine\n");
+    assert!(!repo.path(".origin/moving").exists());
+    // The edits are a revision after the move's.
+    assert_ne!(repo.revision(), revision);
+    let evolog = repo.ok(&["evolog", &first]);
+    assert!(evolog.contains(&revision[..12]), "{evolog}");
+}
+
+#[test]
+fn a_move_cut_short_before_its_revision_is_written_is_taken_back() {
+    let repo = Repo::new();
+    repo.write("own", "own\n");
+    repo.ok(&["describe", "Feature"]);
+    let change = repo.change();
+    let others = tempfile::tempdir().unwrap();
+    let other = others.path().join("other");
+    repo.workspace(&other, &["--change", &change]);
+    repo.ok(&["new", "--on", "main"]);
+    repo.write("upstream", "upstream\n");
+    repo.write("ro/b", "b\n");
+    assert!(repo.ok(&["land"]).contains(" on main #1\n"));
+
+    // `pull` stops after writing `upstream`, before writing its merge.
+    fs::create_dir(other.join("ro")).unwrap();
+    read_only(&other.join("ro"), true);
+    let evolog = repo.ok_in(&other, &["evolog", &change]);
+    repo.fails_in(&other, &["pull"]);
+    assert!(other.join(".origin/moving").exists());
+    fs::write(other.join("own"), "edited\n").unwrap();
+    read_only(&other.join("ro"), false);
+
+    let status = repo.ok_in(&other, &["status"]);
+    assert!(status.starts_with("Took back a move"), "{status}");
+    assert!(!other.join("upstream").exists());
+    assert_eq!(fs::read_to_string(other.join("own")).unwrap(), "edited\n");
+    assert!(!other.join(".origin/moving").exists());
+    let evolog_after = repo.ok_in(&other, &["evolog", &change]);
+    assert_eq!(
+        evolog_after.lines().count(),
+        evolog.lines().count() + 1,
+        "{evolog_after}"
+    );
+    let pulled = repo.ok_in(&other, &["pull"]);
+    assert!(pulled.contains("On top of: main #1\n"), "{pulled}");
+}
+
+#[test]
+fn an_unreadable_move_marker_leaves_the_files() {
+    let repo = Repo::new();
+    repo.write("a", "a\n");
+    repo.ok(&["describe", "First"]);
+    let first = repo.revision();
+    // A marker no move writes: where it went is unknown.
+    fs::write(repo.path(".origin/moving"), b"").unwrap();
+    repo.write("a", "half checked out\n");
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.starts_with("Found a move of the working copy a crash cut short"),
+        "{status}"
+    );
+    assert_eq!(repo.read("a"), "half checked out\n");
+    assert_ne!(repo.revision(), first, "a snapshot recorded it");
+    assert!(!repo.path(".origin/moving").exists());
+    assert_eq!(
+        fs::read_dir(repo.path(".origin/oplog/writers"))
+            .unwrap()
+            .count(),
+        0,
+        "every write is done, and durable"
+    );
+}
+
+/// Makes the stored object holding `content` unreadable, or readable
+/// again. Writers skip it all the same: the store has it.
+fn unreadable_object(repo: &Repo, content: &[u8], unreadable: bool) {
+    let hex = origin_shared::EncodedObject::blob(content).id().to_hex();
+    let stored = repo.path(&format!(
+        ".origin/objects/loose/{}/{}",
+        &hex[..2],
+        &hex[2..]
+    ));
+    let mode = if unreadable { 0o000 } else { 0o444 };
+    fs::set_permissions(stored, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn a_refused_move_cut_short_is_taken_back() {
+    let repo = Repo::new();
+    repo.write("a", "a file\n");
+    repo.ok(&["describe", "File"]);
+    let file = repo.change();
+    repo.ok(&["new", "Directory"]);
+    fs::remove_file(repo.path("a")).unwrap();
+    repo.write("a/b", "in a directory\n");
+    repo.write("only here", "only here\n");
+    repo.ok(&["status"]);
+    let revision = repo.revision();
+    repo.write("a/.git/HEAD", "ref\n");
+
+    // `edit` removes `only here`, then is refused at `a`, and taking it
+    // back stops before writing `only here` again.
+    unreadable_object(&repo, b"only here\n", true);
+    repo.fails(&["edit", &file]);
+    assert!(repo.path(".origin/moving").exists());
+    unreadable_object(&repo, b"only here\n", false);
+
+    // The next command finishes taking it back, not the refused move.
+    let status = repo.ok(&["status"]);
+    assert!(status.contains(" Directory\n"), "{status}");
+    assert_eq!(repo.read("only here"), "only here\n");
+    assert_eq!(repo.read("a/b"), "in a directory\n");
+    assert_eq!(repo.revision(), revision);
+    assert!(!repo.path(".origin/moving").exists());
+}
+
+#[test]
+fn a_move_that_cannot_be_finished_leaves_the_files() {
+    let repo = Repo::new();
+    repo.write("a", "a\n");
+    repo.write("ro/b", "b\n");
+    repo.ok(&["describe", "First"]);
+    let first = repo.change();
+    repo.ok(&["new", "Second"]);
+    repo.write("a", "changed\n");
+    fs::remove_file(repo.path("ro/b")).unwrap();
+    repo.ok(&["status"]);
+
+    // `edit` stops after writing `a`, and the content finishing it needs
+    // can't be read.
+    read_only(&repo.path("ro"), true);
+    repo.fails(&["edit", &first]);
+    read_only(&repo.path("ro"), false);
+    assert!(repo.path(".origin/moving").exists());
+    unreadable_object(&repo, b"b\n", true);
+
+    // Every command would fail: the files stay as they are instead.
+    let status = repo.ok(&["status"]);
+    assert!(
+        status.starts_with("Cannot finish a move of the working copy a crash cut short"),
+        "{status}"
+    );
+    assert!(status.contains(" Second\n"), "{status}");
+    assert_eq!(repo.read("a"), "a\n");
+    assert!(!repo.path(".origin/moving").exists());
+    repo.ok(&["log"]);
+}
+
+#[test]
+fn watch_prints_events_from_a_cursor_or_as_they_happen() {
+    let repo = Repo::new();
+    let line =
+        |receive: &mpsc::Receiver<String>| receive.recv_timeout(Duration::from_secs(20)).unwrap();
+    // From the start: the targets `init` created.
+    let (mut all, receive) = repo.spawn(&["watch", "--since", "0"]);
+    let policy = line(&receive);
+    assert!(
+        policy.contains(" target.advanced target=policy seq=0 "),
+        "{policy}"
+    );
+    all.kill().unwrap();
+
+    let (mut checks, receive) = repo.spawn(&["watch", "--kind", "ci.*"]);
+    // Let it read where the log ends before anything happens.
+    thread::sleep(Duration::from_millis(500));
+    repo.ok(&["describe", "Work"]);
+    repo.ok(&["annotate", "@", "ci.test", "--pass"]);
+    let issued = line(&receive);
+    checks.kill().unwrap();
+    let fields: Vec<_> = issued.split(' ').collect();
+    assert!(fields[0].parse::<u64>().is_ok(), "a cursor first: {issued}");
+    assert_eq!(fields[1], "statement.issued");
+    assert!(
+        issued.contains(" kind=ci.test verdict=pass issuer=user:ada"),
+        "{issued}"
+    );
 }

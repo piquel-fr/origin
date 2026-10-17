@@ -562,9 +562,10 @@ impl TryFrom<BTreeMap<String, String>> for Retention {
     }
 }
 
-/// The kinds a retention rule applies to.
+/// Statement kinds, as retention rules and `origin watch --kind` name
+/// them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum KindPattern {
+pub enum KindPattern {
     /// `*`: every kind.
     Any,
     /// `ci.*`: the kinds under a prefix, not the prefix itself.
@@ -582,6 +583,12 @@ impl KindPattern {
             Self::Prefix(prefix) => prefix.as_str() == "core" || prefix.is_reserved(),
             Self::Exact(kind) => kind.is_reserved(),
         }
+    }
+
+    /// Whether the pattern matches `kind`.
+    #[must_use]
+    pub fn matches(&self, kind: &Kind) -> bool {
+        self.specificity(kind).is_some()
     }
 
     /// How specifically the pattern matches `kind`, if it does: longer

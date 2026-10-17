@@ -3,14 +3,17 @@
 //! ```text
 //! .origin/
 //!   objects/ targets/ index/   the store, see `store`, `targets` and `index`
+//!   oplog/                     what this node applied, see `oplog`
 //!   workspaces/                the other workspaces, see `registry`
 //!   workspace                  the revision the working copy is
 //!   state                      the stat cache of the last snapshot
+//!   moving                     the move in progress, if a checkout is
 //! ```
 //!
 //! A repository can have several working copies, its workspaces, which
-//! share its store. The others have only `workspace` and `state` in their
-//! `.origin`, and a `repository` file naming the main one's.
+//! share its store and op log. The others have only `workspace`, `state`
+//! and `moving` in their `.origin`, and a `repository` file naming the main
+//! one's.
 //!
 //! The working copy is always a revision of the current change. Every
 //! command that reads it snapshots it first: when the files changed, they
@@ -33,11 +36,33 @@
 //! own. Until then, edits stay unrecorded rather than fork the change, the
 //! commands that only read the working copy say where the change went, and
 //! the others refuse to build on it.
+//!
+//! Every move of the working copy is logged in the op log, in an entry made
+//! durable with the `workspace` file naming the new revision. A move that
+//! changes the files first publishes `moving`, durably, naming the files it
+//! starts from, those it goes to and their revision. It then checks the
+//! files out and makes them durable, writes the revision if it's new,
+//! points `workspace` at it, and removes `moving`, durably too. A crash, or
+//! a power loss, can leave the files half checked out, with `moving`
+//! behind, and the user may edit them before the next command to open the
+//! workspace finishes the move. It only touches the files the move changes
+//! that are still on one side of it, by content: it takes them to the
+//! revision and points `workspace` at it, or back where they were if the
+//! revision wasn't written. Every other file, edited or created since,
+//! stays as it is, and the command's snapshot records it. So does every
+//! file with a `moving` it cannot read, which no move writes, or with one
+//! it cannot finish, such as where a file would replace a directory that
+//! holds what no snapshot tracks: an error that lasts would fail every
+//! command otherwise. Taking back a refused checkout is a move too, back to
+//! the working copy, which publishes `moving` again first: a crash then
+//! finishes taking the files back, not the move refused.
 
 mod annotate;
 mod land;
+mod ops;
 mod registry;
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{self, Path, PathBuf};
@@ -54,6 +79,7 @@ use crate::annotations::{AnnotateError, Annotations};
 use crate::config::{ConfigError, UserConfig};
 use crate::conflict::Conflicts;
 use crate::index::{FindChangeError, FindError, Index};
+use crate::oplog::{Actor, Effect, Move, Why};
 use crate::output::FileDiff;
 use crate::policy::PolicyError;
 use crate::queue::{LandError, Queue};
@@ -68,6 +94,9 @@ pub struct Workspace {
     config: UserConfig,
     /// The revision the working copy was when last snapshotted.
     revision: RevisionId,
+    /// The move a snapshot made, saved with the command's own records,
+    /// which is logged with the command's own move.
+    unlogged: Option<Move>,
 }
 
 /// The working copy as of a snapshot.
@@ -105,6 +134,55 @@ enum Behind {
     Rebased(RevisionId),
 }
 
+/// A move of the working copy in progress, as `moving` records it, so the
+/// next command can finish it if a crash cuts it short.
+#[derive(Debug, PartialEq, Eq)]
+struct Moving {
+    /// The files the move found.
+    from: TreeId,
+    /// The files of `revision`.
+    to: TreeId,
+    /// Where the move goes, which is only written once its files are, if
+    /// it's new.
+    revision: RevisionId,
+    why: Why,
+}
+
+impl Moving {
+    /// The move that takes this one back, to `revision`, the working copy.
+    fn back(&self, revision: RevisionId) -> Self {
+        Self {
+            from: self.to,
+            to: self.from,
+            revision,
+            why: self.why,
+        }
+    }
+
+    /// Parses `<from> <to> <revision> <why>`, as written.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let mut fields = str::from_utf8(bytes).ok()?.trim_end().splitn(4, ' ');
+        Some(Self {
+            from: fields.next()?.parse().ok()?,
+            to: fields.next()?.parse().ok()?,
+            revision: fields.next()?.parse().ok()?,
+            why: Why::parse(fields.next()?)?,
+        })
+    }
+}
+
+impl fmt::Display for Moving {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            from,
+            to,
+            revision,
+            why,
+        } = self;
+        writeln!(f, "{from} {to} {revision} {why}")
+    }
+}
+
 impl WorkingCopy {
     /// The change `prefix` names: `@` for the working copy's, or a unique
     /// prefix of its id.
@@ -131,6 +209,10 @@ impl Workspace {
     /// one's, which holds the store.
     const REPOSITORY: &str = "repository";
 
+    /// The file in [`Workspace::META_DIR`] recording the move of a checkout
+    /// in progress: see [`Moving`].
+    const MOVING: &str = "moving";
+
     /// `origin init`: creates a repository in `root`, with the `policy`
     /// target naming this node the authority of `policy` and `main`, an
     /// empty `main`, and a first change on top of it.
@@ -139,13 +221,13 @@ impl Workspace {
     ///
     /// Fails if `root` already has a repository, the node key cannot be
     /// loaded, or the repository cannot be written.
-    pub fn init(root: &Path, config: UserConfig) -> Result<Self, WorkspaceError> {
+    pub fn init(root: &Path, config: UserConfig, actor: &Actor) -> Result<Self, WorkspaceError> {
         let root = path::absolute(root).map_err(|source| WorkspaceError::io(root, source))?;
         let meta = root.join(Self::META_DIR);
         if meta.exists() {
             return Err(WorkspaceError::AlreadyInitialized(root));
         }
-        let store = Store::new(meta, Native::default());
+        let store = Store::new(meta, Native::default()).with_actor(actor.in_workspace(&root));
         store.init()?;
         let key = config.node_key()?;
 
@@ -169,13 +251,10 @@ impl Workspace {
             store,
             config,
             revision: encoded.id().into(),
+            unlogged: None,
         };
-        // A first revision makes no divergence, which an index would tell.
-        workspace.save(
-            &[vec![empty_description], vec![encoded]],
-            workspace.revision,
-            &mut Index::default(),
-        )?;
+        workspace.write(&[vec![empty_description], vec![encoded]])?;
+        workspace.publish_pointer(None, workspace.revision, Why::Command)?;
         println!(
             "Initialized a repository in {}: node:{} is the authority of `policy` and `main`",
             workspace.root.display(),
@@ -211,24 +290,28 @@ impl Workspace {
         )
     }
 
-    /// Opens the working copy containing `start`.
+    /// Opens the working copy containing `start`, for `actor` to write in.
     ///
     /// # Errors
     ///
     /// Fails if neither `start` nor any parent has a repository, or like
     /// [`Workspace::open`].
-    pub fn discover(start: &Path, config: UserConfig) -> Result<Self, WorkspaceError> {
+    pub fn discover(
+        start: &Path,
+        config: UserConfig,
+        actor: &Actor,
+    ) -> Result<Self, WorkspaceError> {
         let root = start
             .ancestors()
             .find(|dir| dir.join(Self::META_DIR).is_dir())
             .ok_or_else(|| WorkspaceError::NotFound(start.to_owned()))?;
-        Self::open(root, config)
+        Self::open(root, config, actor)
     }
 
     /// Opens the working copy at `root`: the main one, whose `.origin` holds
     /// the store, or another workspace, whose `.origin/repository` names
-    /// the main one's.
-    fn open(root: &Path, config: UserConfig) -> Result<Self, WorkspaceError> {
+    /// the main one's. Finishes a move a crash cut short first.
+    fn open(root: &Path, config: UserConfig, actor: &Actor) -> Result<Self, WorkspaceError> {
         let meta = root.join(Self::META_DIR);
         let repository = meta.join(Self::REPOSITORY);
         let store = match Self::read_path(&repository) {
@@ -241,12 +324,69 @@ impl Workspace {
         };
         let revision =
             Self::read_pointer(root)?.ok_or_else(|| WorkspaceError::Incomplete(root.to_owned()))?;
-        Ok(Self {
+        let mut workspace = Self {
             root: root.to_owned(),
-            store: Store::open_writable(store, Native::default())?,
+            store: Store::open_writable(store, Native::default())?
+                .with_actor(actor.in_workspace(root)),
             config,
             revision,
-        })
+            unlogged: None,
+        };
+        workspace.finish_move()?;
+        Ok(workspace)
+    }
+
+    /// Finishes the move `moving` records, if a crash cut it short, as the
+    /// module explains: takes the files still as the move found them to
+    /// where it went, and points the working copy there, if the move's
+    /// revision was written, or else takes the files it changed back. Files
+    /// on neither side, edited since, stay as they are. So does every file,
+    /// with a `moving` it cannot read, or that it fails to finish.
+    fn finish_move(&mut self) -> Result<(), WorkspaceError> {
+        let path = self.meta(Self::MOVING);
+        let moving = match fs::read(&path) {
+            Ok(moving) => moving,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(WorkspaceError::io(&path, source)),
+        };
+        let Some(moving) = Moving::parse(&moving) else {
+            self.moved()?;
+            println!(
+                "Found a move of the working copy a crash cut short: its files stay as they are"
+            );
+            return Ok(());
+        };
+        let written = self.store.contains(moving.revision.into())?;
+        let (from, to) = if written {
+            (moving.from, moving.to)
+        } else {
+            (moving.to, moving.from)
+        };
+        if let Err(error) = self.restore(from, to) {
+            self.moved()?;
+            println!(
+                "Cannot finish a move of the working copy a crash cut short, so its files stay as they are: {:#}",
+                anyhow::Error::from(error)
+            );
+            return Ok(());
+        }
+        if !written {
+            self.moved()?;
+            println!(
+                "Took back a move of the working copy a crash cut short, before its revision was written"
+            );
+            return Ok(());
+        }
+        if self.revision != moving.revision {
+            self.point_at(moving.revision, moving.why)?;
+        }
+        self.moved()?;
+        let revision = self.store.get(moving.revision)?;
+        println!(
+            "Finished moving the working copy to {}, which a crash cut short",
+            self.headline(&revision)?
+        );
+        Ok(())
     }
 
     /// The revision the working copy at `root` is, if it has one.
@@ -432,7 +572,12 @@ impl Workspace {
     fn inspect(&mut self) -> Result<WorkingCopy, WorkspaceError> {
         let mut working_copy = self.snapshot()?;
         if let Some(unsaved) = working_copy.unsaved.take() {
-            self.save(&[vec![unsaved]], working_copy.id, &mut working_copy.index)?;
+            self.save(
+                &[vec![unsaved]],
+                working_copy.id,
+                Why::Snapshot,
+                &mut working_copy.index,
+            )?;
         }
         Ok(working_copy)
     }
@@ -455,18 +600,34 @@ impl Workspace {
         }
     }
 
+    /// Records the snapshot of a command that saves it with its own
+    /// records as a move of its own, so `undo` takes the command back to the
+    /// edits it recorded. It's logged with the command's move, which starts
+    /// from it.
+    fn log_snapshot(&mut self, working_copy: &WorkingCopy) {
+        if working_copy.unsaved.is_some() {
+            self.unlogged = Some(Move {
+                from: Some(self.revision),
+                to: working_copy.id,
+                why: Why::Snapshot,
+            });
+            self.revision = working_copy.id;
+        }
+    }
+
     /// Writes `layers` of objects, adding them to `index`, then makes
-    /// `revision` the working copy, flagging its change if that made it
-    /// diverge.
+    /// `revision`, which has the working copy's files, the working copy,
+    /// flagging its change if that made it diverge.
     fn save(
         &mut self,
         layers: &[Vec<EncodedObject>],
         revision: RevisionId,
+        why: Why,
         index: &mut Index,
     ) -> Result<(), WorkspaceError> {
         self.write(layers)?;
         index.add(layers.iter().flatten())?;
-        self.point_at(revision)?;
+        self.point_at(revision, why)?;
         self.flag_divergence(index, revision)
     }
 
@@ -479,11 +640,92 @@ impl Workspace {
         Ok(())
     }
 
-    /// Durably records that the working copy is `revision`.
-    fn point_at(&mut self, revision: RevisionId) -> Result<(), WorkspaceError> {
-        self.write_durably(self.meta(Self::POINTER), format!("{revision}\n").as_bytes())?;
-        self.revision = revision;
+    /// Durably records that the working copy, which has the files of
+    /// `revision`, is `revision`, and logs the move.
+    fn point_at(&mut self, revision: RevisionId, why: Why) -> Result<(), WorkspaceError> {
+        self.publish_pointer(Some(self.revision), revision, why)
+    }
+
+    /// Durably records that the working copy moved from `from`, or was
+    /// created, to `to`, with the op log entry saying so, after the move of
+    /// a snapshot the command saved: the entries are durable with
+    /// `workspace`.
+    fn publish_pointer(
+        &mut self,
+        from: Option<RevisionId>,
+        to: RevisionId,
+        why: Why,
+    ) -> Result<(), WorkspaceError> {
+        let mut moves: Vec<_> = self.unlogged.take().into_iter().collect();
+        moves.push(Move { from, to, why });
+        let write = self.store.durable_write();
+        write
+            .stage(self.meta(Self::POINTER), format!("{to}\n").as_bytes())
+            .map_err(StoreError::from)?;
+        let moves: Vec<_> = moves.into_iter().map(Effect::Moved).collect();
+        self.store.commit_logged(write, &moves)?;
+        self.revision = to;
         Ok(())
+    }
+
+    /// Moves the working copy, whose files `working_copy` found, to
+    /// `revision`, `to`, as the module explains: checks it out over them,
+    /// then writes `unwritten`, the layers that write it if it's new, and
+    /// makes it the working copy. A crash before it's done leaves `moving`
+    /// behind, so the next command finishes the move, or takes it back if
+    /// the revision wasn't written. A checkout refused by a file edited
+    /// since the snapshot writes nothing, and takes back the files it
+    /// changed, as a move of its own, so the working copy and its change
+    /// stay where they were.
+    fn switch_to(
+        &mut self,
+        working_copy: &WorkingCopy,
+        to: RevisionId,
+        revision: &Revision,
+        unwritten: &[Vec<EncodedObject>],
+        why: Why,
+    ) -> Result<(), WorkspaceError> {
+        // The files stay as they are: there's nothing to finish.
+        if revision.snapshot == working_copy.files {
+            self.write(unwritten)?;
+            return self.point_at(to, why);
+        }
+        let moving = Moving {
+            from: working_copy.files,
+            to: revision.snapshot,
+            revision: to,
+            why,
+        };
+        self.publish_moving(&moving)?;
+        let checkout = self.checkout(
+            working_copy.files,
+            revision.snapshot,
+            Some(&working_copy.cache),
+        );
+        if let Err(WorkspaceError::Snapshot(SnapshotError::Edited(_))) = checkout {
+            // So a crash finishes taking the files back, not the move, whose
+            // revision may exist.
+            let back = moving.back(working_copy.id);
+            self.publish_moving(&back)?;
+            self.restore(back.from, back.to)?;
+            self.moved()?;
+        }
+        checkout?;
+        self.write(unwritten)?;
+        self.point_at(to, why)?;
+        self.moved()
+    }
+
+    /// Publishes `moving`, durably, before its move changes any file.
+    fn publish_moving(&self, moving: &Moving) -> Result<(), WorkspaceError> {
+        self.write_durably(self.meta(Self::MOVING), moving.to_string().as_bytes())
+    }
+
+    /// Removes `moving`, durably, once its move is done.
+    fn moved(&self) -> Result<(), WorkspaceError> {
+        let path = self.meta(Self::MOVING);
+        fs::remove_file(&path).map_err(|source| WorkspaceError::io(&path, source))?;
+        Ok(self.store.sync_dir(&self.root.join(Self::META_DIR))?)
     }
 
     /// Durably replaces a metadata file.
@@ -494,32 +736,6 @@ impl Workspace {
             .and_then(|()| write.commit())
             .map_err(StoreError::from)?;
         Ok(())
-    }
-
-    /// Moves the working copy, whose files `working_copy` found, to
-    /// `revision`, `to`: checks it out over them, then writes `unwritten`,
-    /// the layers that write it if it's new, and makes it the working copy.
-    /// A checkout refused by a file edited since the snapshot writes
-    /// nothing, and takes back the files it changed, so the working copy
-    /// and its change stay where they were.
-    fn switch_to(
-        &mut self,
-        working_copy: &WorkingCopy,
-        to: RevisionId,
-        revision: &Revision,
-        unwritten: &[Vec<EncodedObject>],
-    ) -> Result<(), WorkspaceError> {
-        let checkout = self.checkout(
-            working_copy.files,
-            revision.snapshot,
-            Some(&working_copy.cache),
-        );
-        if let Err(WorkspaceError::Snapshot(SnapshotError::Edited(_))) = checkout {
-            self.restore(revision.snapshot, working_copy.files)?;
-        }
-        checkout?;
-        self.write(unwritten)?;
-        self.point_at(to)
     }
 
     /// Makes the files still as `from` has them match `to`, durably, and
@@ -666,6 +882,7 @@ impl Workspace {
     pub fn new_change(&mut self, description: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
         let mut working_copy = self.following(working_copy)?;
+        self.log_snapshot(&working_copy);
         let description = EncodedObject::blob(description.as_bytes());
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
@@ -681,7 +898,7 @@ impl Workspace {
         let first = working_copy.unsaved.take().into_iter().chain([description]);
         // It starts with the files of the one below, and their conflicts.
         let layers = self.revision_layers(first.collect(), &encoded, &working_copy.conflicts);
-        self.save(&layers, id, &mut working_copy.index)?;
+        self.save(&layers, id, Why::Command, &mut working_copy.index)?;
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.headline(&working_copy.revision)?);
         Ok(())
@@ -697,6 +914,7 @@ impl Workspace {
     pub fn describe(&mut self, description: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
         let mut working_copy = self.following(working_copy)?;
+        self.log_snapshot(&working_copy);
         let description = EncodedObject::blob(description.as_bytes());
         let revision = Revision {
             predecessors: vec![working_copy.id],
@@ -708,7 +926,7 @@ impl Workspace {
         let id = encoded.id().into();
         let first = working_copy.unsaved.take().into_iter().chain([description]);
         let layers = self.revision_layers(first.collect(), &encoded, &working_copy.conflicts);
-        self.save(&layers, id, &mut working_copy.index)?;
+        self.save(&layers, id, Why::Command, &mut working_copy.index)?;
         println!("Working copy: {}", self.headline(&revision)?);
         Ok(())
     }
@@ -736,7 +954,7 @@ impl Workspace {
         let encoded = revision.encode();
         let id = encoded.id().into();
         let layers = self.revision_layers(Vec::new(), &encoded, &working_copy.conflicts);
-        self.save(&layers, id, &mut working_copy.index)?;
+        self.save(&layers, id, Why::Command, &mut working_copy.index)?;
         println!("Resolved {}", Self::list_paths(&resolved));
         if !working_copy.conflicts.is_empty() {
             Self::print_conflicts(&working_copy.conflicts);
@@ -758,7 +976,7 @@ impl Workspace {
         let head = Self::single_head(index, change)?;
         let revision: Revision = self.store.get(head)?;
         if head != working_copy.id {
-            self.switch_to(&working_copy, head, &revision, &[])?;
+            self.switch_to(&working_copy, head, &revision, &[], Why::Command)?;
         }
         println!("Working copy: {}", self.headline(&revision)?);
         Ok(())
@@ -815,7 +1033,8 @@ impl Workspace {
         let mut layers = self.revision_layers(vec![reason, empty], &encoded, &conflicts);
         // Published before the revision that replaces the change.
         layers[1].push(statement);
-        self.switch_to(&working_copy, encoded.id().into(), &revision, &layers)?;
+        let id = encoded.id().into();
+        self.switch_to(&working_copy, id, &revision, &layers, Why::Command)?;
         println!("Abandoned change {}", change.short());
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
@@ -882,7 +1101,7 @@ impl Workspace {
         let id = encoded.id().into();
         let layers = self.revision_layers(Vec::new(), &encoded, &conflicts);
         if change == working_copy.revision.change {
-            self.switch_to(&working_copy, id, &revision, &layers)?;
+            self.switch_to(&working_copy, id, &revision, &layers, Why::Command)?;
         } else {
             self.write(&layers)?;
         }
@@ -1156,9 +1375,7 @@ impl Workspace {
 
     fn target_name(&self, id: TargetId) -> Result<TargetName, WorkspaceError> {
         self.store
-            .targets()?
-            .into_iter()
-            .find(|target| target.id() == id)
+            .target_name(id)?
             .ok_or(WorkspaceError::UnknownTargetId(id))
     }
 }
@@ -1261,6 +1478,15 @@ pub enum WorkspaceError {
     /// A landing failed.
     #[error(transparent)]
     Land(#[from] LandError),
+    /// `undo` found no operation of this workspace to take back.
+    #[error("nothing to undo: no operation moved this workspace's working copy")]
+    NothingToUndo,
+    /// `undo` reached the operation that created the workspace.
+    #[error(
+        "nothing to undo but the creation of {}: remove it with `origin workspace rm`",
+        .0.display()
+    )]
+    UndoCreation(PathBuf),
 }
 
 impl WorkspaceError {
