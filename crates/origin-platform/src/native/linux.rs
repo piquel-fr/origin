@@ -1,12 +1,12 @@
 //! Linux: `fdatasync` and `fsync`, `syncfs` for batches, `flock`, clones with
-//! the `FICLONE` ioctl (Btrfs, XFS, bcachefs), and file systems told apart by
-//! their `statfs` magic number.
+//! the `FICLONE` ioctl (Btrfs, XFS, bcachefs), `pread`, and file systems told
+//! apart by their `statfs` magic number.
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op};
+use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, ReadAt};
 
 /// The Linux implementation of [`Platform`](crate::Platform).
 #[derive(Clone, Copy, Debug, Default)]
@@ -72,6 +72,8 @@ impl Durability for Linux {
 }
 
 impl FileLock for Linux {}
+
+impl ReadAt for Linux {}
 
 impl CloneFile for Linux {
     /// `FICLONE` reports `EOPNOTSUPP` on file systems that cannot clone,

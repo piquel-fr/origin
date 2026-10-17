@@ -1,6 +1,6 @@
 //! File operations that differ between platforms: durable writes, file
-//! locks, copy-on-write clones, and telling local file systems from network
-//! ones.
+//! locks, copy-on-write clones, positioned reads, and telling local file
+//! systems from network ones.
 //!
 //! Each operation is a trait. Every supported platform implements them in its
 //! own module under [`native`], and [`Native`] picks the one for the build
@@ -16,16 +16,18 @@ mod error;
 mod file_system;
 mod lock;
 pub mod native;
+mod read;
 
 pub use clone::{CloneError, CloneFile};
-pub use durability::{Durability, DurableWrite};
+pub use durability::{Durability, DurableWrite, StagedFile};
 pub use error::{Error, Op};
 pub use file_system::{FileSystem, FsKind, WritableError};
 pub use lock::{FileLock, LockMode, LockedFile};
 pub use native::Native;
+pub use read::ReadAt;
 
 /// Everything origin needs from the platform it runs on, shared by all the
 /// threads of a process.
-pub trait Platform: Durability + FileLock + CloneFile + FileSystem + Send + Sync {}
+pub trait Platform: Durability + FileLock + CloneFile + FileSystem + ReadAt + Send + Sync {}
 
-impl<T: Durability + FileLock + CloneFile + FileSystem + Send + Sync> Platform for T {}
+impl<T: Durability + FileLock + CloneFile + FileSystem + ReadAt + Send + Sync> Platform for T {}

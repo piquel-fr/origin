@@ -11,16 +11,21 @@
 //! survive a crash, so anything that refers to them can be published.
 //! Readers never see a partial object, and concurrent writers of the same
 //! object are harmless. A batch that finds an object already there syncs
-//! its directory too, since the writer that renamed it there may not have
-//! yet. Writers that crash leave temporary files behind,
-//! which [`Store::remove_stale_temps`] removes. Garbage collection calls
-//! it, so opening a store never pays for a walk over every object.
+//! its directory too, since the writer that put it there may not have yet.
+//! Writers that crash leave temporary files behind, which
+//! [`Store::remove_stale_temps`] removes. Garbage collection
+//! ([`Store::gc`]) calls it, so opening a store never pays for a walk over
+//! every object.
+//!
+//! [`Store::compact`] moves small loose objects into [`packs`], and reads
+//! look in the loose objects first, then in the packs.
 
 use std::fs;
 use std::io;
 use std::num::NonZero;
 use std::panic;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -30,11 +35,17 @@ use origin_shared::{EncodedObject, ObjectId, TargetName, TypedId};
 
 use crate::targets::Head;
 
+pub use packs::Compaction;
+use packs::Packs;
+
+pub mod packs;
+
 /// The storage of one repository.
 #[derive(Clone, Debug)]
 pub struct Store<P = Native> {
     root: PathBuf,
     pub(crate) platform: P,
+    packs: Arc<Packs>,
 }
 
 impl<P: Platform> Store<P> {
@@ -53,6 +64,7 @@ impl<P: Platform> Store<P> {
         Self {
             root: root.into(),
             platform,
+            packs: Arc::default(),
         }
     }
 
@@ -69,18 +81,33 @@ impl<P: Platform> Store<P> {
         Ok(store)
     }
 
+    /// Collects garbage: compacts the store, unless another compaction is
+    /// running, then removes the temporary files crashed writes left behind.
+    /// Returns what the compaction did.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::compact`] and [`Store::remove_stale_temps`].
+    pub fn gc(&self) -> Result<Option<Compaction>, StoreError> {
+        let compaction = self.compact()?;
+        self.remove_stale_temps()?;
+        Ok(compaction)
+    }
+
     /// Removes the temporary files that crashed writes left behind: those
-    /// older than [`Store::STALE_TEMP`]. It walks every object, so only
-    /// garbage collection calls it.
+    /// older than [`Store::STALE_TEMP`]. It walks every loose object, so
+    /// only garbage collection calls it. It leaves the packs directory to
+    /// the compactor, which removes what crashed compactions left there
+    /// under its lock, so a long compaction never loses its pack.
     ///
     /// # Errors
     ///
     /// Fails if the store's files cannot be listed or a stale one removed.
     pub fn remove_stale_temps(&self) -> Result<(), StoreError> {
-        Self::remove_stale_temps_in(&self.root)
+        self.remove_stale_temps_in(&self.root)
     }
 
-    fn remove_stale_temps_in(dir: &Path) -> Result<(), StoreError> {
+    fn remove_stale_temps_in(&self, dir: &Path) -> Result<(), StoreError> {
         let io_error = |source| StoreError::io(dir, source);
         for entry in fs::read_dir(dir).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
@@ -91,8 +118,10 @@ impl<P: Platform> Store<P> {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     result => result.map_err(|source| StoreError::io(&path, source))?,
                 }
-            } else if entry.file_type().map_err(io_error)?.is_dir() {
-                Self::remove_stale_temps_in(&entry.path())?;
+            } else if entry.file_type().map_err(io_error)?.is_dir()
+                && entry.path() != self.packs_dir()
+            {
+                self.remove_stale_temps_in(&entry.path())?;
             }
         }
         Ok(())
@@ -123,8 +152,9 @@ impl<P: Platform> Store<P> {
             let shard = loose.join(format!("{shard:02x}"));
             fs::create_dir_all(&shard).map_err(|source| StoreError::io(&shard, source))?;
         }
-        let targets = self.targets_dir();
-        fs::create_dir_all(&targets).map_err(|source| StoreError::io(&targets, source))?;
+        for dir in [self.packs_dir(), self.targets_dir()] {
+            fs::create_dir_all(&dir).map_err(|source| StoreError::io(&dir, source))?;
+        }
         let objects = self.root.join("objects");
         let parent = self.root.parent().unwrap_or(Path::new("."));
         for dir in [&loose, &objects, &self.root, parent] {
@@ -178,36 +208,46 @@ impl<P: Platform> Store<P> {
     /// failure may not be durable.
     pub fn write_all(&self, objects: &[EncodedObject]) -> Result<usize, StoreError> {
         let batch = self.batch();
-        // Asking for the cores reads the cgroup's quota, which costs more than
-        // writing a lone object.
-        let written = if objects.len() > 1 {
-            let threads = thread::available_parallelism()
-                .map_or(1, NonZero::get)
-                .min(objects.len());
-            thread::scope(|scope| {
-                objects
-                    .chunks(objects.len().div_ceil(threads))
-                    .map(|chunk| scope.spawn(|| batch.write_all(chunk)))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|thread| {
-                        thread
-                            .join()
-                            .unwrap_or_else(|panic| panic::resume_unwind(panic))
-                    })
-                    .sum::<Result<usize, _>>()
-            })?
-        } else {
-            batch.write_all(objects)?
-        };
+        let written = Self::on_every_core(objects, |chunk| batch.write_all(chunk))
+            .into_iter()
+            .sum::<Result<usize, _>>()?;
         batch.commit()?;
         Ok(written)
     }
 
+    /// Runs `f` on `items` split into one chunk per core, returning each
+    /// chunk's result in order.
+    fn on_every_core<T: Sync, R: Send>(items: &[T], f: impl Fn(&[T]) -> R + Sync) -> Vec<R> {
+        // Asking for the cores reads the cgroup's quota, which costs more than
+        // handling a lone item, such as writing one object.
+        if items.len() <= 1 {
+            return vec![f(items)];
+        }
+        let threads = thread::available_parallelism()
+            .map_or(1, NonZero::get)
+            .min(items.len());
+        thread::scope(|scope| {
+            items
+                .chunks(items.len().div_ceil(threads))
+                .map(|chunk| scope.spawn(|| f(chunk)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| {
+                    thread
+                        .join()
+                        .unwrap_or_else(|panic| panic::resume_unwind(panic))
+                })
+                .collect()
+        })
+    }
+
     /// Whether the store has the object.
-    #[must_use]
-    pub fn contains(&self, id: ObjectId) -> bool {
-        self.path(id).exists()
+    ///
+    /// # Errors
+    ///
+    /// Fails if the packs cannot be loaded.
+    pub fn contains(&self, id: ObjectId) -> Result<bool, StoreError> {
+        Ok(self.path(id).exists() || self.find_packed(id)?.is_some())
     }
 
     /// Reads an object, or `None` if the store does not have it.
@@ -217,9 +257,15 @@ impl<P: Platform> Store<P> {
     /// Fails if the object cannot be read or is corrupt.
     pub fn try_read(&self, id: ObjectId) -> Result<Option<EncodedObject>, StoreError> {
         let path = self.path(id);
-        let compressed = match fs::read(&path) {
-            Ok(compressed) => compressed,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        let (compressed, path) = match fs::read(&path) {
+            Ok(compressed) => (compressed, path),
+            // Compaction may have just moved it into a pack.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some((pack, location)) = self.find_packed(id)? else {
+                    return Ok(None);
+                };
+                (pack.read(&self.platform, location)?, pack.path().to_owned())
+            }
             Err(source) => return Err(StoreError::io(&path, source)),
         };
         let bytes =
@@ -275,7 +321,9 @@ pub struct Batch<'a, P> {
 
 impl<P: Platform> Batch<'_, P> {
     /// Stages an object, unless the store already has it, returning whether
-    /// it was new. Either way, it is durable once the batch commits.
+    /// it was new. Either way, it is durable once the batch commits. Packs
+    /// are only checked as last loaded: an object packed since is staged
+    /// again, and the next compaction removes the copy.
     ///
     /// # Errors
     ///
@@ -288,6 +336,11 @@ impl<P: Platform> Batch<'_, P> {
             let mut shard = path;
             shard.pop();
             self.write.sync_dir_with(shard);
+            return Ok(false);
+        }
+        if self.store.packs.find(object.id()).is_some() {
+            // The manifest naming its pack may not be durable yet.
+            self.write.sync_dir_with(self.store.packs_dir());
             return Ok(false);
         }
         let compressed = zstd::bulk::compress(object.bytes(), Store::<P>::COMPRESSION_LEVEL)
@@ -383,13 +436,13 @@ pub(crate) mod tests {
     use std::sync::Mutex;
     use std::time::SystemTime;
 
-    use origin_platform::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind};
+    use origin_platform::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, ReadAt};
 
     use origin_shared::{Record, Tree, TreeId};
 
     use super::*;
 
-    fn store() -> (tempfile::TempDir, Store) {
+    pub(super) fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().join(".origin"), Native::default());
         store.init().unwrap();
@@ -433,6 +486,8 @@ pub(crate) mod tests {
 
     impl FileLock for Recorder {}
 
+    impl ReadAt for Recorder {}
+
     impl CloneFile for Recorder {
         fn cannot_clone(&self, error: &io::Error) -> bool {
             Native::default().cannot_clone(error)
@@ -462,7 +517,7 @@ pub(crate) mod tests {
         let (_dir, store) = store();
         let blob = EncodedObject::blob(b"hello");
 
-        assert!(!store.contains(blob.id()));
+        assert!(!store.contains(blob.id()).unwrap());
         assert!(store.try_read(blob.id()).unwrap().is_none());
         assert_eq!(store.write_all(slice::from_ref(&blob)).unwrap(), 1);
         assert_eq!(
@@ -470,7 +525,7 @@ pub(crate) mod tests {
             0,
             "already there"
         );
-        assert!(store.contains(blob.id()));
+        assert!(store.contains(blob.id()).unwrap());
         assert_eq!(store.read(blob.id()).unwrap(), blob);
     }
 
@@ -485,12 +540,19 @@ pub(crate) mod tests {
         for object in &objects {
             assert!(batch.write(object).unwrap());
         }
-        assert!(!store.contains(objects[0].id()));
+        assert!(!store.contains(objects[0].id()).unwrap());
         drop(batch);
-        assert!(!store.contains(objects[0].id()), "dropped batches vanish");
+        assert!(
+            !store.contains(objects[0].id()).unwrap(),
+            "dropped batches vanish"
+        );
 
         assert_eq!(store.write_all(&objects).unwrap(), objects.len());
-        assert!(objects.iter().all(|object| store.contains(object.id())));
+        assert!(
+            objects
+                .iter()
+                .all(|object| store.contains(object.id()).unwrap())
+        );
     }
 
     #[test]
@@ -513,20 +575,26 @@ pub(crate) mod tests {
         let shard = store.loose().join("ab");
         let stale = shard.join(".tmp-1-0");
         let fresh = shard.join(".tmp-1-1");
-        for temp in [&stale, &fresh] {
+        let packing = store.packs_dir().join(".tmp-1-2");
+        for temp in [&stale, &fresh, &packing] {
             fs::write(temp, b"partial").unwrap();
         }
         let old = SystemTime::now() - Store::<Native>::STALE_TEMP * 2;
-        File::options()
-            .write(true)
-            .open(&stale)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
+        for temp in [&stale, &packing] {
+            File::options()
+                .write(true)
+                .open(temp)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
 
         store.remove_stale_temps().unwrap();
         assert!(!stale.exists(), "a crashed write's file is removed");
         assert!(fresh.exists(), "a write in progress keeps its file");
+        assert!(packing.exists(), "the compactor's are left to it");
+        store.gc().unwrap();
+        assert!(!packing.exists());
     }
 
     #[test]

@@ -25,5 +25,9 @@ tempfile.workspace = true
 name = "store"
 harness = false
 
+[[bench]]
+name = "packs"
+harness = false
+
 [lints]
 workspace = true
