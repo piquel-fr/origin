@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::num::NonZero;
 use std::panic;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,21 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
     /// Fails if a directory or the temporary file cannot be created or
     /// written.
     pub fn stage(&self, path: impl Into<PathBuf>, contents: &[u8]) -> Result<(), Error> {
+        self.stage_with(path, |file| file.write_all(contents))
+    }
+
+    /// Stages `path` like [`DurableWrite::stage`], with the contents `write`
+    /// writes through a buffered [`StagedFile`], so a file never needs to
+    /// fit in memory. If `write` fails, nothing is staged.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`DurableWrite::stage`], or with the error of `write`.
+    pub fn stage_with<E: From<Error>>(
+        &self,
+        path: impl Into<PathBuf>,
+        write: impl FnOnce(&mut StagedFile) -> Result<(), E>,
+    ) -> Result<(), E> {
         let path = path.into();
         self.create_parents(&path)?;
         let temp = Self::parent(&path).join(format!(
@@ -134,7 +149,7 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
             process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
-        if let Err(error) = Self::write_temp(&temp, contents) {
+        if let Err(error) = StagedFile::write(&temp, write) {
             // Best effort: the file is unusable either way.
             let _ = fs::remove_file(&temp);
             return Err(error);
@@ -151,12 +166,6 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
     pub fn sync_dir_with(&self, dir: impl Into<PathBuf>) {
         let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
         staged.dirs.insert(dir.into());
-    }
-
-    fn write_temp(temp: &Path, contents: &[u8]) -> Result<(), Error> {
-        File::create(temp)
-            .and_then(|mut file| file.write_all(contents))
-            .map_err(|source| Error::new(Op::Write, temp, source))
     }
 
     /// Creates the missing parent directories of `path`, outermost first,
@@ -260,6 +269,44 @@ impl<P> Drop for DurableWrite<'_, P> {
             // failed rename, some of these are already published.
             let _ = fs::remove_file(temp);
         }
+    }
+}
+
+/// A temporary file being written by [`DurableWrite::stage_with`].
+#[derive(Debug)]
+pub struct StagedFile {
+    file: BufWriter<File>,
+    temp: PathBuf,
+}
+
+impl StagedFile {
+    /// Creates `temp` and fills it with `write`.
+    fn write<E: From<Error>>(
+        temp: &Path,
+        write: impl FnOnce(&mut Self) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let file = File::create(temp).map_err(|source| Error::new(Op::Write, temp, source))?;
+        let mut staged = Self {
+            file: BufWriter::new(file),
+            temp: temp.to_owned(),
+        };
+        write(&mut staged)?;
+        staged
+            .file
+            .flush()
+            .map_err(|source| Error::new(Op::Write, temp, source))?;
+        Ok(())
+    }
+
+    /// Appends `bytes` to the file.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be written.
+    pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.file
+            .write_all(bytes)
+            .map_err(|source| Error::new(Op::Write, &self.temp, source))
     }
 }
 
@@ -431,6 +478,31 @@ mod tests {
         write.stage(&path, b"new").unwrap();
         write.commit().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn streamed_files_are_staged_whole_or_not_at_all() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = Recorder::default();
+        let write = DurableWrite::new(&recorder);
+        write
+            .stage_with(root.path().join("whole"), |file| {
+                file.write_all(b"one ")?;
+                file.write_all(b"two")
+            })
+            .unwrap();
+        let failed = write.stage_with(root.path().join("partial"), |file| {
+            file.write_all(b"one ")?;
+            Err(Error::new(
+                Op::Write,
+                Path::new("source"),
+                io::Error::other("gone"),
+            ))
+        });
+        assert_eq!(failed.unwrap_err().path, Path::new("source"));
+        write.commit().unwrap();
+        assert_eq!(names(root.path()), ["whole"], "the failed file is removed");
+        assert_eq!(fs::read(root.path().join("whole")).unwrap(), b"one two");
     }
 
     #[test]

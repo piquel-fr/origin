@@ -1,6 +1,6 @@
 [package]
 name = "origin-platform"
-description = "Platform-specific file operations: durable writes, locks, copy-on-write clones and file system checks"
+description = "Platform-specific file operations: durable writes, locks, copy-on-write clones, positioned reads and file system checks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
