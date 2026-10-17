@@ -20,10 +20,16 @@ origin edit <change>                # switch the working copy to another change
 origin abandon --reason "Too slow"  # give a change up, keeping it for others to see
 origin converge <change>            # end a change's divergence
 origin index rebuild                # rebuild the record index from the store
+
+origin annotate @ ci.test --pass --inputs src Cargo.toml   # a statement about a revision
+origin statements [<rev>]           # the statements about a revision
+origin promote [<rev>]              # carry results over from revisions with the same inputs
+origin gc                           # drop expired payloads (policy.toml) and pack objects
 ```
 
 Changes are named by a unique prefix of their id, or `@` for the working
-copy's. Your name and node key live in `~/.config/origin` (or
+copy's. A revision is `@`, a change (for its head), or a unique prefix of
+the revision's id. Your name and node key live in `~/.config/origin` (or
 `$ORIGIN_CONFIG_DIR`): set `user = "<name>"` in its `config.toml` if `$USER`
 isn't the name you want. See [the design](docs/design.md) for the model.
 
