@@ -23,12 +23,14 @@ pub struct Dropped {
 impl<P: Platform> Annotations<'_, P> {
     /// Deletes the payloads whose retention ended by `now`, counted from
     /// when this node stored their statement. A payload stays while any
-    /// statement still keeps it, or a revision or a tree refers to the same
-    /// blob, such as an empty file and an empty payload. Statements stay.
-    /// It waits for the writers [holding objects](crate::store::Store::hold_objects),
-    /// which landings on `policy` are too, then reads the rules from
-    /// `retention` and the index again, so a writer never refers to a
-    /// payload deleted under it, and a policy landed meanwhile applies.
+    /// statement still keeps it, or a revision's description is the same
+    /// attachment, such as an empty description and an empty payload.
+    /// Attachments never share an id with a file, so no snapshot is read.
+    /// Statements stay. It waits for the writers [holding
+    /// objects](crate::store::Store::hold_objects), which landings on
+    /// `policy` are too, then reads the rules from `retention` and the
+    /// index again, so a writer never refers to a payload deleted under it,
+    /// and a policy landed meanwhile applies.
     /// Without rules, it neither waits nor reads anything: a policy landed
     /// meanwhile could only have dropped payloads that this run keeps.
     ///
@@ -52,20 +54,13 @@ impl<P: Platform> Annotations<'_, P> {
         self.index = Index::open(self.store)?;
         let mut expired = HashSet::new();
         let mut live: HashSet<ObjectId> = HashSet::new();
-        let mut roots = Vec::new();
         for &record in self.index.arrivals() {
             match record {
                 RecordId::Revision(id) => {
-                    let revision = self.store.get(id)?;
-                    roots.push(revision.snapshot);
-                    live.insert(revision.description.into());
+                    live.insert(self.store.get(id)?.description.into());
                 }
-                RecordId::Acceptance(id) => roots.push(self.store.get(id)?.body().state),
                 RecordId::Statement(id) => {
                     let statement = self.store.get(id)?;
-                    if let RecordId::Snapshot(tree) = statement.subject {
-                        roots.push(tree);
-                    }
                     let Some(payload) = statement.payload else {
                         continue;
                     };
@@ -82,13 +77,9 @@ impl<P: Platform> Annotations<'_, P> {
                         live.insert(payload.into());
                     }
                 }
-                RecordId::Snapshot(_) => {}
+                RecordId::Acceptance(_) | RecordId::Snapshot(_) => {}
             }
         }
-        if expired.is_empty() {
-            return Ok(Dropped::default());
-        }
-        self.store.reach(roots, &mut live)?;
         let mut doomed = Vec::new();
         for &id in expired.difference(&live) {
             if self.store.contains(id)? {
@@ -108,7 +99,7 @@ mod tests {
     use std::time::Duration;
 
     use origin_platform::Native;
-    use origin_shared::{EncodedObject, Verdict};
+    use origin_shared::{EncodedObject, Record, Revision, Verdict};
 
     use super::*;
     use crate::annotations::tests::{FILES, check, issue, revision, store};
@@ -119,7 +110,7 @@ mod tests {
         let (_dir, store) = store();
         let first = revision(&store, 1, &[], &[("empty", "")]);
         let with_payload = |kind: &str, payload: &[u8]| {
-            let payload = EncodedObject::blob(payload);
+            let payload = EncodedObject::attachment(payload);
             let mut statement = check(first, kind, Verdict::Pass, "node:ci", None);
             statement.payload = Some(payload.id().into());
             let annotations = Annotations::open(&store).unwrap();
@@ -129,7 +120,7 @@ mod tests {
             (id, payload.id())
         };
         let (log_statement, log) = with_payload("ci.test", b"a long log");
-        // The same blob as the empty file, which must stay.
+        // The same attachment as the empty description, which must stay.
         let (_, empty) = with_payload("ci.lint", b"");
         let (_, review) = with_payload("review", b"looks good");
         let (_, shared) = with_payload("ci.bench", b"shared");
@@ -188,7 +179,7 @@ mod tests {
     fn collection_waits_for_writers_holding_objects() {
         let (_dir, store) = store();
         let first = revision(&store, 1, &[], FILES);
-        let payload = EncodedObject::blob(b"a log, and a file");
+        let payload = EncodedObject::attachment(b"a log, and a description");
         let mut statement = check(first, "ci.test", Verdict::Pass, "node:ci", None);
         statement.payload = Some(payload.id().into());
         Annotations::open(&store)
@@ -199,8 +190,9 @@ mod tests {
             .unwrap()
             .retention;
 
-        // A writer finds the expired payload stored as a file it snapshots,
-        // so it doesn't write it, then writes the revision referring to it.
+        // A writer finds the expired payload stored as the description it
+        // writes, so it doesn't write it, then writes the revision referring
+        // to it.
         let held = store.hold_objects().unwrap();
         assert_eq!(store.write_all(std::slice::from_ref(&payload)).unwrap(), 0);
         let (done, collected) = std::sync::mpsc::channel();
@@ -215,7 +207,11 @@ mod tests {
             });
             thread::sleep(Duration::from_millis(100));
             assert!(collected.try_recv().is_err(), "collection waits");
-            revision(&store, 2, &[], &[("log", "a log, and a file")]);
+            let reusing = Revision {
+                description: payload.id().into(),
+                ..store.get(first).unwrap()
+            };
+            store.write_all(&[reusing.encode()]).unwrap();
             drop(held);
             assert_eq!(collected.recv().unwrap(), Dropped::default());
         });
@@ -226,7 +222,7 @@ mod tests {
     fn promotions_and_collection_exclude_each_other() {
         let (_dir, store) = store();
         let first = revision(&store, 1, &[], FILES);
-        let payload = EncodedObject::blob(b"a log to promote");
+        let payload = EncodedObject::attachment(b"a log to promote");
         let inputs = Some((&["src"][..], false));
         let mut result = check(first, "ci.test", Verdict::Pass, "node:ci", inputs);
         result.payload = Some(payload.id().into());
@@ -245,7 +241,7 @@ mod tests {
                 let issuer = "node:queue".parse().unwrap();
                 let promotions = Annotations::open(&store)
                     .unwrap()
-                    .promote(second, &issuer)
+                    .promote(second, &issuer, |_| Ok(true))
                     .unwrap();
                 done.send(promotions.len()).unwrap();
             });

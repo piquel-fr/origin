@@ -123,8 +123,11 @@ ids! {
 }
 
 object_ids! {
-    /// Identifies a blob: file contents, a description or a payload.
+    /// Identifies a blob: a file's content.
     BlobId;
+    /// Identifies an attachment: a revision's description or a statement's
+    /// payload.
+    AttachmentId;
     /// Identifies a tree, the root of which is a snapshot.
     TreeId => Tree;
     /// Identifies a revision.
@@ -213,6 +216,19 @@ pub(crate) mod hex {
                 DIGITS[usize::from(byte & 0xf)],
             ];
         }
+    }
+
+    /// Parses an even number of hex digits, in either case.
+    pub fn bytes(input: &str) -> Option<Vec<u8>> {
+        let digit = |c: u8| char::from(c).to_digit(16);
+        let (pairs, rest) = input.as_bytes().as_chunks::<2>();
+        if !rest.is_empty() {
+            return None;
+        }
+        pairs
+            .iter()
+            .map(|&[high, low]| u8::try_from(digit(high)? << 4 | digit(low)?).ok())
+            .collect()
     }
 
     /// Parses exactly `2 * N` hex digits, in either case.

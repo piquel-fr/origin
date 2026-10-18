@@ -12,14 +12,17 @@ use std::path::{self, Path, PathBuf};
 
 use origin_client::Client;
 use origin_shared::Head;
+use origin_shared::access::Rights;
 use origin_shared::api::{
-    ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, Inventory, InventoryRequest, LandRequest,
-    Landings, LogEntry, LogQuery, NewTarget, PutQuery, RepoName, Stored, TargetInfo,
+    BrowseQuery, ErrorCode, EventsQuery, FetchRecords, FetchSnapshot, Inventory, InventoryRequest,
+    IssuedToken, LandRequest, Landings, Listing, LogEntry, LogQuery, NewTarget, PutQuery, RepoName,
+    Stored, TargetInfo, TokenRequest,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
 use origin_shared::pack::{Pack, Part};
 
+use crate::config::UserConfig;
 use crate::service::{Caller, Node, OriginService, ServiceError};
 use crate::workspace::Workspace;
 
@@ -68,8 +71,8 @@ calls! {
     fn targets() -> Vec<TargetInfo> = targets(), targets();
     /// The acceptances of a target, oldest first.
     fn log(query: &LogQuery) -> Vec<LogEntry> = log(query), log(query);
-    /// Records by id, each followed by the blob it carries: those up to the
-    /// last record of the part, if it stops short.
+    /// Records by id, each followed by the attachment it carries: those up
+    /// to the last record of the part, if it stops short.
     fn records(request: &FetchRecords) -> Part = fetch_records(request), records(&request.ids);
     /// The trees and blobs of a snapshot that the request's snapshots lack,
     /// in parts.
@@ -91,25 +94,41 @@ calls! {
     fn create_target(request: &NewTarget) -> Head = create_target(request), create_target(request);
     /// The events after a cursor, waiting for some.
     fn events(query: &EventsQuery) -> Page = events(query), events(query);
+    /// Who the remote thinks the user is, and what they may do there.
+    fn whoami() -> Rights = whoami(), whoami();
+    /// Issues a token acting for the user, with a narrower scope.
+    fn issue_token(request: &TokenRequest) -> IssuedToken =
+        issue_token(request), issue_token(request);
+    /// Lists a directory of a snapshot.
+    fn tree(query: &BrowseQuery) -> Listing = tree(query), tree(query);
+    /// Reads a file of a snapshot.
+    fn file(query: &BrowseQuery) -> Vec<u8> = file(query), file(query);
 }
 
 impl Remote {
     /// Opens the remote at `url`: an `http://` URL whose last path segment
-    /// names the repository, or the path of a repository, which `node`
-    /// serves in-process.
+    /// names the repository, called with `token` if there's one, or the
+    /// path of a repository, which `node` serves in-process, to its owner.
     ///
     /// # Errors
     ///
     /// Fails if the URL names no repository, or the path holds none.
-    pub fn open(url: &RemoteUrl, node: Node) -> Result<Self, RemoteError> {
+    pub fn open(url: &RemoteUrl, node: Node, token: Option<String>) -> Result<Self, RemoteError> {
         match url {
-            RemoteUrl::Http { base, repo } => Ok(Self::Http {
-                runtime: tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(RemoteError::Runtime)?,
-                repo: Client::new(base).repo(repo.clone()),
-            }),
+            RemoteUrl::Http { base, repo } => {
+                let client = Client::new(base);
+                let client = match token {
+                    Some(token) => client.with_token(token),
+                    None => client,
+                };
+                Ok(Self::Http {
+                    runtime: tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(RemoteError::Runtime)?,
+                    repo: client.repo(repo.clone()),
+                })
+            }
             RemoteUrl::Path(path) => {
                 // A working copy's repository is in its `.origin`.
                 let meta = path.join(Workspace::META_DIR);
@@ -137,6 +156,16 @@ pub enum RemoteUrl {
 }
 
 impl RemoteUrl {
+    /// The token the user of `config` sends this remote, if any: none to a
+    /// local path, which serves them as its owner.
+    #[must_use]
+    pub fn token(&self, config: &UserConfig) -> Option<String> {
+        match self {
+            Self::Http { base, .. } => config.token(base),
+            Self::Path(_) => None,
+        }
+    }
+
     /// Parses a remote URL: `http://host[:port]/<repository>`, or a path,
     /// made absolute, so the URL works from anywhere.
     ///

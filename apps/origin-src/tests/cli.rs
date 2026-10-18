@@ -312,7 +312,7 @@ fn a_revision_is_published_only_after_its_conflicts() {
     let issuer = revision.author.clone();
     let described = Revision {
         predecessors: vec![converged],
-        description: EncodedObject::blob(b"Described").id().into(),
+        description: EncodedObject::attachment(b"Described").id().into(),
         ..revision
     }
     .encode();
@@ -517,7 +517,7 @@ fn init_with_a_malformed_key_leaves_no_repository() {
 }
 
 #[test]
-fn only_the_creator_of_a_change_abandons_it() {
+fn only_the_creator_of_a_change_or_admins_abandon_it() {
     let repo = Repo::new();
     repo.write("file", "ada's\n");
     repo.ok(&["describe", "Ada's change"]);
@@ -540,6 +540,19 @@ fn only_the_creator_of_a_change_abandons_it() {
     assert_eq!(repo.ok(&["statements"]), statements);
     fs::write(&config, "user = \"ada\"\n").unwrap();
     assert!(!repo.ok(&["show", &change]).contains("bandoned"));
+
+    // Once the policy makes eve an admin, she may.
+    repo.ok(&["new", "--on", "policy"]);
+    let policy = repo
+        .read("policy.toml")
+        .replace("\n# [grants]\n", "\n[grants]\n\"user:eve\" = [\"admin\"]\n");
+    repo.write("policy.toml", &policy);
+    repo.ok(&["land"]);
+    fs::write(&config, "user = \"eve\"\n").unwrap();
+    repo.ok(&["abandon", &change, "--reason", "Not mine"]);
+    fs::write(&config, "user = \"ada\"\n").unwrap();
+    let show = repo.ok(&["show", &change]);
+    assert!(show.contains("Abandoned by user:eve: Not mine\n"), "{show}");
 }
 
 #[test]
@@ -724,7 +737,7 @@ fn statements_about_statements_show_under_them() {
 fn a_payload_the_repository_lacks_is_unavailable() {
     let repo = Repo::new();
     repo.ok(&["annotate", "@", "review", "--pass", "-m", "Looks good"]);
-    let hex = EncodedObject::blob(b"Looks good").id().to_hex();
+    let hex = EncodedObject::attachment(b"Looks good").id().to_hex();
     fs::remove_file(repo.path(&format!(
         ".origin/objects/loose/{}/{}",
         &hex[..2],
@@ -1093,6 +1106,13 @@ fn removing_a_workspace_keeps_its_work() {
             .contains("+not snapshotted yet\n")
     );
 
+    // A workspace removes itself.
+    let own = others.path().join("own");
+    let change = repo.workspace(&own, &[]);
+    let removed = repo.ok_in(&own, &["workspace", "rm", "."]);
+    assert!(removed.starts_with(&format!("Kept its working copy: {change} ")));
+    assert!(!own.exists());
+
     assert!(
         repo.fails(&["workspace", "rm", "."])
             .contains("is the main working copy")
@@ -1417,6 +1437,19 @@ fn commands_in_different_workspaces_run_concurrently() {
     for (_, change) in &workspaces {
         assert_eq!(revisions(change), 1 + 2 * EDITS);
     }
+}
+
+#[test]
+fn commands_in_one_workspace_wait_for_each_other() {
+    let repo = Repo::new();
+    // As a command working in the working copy holds it.
+    let lock = fs::File::create(repo.path(".origin/lock")).unwrap();
+    lock.lock().unwrap();
+    let (mut status, _) = repo.spawn(&["status"]);
+    thread::sleep(Duration::from_millis(500));
+    assert!(status.try_wait().unwrap().is_none(), "it waits");
+    drop(lock);
+    assert!(status.wait().unwrap().success());
 }
 
 #[test]
