@@ -3,7 +3,7 @@
 //!
 //! Core interprets only the reserved kinds: [`Kind::ABANDON`],
 //! [`Kind::CONFLICT`] and [`Kind::DIVERGENT`], and only from the issuers
-//! [`Store::authorizes`] names. Every other kind belongs to whoever issues
+//! [`RevisionView::authorizes`] names. Every other kind belongs to whoever issues
 //! it. Supersession counts only within one issuer: a statement claiming to
 //! supersede another issuer's is issued like any other, and the one it
 //! names still stands.
@@ -27,8 +27,8 @@ use std::time::SystemTime;
 use origin_platform::{Native, Platform};
 use origin_shared::api::Annotation;
 use origin_shared::{
-    ChangeId, EncodedObject, Kind, ObjectId, Principal, Record, RecordId, RevisionId, Statement,
-    StatementId, TreeId,
+    ChangeId, EncodedObject, Kind, ObjectId, Principal, Record, RecordId, Revision, RevisionId,
+    Statement, StatementId,
 };
 
 use crate::index::Index;
@@ -311,10 +311,12 @@ impl<'a, P: Platform> Annotations<'a, P> {
     }
 
     /// The statements promoting results to `subject`, as `issuer` would
-    /// issue them, without writing them, sorted by kind: for each
+    /// issue them for a caller who `sees` some records, without writing
+    /// them, sorted by kind: for each
     /// [promotion group](Statement::promotion_group), the latest statement
-    /// about another record with the same input digest as the subject,
-    /// unless its issuer superseded it. Groups whose kind and issuer the
+    /// about another record the caller sees with the same input digest as
+    /// the subject, unless its issuer superseded it. So a promotion never
+    /// copies a result, and its payload, that the caller can't read. Groups whose kind and issuer the
     /// subject already has a result of, directly or promoted, are skipped:
     /// a result that ran there wins. A statement has no snapshot, so
     /// nothing is promoted to one.
@@ -327,6 +329,7 @@ impl<'a, P: Platform> Annotations<'a, P> {
         &mut self,
         subject: RecordId,
         issuer: &Principal,
+        mut sees: impl FnMut(RecordId) -> Result<bool, StoreError>,
     ) -> Result<Vec<Statement>, StoreError> {
         let Some(snapshot) = self.store.snapshot_of(subject)? else {
             return Ok(Vec::new());
@@ -358,7 +361,7 @@ impl<'a, P: Platform> Annotations<'a, P> {
                     continue;
                 }
                 let statement = self.store.get(id)?;
-                if self.superseded_by(id, &statement)?.is_none() {
+                if self.superseded_by(id, &statement)?.is_none() && sees(statement.subject)? {
                     promotions.push(Statement {
                         subject,
                         issuer: issuer.clone(),
@@ -376,7 +379,7 @@ impl<'a, P: Platform> Annotations<'a, P> {
     }
 
     /// Issues the [`promotions`](Self::promotions) to `subject` as
-    /// `issuer`, returning them.
+    /// `issuer`, for a caller who `sees` some records, returning them.
     ///
     /// # Errors
     ///
@@ -386,8 +389,9 @@ impl<'a, P: Platform> Annotations<'a, P> {
         &mut self,
         subject: RecordId,
         issuer: &Principal,
+        sees: impl FnMut(RecordId) -> Result<bool, StoreError>,
     ) -> Result<Vec<(StatementId, Statement)>, StoreError> {
-        let promotions = self.promotions(subject, issuer)?;
+        let promotions = self.promotions(subject, issuer, sees)?;
         let encoded: Vec<_> = promotions.iter().map(Statement::encode).collect();
         self.store.write_all(&encoded)?;
         Ok(encoded
@@ -420,7 +424,7 @@ impl<'a, P: Platform> Annotations<'a, P> {
             .iter()
             .map(|head| head.to_hex() + "\n")
             .collect::<String>();
-        let payload = EncodedObject::blob(list.as_bytes());
+        let payload = EncodedObject::attachment(list.as_bytes());
         let statement = Statement {
             subject: RecordId::Revision(heads[0]),
             kind: Kind::DIVERGENT,
@@ -436,11 +440,13 @@ impl<'a, P: Platform> Annotations<'a, P> {
 
     /// Deletes the payloads whose retention ended by `now`, counted from
     /// when this node stored their statement. A payload stays while any
-    /// statement still keeps it, or a revision or a tree refers to the same
-    /// blob, such as an empty file and an empty payload. Statements stay.
-    /// It waits for the writers [holding objects](Store::hold_objects), and
-    /// reads the index again once they're done, so a writer never refers
-    /// to a payload deleted under it.
+    /// statement still keeps it, or a revision's description is the same
+    /// attachment, such as an empty description and an empty payload.
+    /// Attachments never share an id with a file, so no snapshot is read.
+    /// Statements stay. It waits for the writers [holding
+    /// objects](Store::hold_objects), and reads the index again once
+    /// they're done, so a writer never refers to a payload deleted under
+    /// it.
     ///
     /// # Errors
     ///
@@ -457,20 +463,13 @@ impl<'a, P: Platform> Annotations<'a, P> {
         self.index = Index::open(self.store)?;
         let mut expired = HashSet::new();
         let mut live: HashSet<ObjectId> = HashSet::new();
-        let mut roots = Vec::new();
         for &record in self.index.arrivals() {
             match record {
                 RecordId::Revision(id) => {
-                    let revision = self.store.get(id)?;
-                    roots.push(revision.snapshot);
-                    live.insert(revision.description.into());
+                    live.insert(self.store.get(id)?.description.into());
                 }
-                RecordId::Acceptance(id) => roots.push(self.store.get(id)?.body().state),
                 RecordId::Statement(id) => {
                     let statement = self.store.get(id)?;
-                    if let RecordId::Snapshot(tree) = statement.subject {
-                        roots.push(tree);
-                    }
                     let Some(payload) = statement.payload else {
                         continue;
                     };
@@ -487,13 +486,9 @@ impl<'a, P: Platform> Annotations<'a, P> {
                         live.insert(payload.into());
                     }
                 }
-                RecordId::Snapshot(_) => {}
+                RecordId::Acceptance(_) | RecordId::Snapshot(_) => {}
             }
         }
-        if expired.is_empty() {
-            return Ok(Dropped::default());
-        }
-        self.store.reach(roots, &mut live)?;
         let mut doomed = Vec::new();
         for &id in expired.difference(&live) {
             if self.store.contains(id)? {
@@ -508,21 +503,6 @@ impl<'a, P: Platform> Annotations<'a, P> {
 }
 
 impl<P: Platform> Store<P> {
-    /// The snapshot of a record a statement is about, which its input
-    /// digest is taken from. Statements have none.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the record cannot be read.
-    pub fn snapshot_of(&self, subject: RecordId) -> Result<Option<TreeId>, StoreError> {
-        Ok(match subject {
-            RecordId::Snapshot(id) => Some(id),
-            RecordId::Revision(id) => Some(self.get(id)?.snapshot),
-            RecordId::Acceptance(id) => Some(self.get(id)?.body().state),
-            RecordId::Statement(_) => None,
-        })
-    }
-
     /// Checks the claim `statement`, `id`, makes. A statement that promotes
     /// none makes its own. A promotion must name an original the store has
     /// that is [promotable](Statement::is_promotable), match its kind,
@@ -583,13 +563,26 @@ impl<P: Platform> Store<P> {
             original: Some((original_id, original)),
         }))
     }
+}
+
+/// Where the revisions are read that decide who may issue a reserved kind:
+/// a store, or a batch being put along with what its store has, so a
+/// statement can be about a revision of the same batch.
+pub trait RevisionView {
+    /// The revision `id`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if it cannot be found or read.
+    fn revision(&self, id: RevisionId) -> Result<Revision, StoreError>;
 
     /// Whether `statement`'s issuer may issue a statement of its kind, if
     /// that kind is reserved:
     ///
     /// - `core.abandon`, about a revision, only the change's creator: the
     ///   author of its first revision, so no one who took it over, or
-    ///   rebased it, gives it up for them;
+    ///   rebased it, gives it up for them; or an `admin`, which
+    ///   [`Policy::authorizes`](crate::policy::Policy::authorizes) adds;
     /// - `core.conflict`, a node, as a landing queue that could not rebase
     ///   the record, or the author of the revision it's about, listing
     ///   the conflicts its files still have;
@@ -600,8 +593,8 @@ impl<P: Platform> Store<P> {
     ///
     /// # Errors
     ///
-    /// Fails if a revision cannot be read.
-    pub fn authorizes(&self, statement: &Statement) -> Result<bool, StoreError> {
+    /// Fails if the revision it's about cannot be read.
+    fn authorizes(&self, statement: &Statement) -> Result<bool, StoreError> {
         let issuer = &statement.issuer;
         if !statement.kind.is_reserved() {
             return Ok(true);
@@ -617,7 +610,7 @@ impl<P: Platform> Store<P> {
         Ok(if *kind == Kind::ABANDON {
             self.created(subject, issuer)?
         } else if *kind == Kind::CONFLICT {
-            is_node || self.get(subject)?.author == *issuer
+            is_node || self.revision(subject)?.author == *issuer
         } else {
             *kind == Kind::DIVERGENT && is_node
         })
@@ -626,6 +619,11 @@ impl<P: Platform> Store<P> {
     /// Whether `author` created the change of `revision`: made each
     /// revision it evolves from that evolves from none. Records being
     /// immutable, there is always one, and no one adds another later.
+    /// History this view lacks leaves it unknown: no.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a revision cannot be read.
     fn created(&self, revision: RevisionId, author: &Principal) -> Result<bool, StoreError> {
         let mut seen = HashSet::new();
         let mut next = vec![revision];
@@ -633,13 +631,23 @@ impl<P: Platform> Store<P> {
             if !seen.insert(id) {
                 continue;
             }
-            let revision = self.get(id)?;
+            let revision = match self.revision(id) {
+                Ok(revision) => revision,
+                Err(StoreError::NotFound(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            };
             if revision.predecessors.is_empty() && revision.author != *author {
                 return Ok(false);
             }
             next.extend(revision.predecessors);
         }
         Ok(true)
+    }
+}
+
+impl<P: Platform> RevisionView for Store<P> {
+    fn revision(&self, id: RevisionId) -> Result<Revision, StoreError> {
+        self.get(id)
     }
 }
 
@@ -698,7 +706,9 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use origin_shared::{Base, BlobId, Digest, Inputs, RepoPath, Revision, RevisionId, Verdict};
+    use origin_shared::{
+        AttachmentId, Base, Digest, Inputs, RepoPath, Revision, RevisionId, Verdict,
+    };
 
     use super::*;
     use crate::tree::tests::build;
@@ -728,7 +738,7 @@ mod tests {
             base: Base::Acceptance(ObjectId::from_bytes([0; 32]).into()),
             deps: Vec::new(),
             snapshot: build(store, files),
-            description: BlobId::from(EncodedObject::blob(b"").id()),
+            description: AttachmentId::from(EncodedObject::attachment(b"").id()),
             author: principal("user:alice"),
         }
         .encode();
@@ -777,7 +787,7 @@ mod tests {
         let promoter = principal("node:queue");
         Annotations::open(store)
             .unwrap()
-            .promote(RecordId::Revision(revision), &promoter)
+            .promote(RecordId::Revision(revision), &promoter, |_| Ok(true))
             .unwrap()
             .into_iter()
             .map(|(_, statement)| {
@@ -988,7 +998,7 @@ mod tests {
         assert_eq!(about.len(), 1);
         assert_eq!(about[0].statement.kind, Kind::DIVERGENT);
         let heads = store
-            .try_blob(about[0].statement.payload.unwrap().into())
+            .try_attachment(about[0].statement.payload.unwrap())
             .unwrap()
             .unwrap();
         let mut expected = [left, right];
@@ -1004,7 +1014,7 @@ mod tests {
         let (_dir, store) = store();
         let first = revision(&store, 1, &[], &[("empty", "")]);
         let with_payload = |kind: &str, payload: &[u8]| {
-            let payload = EncodedObject::blob(payload);
+            let payload = EncodedObject::attachment(payload);
             let mut statement = check(first, kind, Verdict::Pass, "node:ci", None);
             statement.payload = Some(payload.id().into());
             let annotations = Annotations::open(&store).unwrap();
@@ -1014,7 +1024,7 @@ mod tests {
             (id, payload.id())
         };
         let (log_statement, log) = with_payload("ci.test", b"a long log");
-        // The same blob as the empty file, which must stay.
+        // The same attachment as the empty description, which must stay.
         let (_, empty) = with_payload("ci.lint", b"");
         let (_, review) = with_payload("review", b"looks good");
         let (_, shared) = with_payload("ci.bench", b"shared");
@@ -1238,7 +1248,7 @@ mod tests {
     fn collection_waits_for_writers_holding_objects() {
         let (_dir, store) = store();
         let first = revision(&store, 1, &[], FILES);
-        let payload = EncodedObject::blob(b"a log, and a file");
+        let payload = EncodedObject::attachment(b"a log, and a description");
         let mut statement = check(first, "ci.test", Verdict::Pass, "node:ci", None);
         statement.payload = Some(payload.id().into());
         Annotations::open(&store)
@@ -1249,8 +1259,9 @@ mod tests {
             .unwrap()
             .retention;
 
-        // A writer finds the expired payload stored as a file it snapshots,
-        // so it doesn't write it, then writes the revision referring to it.
+        // A writer finds the expired payload stored as the description it
+        // writes, so it doesn't write it, then writes the revision referring
+        // to it.
         let held = store.hold_objects().unwrap();
         assert_eq!(store.write_all(std::slice::from_ref(&payload)).unwrap(), 0);
         let (done, collected) = std::sync::mpsc::channel();
@@ -1265,7 +1276,11 @@ mod tests {
             });
             thread::sleep(Duration::from_millis(100));
             assert!(collected.try_recv().is_err(), "collection waits");
-            revision(&store, 2, &[], &[("log", "a log, and a file")]);
+            let reusing = Revision {
+                description: payload.id().into(),
+                ..store.get(first).unwrap()
+            };
+            store.write_all(&[reusing.encode()]).unwrap();
             drop(held);
             assert_eq!(collected.recv().unwrap(), Dropped::default());
         });

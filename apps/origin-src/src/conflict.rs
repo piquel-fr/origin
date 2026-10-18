@@ -82,6 +82,13 @@ impl Conflicts {
         self.0.push(conflicted);
     }
 
+    /// Those of these conflicts whose path `keep` keeps.
+    #[must_use]
+    pub fn only(mut self, keep: impl Fn(&RepoPath) -> bool) -> Self {
+        self.0.retain(|conflicted| keep(&conflicted.path));
+        self
+    }
+
     /// Whether there are none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -163,7 +170,7 @@ impl Conflicts {
             list.push_str(conflicted.path.as_str());
             list.push('\0');
         }
-        let payload = EncodedObject::blob(list.as_bytes());
+        let payload = EncodedObject::attachment(list.as_bytes());
         let statement = Statement {
             subject,
             kind: Kind::CONFLICT,
@@ -190,7 +197,7 @@ impl Conflicts {
         let Some(payload) = statement.payload else {
             return Ok(Self::default());
         };
-        let content = store.try_blob(payload.into())?.unwrap_or_default();
+        let content = store.try_attachment(payload)?.unwrap_or_default();
         let conflicted = String::from_utf8_lossy(&content)
             .split_terminator('\0')
             .filter_map(|line| {
@@ -220,15 +227,30 @@ impl Conflicts {
         claims: &[Claim],
         revision: &Revision,
     ) -> Result<Self, StoreError> {
+        Self::latest(store, claims.iter().map(Claim::statement), revision)
+    }
+
+    /// The unresolved conflicts of `revision`, as [`Conflicts::of`] finds
+    /// them, from `statements` about it, in arrival order.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Conflicts::of`].
+    pub fn latest<'s, P: Platform>(
+        store: &Store<P>,
+        statements: impl IntoIterator<Item = &'s Statement>,
+        revision: &Revision,
+    ) -> Result<Self, StoreError> {
         if matches!(revision.author, Principal::Node(_)) {
             return Ok(Self::default());
         }
-        let Some(claim) = claims.iter().rev().find(|claim| {
-            claim.statement().kind == Kind::CONFLICT && claim.statement().issuer == revision.author
-        }) else {
+        let latest = statements.into_iter().filter(|statement| {
+            statement.kind == Kind::CONFLICT && statement.issuer == revision.author
+        });
+        let Some(statement) = latest.last() else {
             return Ok(Self::default());
         };
-        Self::listed(store, claim.statement())?.remaining(store, revision.snapshot)
+        Self::listed(store, statement)?.remaining(store, revision.snapshot)
     }
 
     /// Those of these conflicts `snapshot` still has: where it has the

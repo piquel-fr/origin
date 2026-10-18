@@ -415,19 +415,29 @@ impl Bench {
     }
 }
 
-/// An `origin serve` hosting one empty repository, stopped when dropped.
+/// An `origin serve` hosting one empty repository, which the bench user,
+/// signed in with [`Server::TOKEN`], writes to. Stopped when dropped.
 struct Server {
     child: Child,
     url: String,
 }
 
 impl Server {
+    /// The bench user's token.
+    const TOKEN: &str = "bench-secret";
+
+    /// Starts the server, and adds its token to the bench user's
+    /// configuration in `config`.
     fn start(origin: &Path, base: &Path, config: &Path) -> Result<Self> {
         let dir = base.join("server");
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join("origin-server.toml"),
-            "listen = \"127.0.0.1:0\"\nnode = \"hosted\"\n[repos]\ndemo = \"demo\"\n",
+            format!(
+                "listen = \"127.0.0.1:0\"\nnode = \"hosted\"\n[repos]\ndemo = \"demo\"\n\
+                 [tokens]\n\"user:bench\" = \"{}\"\n",
+                Self::TOKEN
+            ),
         )?;
         run(Command::new(origin)
             .args(["repo", "create", "demo"])
@@ -447,6 +457,12 @@ impl Server {
             .trim()
             .strip_prefix("Listening on ")
             .with_context(|| format!("unexpected server output: {line}"))?;
+        let user = config.join("config.toml");
+        let toml = fs::read_to_string(&user)?;
+        fs::write(
+            &user,
+            format!("{toml}[tokens]\n\"{base}\" = \"{}\"\n", Self::TOKEN),
+        )?;
         Ok(Self {
             url: format!("{base}/demo"),
             child,
