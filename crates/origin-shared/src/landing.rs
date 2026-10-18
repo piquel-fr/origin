@@ -47,6 +47,11 @@ pub struct Pending {
     pub subject: RecordId,
     /// Why it waits.
     pub blocked: Blocked,
+    /// When the token of its submitter, whom it's retried for, expires, in
+    /// seconds since the Unix epoch, if it's a scoped one. Once it has, the
+    /// landing is no longer retried: it waits until it's landed again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
 }
 
 /// Why a landing waits.
@@ -63,6 +68,15 @@ pub enum Blocked {
         /// The paths, sorted.
         paths: Vec<RepoPath>,
     },
+}
+
+impl Pending {
+    /// Whether its submitter's token expired, so it's no longer retried.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.expires
+            .is_some_and(|expires| expires <= crate::access::Token::now())
+    }
 }
 
 impl Landing {

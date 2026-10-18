@@ -16,6 +16,7 @@ pub mod index;
 pub mod oplog;
 pub mod output;
 pub mod permissions;
+pub mod plugin;
 pub mod policy;
 pub mod queue;
 pub mod remote;
