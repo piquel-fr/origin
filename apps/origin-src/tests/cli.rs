@@ -285,7 +285,7 @@ fn a_revision_is_published_only_after_its_conflicts() {
     let issuer = revision.author.clone();
     let described = Revision {
         predecessors: vec![converged],
-        description: EncodedObject::blob(b"Described").id().into(),
+        description: EncodedObject::attachment(b"Described").id().into(),
         ..revision
     }
     .encode();
@@ -332,7 +332,7 @@ fn abandoning_the_current_change_restores_its_base() {
 }
 
 #[test]
-fn only_those_who_worked_on_a_change_abandon_it() {
+fn only_those_who_worked_on_a_change_or_admins_abandon_it() {
     let repo = Repo::new();
     repo.ok(&["new", "Ada's change"]);
     let change = repo.change();
@@ -341,10 +341,19 @@ fn only_those_who_worked_on_a_change_abandon_it() {
     fs::write(&config, "user = \"eve\"\n").unwrap();
     repo.ok(&["abandon", &change, "--reason", "Not mine"]);
     fs::write(&config, "user = \"ada\"\n").unwrap();
-
     let show = repo.ok(&["show", &change]);
     assert!(!show.contains("abandoned"), "{show}");
     assert!(!show.contains("Abandoned by"), "{show}");
+
+    // Once the policy makes eve an admin, hers counts.
+    repo.ok(&["new", "--on", "policy"]);
+    let policy = repo
+        .read("policy.toml")
+        .replace("\n# [grants]\n", "\n[grants]\n\"user:eve\" = [\"admin\"]\n");
+    repo.write("policy.toml", &policy);
+    repo.ok(&["land"]);
+    let show = repo.ok(&["show", &change]);
+    assert!(show.contains("Abandoned by user:eve: Not mine\n"), "{show}");
 }
 
 #[test]

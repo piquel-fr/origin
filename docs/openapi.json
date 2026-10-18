@@ -29,7 +29,7 @@
     },
     "/api/v1/repos": {
       "get": {
-        "summary": "Lists the repositories on the server.",
+        "summary": "Lists the repositories on the server that the caller sees.",
         "operationId": "list_repos",
         "responses": {
           "200": {
@@ -41,6 +41,16 @@
                   "items": {
                     "$ref": "#/components/schemas/RepoSummary"
                   }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The token is invalid or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -244,6 +254,83 @@
           },
           "410": {
             "description": "The server no longer keeps the events after the cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/file": {
+      "get": {
+        "summary": "Reads a file of a snapshot, as `tree` finds it.",
+        "operationId": "file",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at",
+            "in": "query",
+            "description": "The snapshot: a target, such as `main`, or `revision:<id>` or\n`acceptance:<id>`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "The directory or file: the root by default.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file's content",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The path is a directory, or the record has no snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not read the file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository, the target, the record or the path does not exist",
             "content": {
               "application/json": {
                 "schema": {
@@ -791,6 +878,191 @@
           }
         }
       }
+    },
+    "/api/v1/repos/{repo}/tokens": {
+      "post": {
+        "summary": "Issues a token acting for the caller, with a scope narrowing their\nrights, signed by the server, which verifies it without storing it.",
+        "operationId": "issue_token",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository whose policy the scope is checked against",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller isn't signed in, or the scope reaches beyond their rights",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/tree": {
+      "get": {
+        "summary": "Lists a directory of a snapshot: a target's tip, or a revision's or an\nacceptance's. Withheld entries keep their place.",
+        "operationId": "tree",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at",
+            "in": "query",
+            "description": "The snapshot: a target, such as `main`, or `revision:<id>` or\n`acceptance:<id>`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "The directory or file: the root by default.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The directory's entries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Listing"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The path is a file, or the record has no snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller reads nothing under the path",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository, the target, the record or the path does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/whoami": {
+      "get": {
+        "summary": "Tells the caller who they are and what they may do in the repository.",
+        "operationId": "whoami",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller's rights",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rights"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The token is invalid or expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -930,6 +1202,12 @@
           }
         }
       },
+      "AttachmentId": {
+        "type": "string",
+        "examples": [
+          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+        ]
+      },
       "Base": {
         "oneOf": [
           {
@@ -964,12 +1242,6 @@
       "Binary": {
         "type": "string",
         "contentMediaType": "application/octet-stream"
-      },
-      "BlobId": {
-        "type": "string",
-        "examples": [
-          "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
-        ]
       },
       "Blocked": {
         "oneOf": [
@@ -1022,6 +1294,12 @@
         ],
         "description": "Why a landing waits."
       },
+      "Capability": {
+        "type": "string",
+        "examples": [
+          "write src"
+        ]
+      },
       "ChangeId": {
         "type": "string",
         "examples": [
@@ -1034,6 +1312,18 @@
           "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
         ]
       },
+      "EntryKind": {
+        "type": "string",
+        "examples": [
+          "file"
+        ]
+      },
+      "EntryName": {
+        "type": "string",
+        "examples": [
+          "main.rs"
+        ]
+      },
       "ErrorCode": {
         "type": "string",
         "description": "The kind of an [`ApiError`].",
@@ -1042,6 +1332,8 @@
           "not_found",
           "conflict",
           "expired",
+          "unauthorized",
+          "forbidden",
           "internal"
         ]
       },
@@ -1213,7 +1505,7 @@
       },
       "FetchRecords": {
         "type": "object",
-        "description": "Asks for records by id: revisions, statements and acceptances. Each\ncomes with the blob it carries, if the repository has it: a revision's\ndescription, a statement's payload. Snapshots are fetched with\n[`FetchSnapshot`] instead.",
+        "description": "Asks for records by id: revisions, statements and acceptances. Each\ncomes with the attachment it carries, if the repository has it: a\nrevision's description, a statement's payload. Snapshots are fetched\nwith [`FetchSnapshot`] instead.",
         "required": [
           "ids"
         ],
@@ -1223,15 +1515,15 @@
             "items": {
               "$ref": "#/components/schemas/ObjectId"
             },
-            "description": "The records, returned in this order, each followed by its blob. A\nresponse that stops short, with the [`MORE`] header, holds those up\nto the last record it has: ask again for those after it."
+            "description": "The records, returned in this order, each followed by its\nattachment. Those the caller may not read are left out. A response\nthat stops short, with the [`MORE`] header, holds those up to the\nlast record it has: ask again for those after it."
           }
         }
       },
       "FetchSnapshot": {
         "type": "object",
-        "description": "Asks for the objects of a snapshot that the caller lacks: its trees and\nblobs, walked from its root. This is the only way blobs and trees leave\na repository, so what each caller may read can be checked by path.",
+        "description": "Asks for the objects of a snapshot that the caller lacks: its trees and\nblobs, walked from its root. This is the only way blobs and trees leave\na repository, so what each caller may read is checked by path: the\ncontent of paths they may not read is withheld, though it keeps its\nplace in the trees.",
         "required": [
-          "snapshot"
+          "of"
         ],
         "properties": {
           "have": {
@@ -1240,6 +1532,10 @@
               "$ref": "#/components/schemas/TreeId"
             },
             "description": "Snapshots the caller holds whole. Whatever one of them holds at the\nsame path is skipped, so only what changed since comes. Those the\nrepository doesn't have are ignored."
+          },
+          "of": {
+            "type": "string",
+            "description": "The record whose snapshot it is: a revision or an acceptance. Only a\nrecord's snapshot is walked, never a tree within one, whose paths\nwould be read as others."
           },
           "paths": {
             "type": "array",
@@ -1253,10 +1549,6 @@
             "format": "int64",
             "description": "Skip this many of the objects, which earlier parts brought: a\nresponse that stops short has the [`MORE`] header.",
             "minimum": 0
-          },
-          "snapshot": {
-            "$ref": "#/components/schemas/TreeId",
-            "description": "The snapshot."
           }
         }
       },
@@ -1364,10 +1656,41 @@
           }
         }
       },
+      "IssuedToken": {
+        "type": "object",
+        "description": "A token a server issued.",
+        "required": [
+          "token",
+          "principal",
+          "expires"
+        ],
+        "properties": {
+          "expires": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it expires, in seconds since the Unix epoch.",
+            "minimum": 0
+          },
+          "principal": {
+            "$ref": "#/components/schemas/Principal",
+            "description": "Who it acts for."
+          },
+          "token": {
+            "type": "string",
+            "description": "The token, to send as `Authorization: Bearer <token>`."
+          }
+        }
+      },
       "Kind": {
         "type": "string",
         "examples": [
           "ci.test"
+        ]
+      },
+      "KindPattern": {
+        "type": "string",
+        "examples": [
+          "ci.*"
         ]
       },
       "LandRequest": {
@@ -1478,6 +1801,69 @@
           }
         }
       },
+      "Level": {
+        "type": "string",
+        "description": "What a caller may do with a path.",
+        "enum": [
+          "none",
+          "read",
+          "write"
+        ]
+      },
+      "Listed": {
+        "type": "object",
+        "description": "An entry of a [`Listing`].",
+        "required": [
+          "name",
+          "kind",
+          "id",
+          "withheld"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ObjectId",
+            "description": "Its object."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EntryKind",
+            "description": "A file, an executable, a symlink or a directory."
+          },
+          "name": {
+            "$ref": "#/components/schemas/EntryName",
+            "description": "Its name."
+          },
+          "withheld": {
+            "type": "boolean",
+            "description": "Whether its content is withheld from the caller: it keeps its\nplace, but can't be read."
+          }
+        }
+      },
+      "Listing": {
+        "type": "object",
+        "description": "A directory of a snapshot.",
+        "required": [
+          "snapshot",
+          "path",
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Listed"
+            },
+            "description": "Its entries, sorted by name."
+          },
+          "path": {
+            "$ref": "#/components/schemas/RepoPath",
+            "description": "The directory."
+          },
+          "snapshot": {
+            "$ref": "#/components/schemas/TreeId",
+            "description": "The snapshot's root tree."
+          }
+        }
+      },
       "LogEntry": {
         "type": "object",
         "description": "One acceptance of a target's log.",
@@ -1545,6 +1931,16 @@
             "description": "The cursor after the entries read: pass it to the next read.",
             "minimum": 0
           }
+        }
+      },
+      "PathAccess": {
+        "type": "object",
+        "description": "What a caller may do with every path: the level of the most specific\npath it lists at or above it. The root is always listed.",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/Level"
+        },
+        "propertyNames": {
+          "type": "string"
         }
       },
       "Pending": {
@@ -1710,7 +2106,7 @@
             "description": "The exact revisions this one requires: the changes below it in a\nstack."
           },
           "description": {
-            "$ref": "#/components/schemas/BlobId",
+            "$ref": "#/components/schemas/AttachmentId",
             "description": "The intent, written for humans and agents."
           },
           "predecessors": {
@@ -1771,6 +2167,68 @@
               "$ref": "#/components/schemas/RevisionEntry"
             },
             "description": "Every revision, in the order the repository received them."
+          }
+        }
+      },
+      "Rights": {
+        "type": "object",
+        "description": "What a caller may do, resolved from the policy in force and narrowed by\ntheir token's scope.",
+        "required": [
+          "paths",
+          "annotate",
+          "land",
+          "admin"
+        ],
+        "properties": {
+          "admin": {
+            "type": "boolean",
+            "description": "Whether they may land on `policy`."
+          },
+          "annotate": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KindPattern"
+            },
+            "description": "The kinds of statements they may issue."
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrincipalName"
+            },
+            "description": "The policy's groups the caller is a member of."
+          },
+          "land": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Targets"
+            },
+            "description": "The targets they may land on, but `policy`."
+          },
+          "paths": {
+            "$ref": "#/components/schemas/PathAccess",
+            "description": "What they may do with each path."
+          },
+          "principal": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Principal",
+                "description": "Who the caller is: `None` for an anonymous caller, or the node's own\nuser."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scope": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            },
+            "description": "The token's scope, if the caller came with a scoped token."
           }
         }
       },
@@ -1836,7 +2294,7 @@
           "payload": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/BlobId",
+                "$ref": "#/components/schemas/AttachmentId",
                 "description": "Free-form details, defined by whoever owns the kind."
               },
               {
@@ -1952,6 +2410,33 @@
         "examples": [
           "main"
         ]
+      },
+      "Targets": {
+        "type": "string",
+        "examples": [
+          "main"
+        ]
+      },
+      "TokenRequest": {
+        "type": "object",
+        "description": "Asks a server for a token with a narrower scope, for an agent or a CI\nrunner.",
+        "required": [
+          "scope",
+          "ttl"
+        ],
+        "properties": {
+          "scope": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            },
+            "description": "What it may do: a part of what the caller may do."
+          },
+          "ttl": {
+            "type": "string",
+            "description": "How long it lasts, such as `1h`."
+          }
+        }
       },
       "TreeId": {
         "type": "string",

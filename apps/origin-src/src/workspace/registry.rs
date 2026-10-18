@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{self, Path, PathBuf};
 
 use origin_platform::DurableWrite;
-use origin_shared::{ChangeId, Digest, EncodedObject, Record, Revision, Tree};
+use origin_shared::{ChangeId, Digest, EncodedObject, Record, RecordId, Revision, Tree};
 
 use super::{Workspace, WorkspaceError};
 use crate::oplog::Why;
@@ -49,7 +49,7 @@ impl Workspace {
             let head = Self::single_head(&working_copy.index, change)?;
             (head, self.store.get(head)?, Vec::new())
         } else {
-            let description = EncodedObject::blob(b"");
+            let description = EncodedObject::attachment(b"");
             let base = working_copy.revision.base;
             let revision = Revision {
                 change: ChangeId::random().map_err(WorkspaceError::Random)?,
@@ -73,7 +73,7 @@ impl Workspace {
         let store = store.with_actor(self.store.actor().in_workspace(&root));
         let mut workspace = Self::at(root, store, self.config.clone(), id);
         let empty = Tree::default().encode().id().into();
-        let changes = workspace.changes(empty, revision.snapshot)?;
+        let changes = workspace.changes(empty, RecordId::Revision(id))?;
         workspace.checkout(&changes, None)?;
         let repository = Self::path_bytes(self.store.root());
         workspace.write_durably(workspace.meta(Self::REPOSITORY), &repository)?;

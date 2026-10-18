@@ -9,12 +9,12 @@
 //! Syncing never changes files under a running workspace: `pull` is a
 //! fetch, then a move of the working copy.
 //!
-//! The remote's event cursor as of the last fetch, and the generation of
-//! the op log it's of, are kept in `.origin/remote-cursor`, so the next
-//! fetch only compares the changes
-//! that moved since (see [`Sync::moved`]). Every way this repository learns
-//! of a change brings all the remote has of it, so the changes it knows are
-//! whole as of that cursor.
+//! The remote's event cursor as of each user's last fetch, and the
+//! generation of the op log it's of, are kept with their rights (see
+//! [`Workspace::access`]), so their next fetch only compares the changes
+//! that moved since (see [`Sync::moved`]). Every way this repository
+//! learns of a change brings all the remote has of it, so the changes it
+//! knows are whole as of that cursor.
 
 use std::fs;
 use std::io;
@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 
 use origin_platform::Native;
 use origin_shared::{
-    Base, ChangeId, EncodedObject, Record, Revision, RevisionId, TargetName, Tree, TreeId,
+    Base, ChangeId, EncodedObject, Record, RecordId, Revision, RevisionId, TargetName, Tree,
 };
 
 use super::{Workspace, WorkspaceError};
@@ -66,7 +66,7 @@ impl Workspace {
             return Err(WorkspaceError::NotEmpty(root));
         }
         let created = !root.exists();
-        let remote = Remote::open(&url, Self::node_of(&config)?)?;
+        let remote = Self::open_remote(&url, &config)?;
         let cloned = Self::clone_into(root.clone(), &url, remote, target, config, actor);
         if cloned.is_err() {
             // Best effort: the error says what went wrong.
@@ -90,17 +90,20 @@ impl Workspace {
         let meta = root.join(Self::META_DIR);
         let store = Store::new(meta, Native::default()).with_actor(actor.in_workspace(&root));
         store.init()?;
-        let sync = Sync::new(&store, &remote, config.node().clone());
+        let rights = remote.whoami()?;
+        Self::save_access(&store, url, &config, &rights, true)?;
+        let store = store.with_withheld(rights.paths);
+        let sync = Sync::new(&store, &remote, config.node().clone(), config.user());
         let cursor = sync.moved(None)?.cursor;
         sync.fetch_chains(slice::from_ref(target))?;
         let tip = store
             .head(target)?
             .ok_or_else(|| WorkspaceError::UnknownTarget(target.clone()))?;
         let state = store.get(tip.acceptance)?.body().state;
-        sync.need(state, &[])?;
+        sync.need(RecordId::Acceptance(tip.acceptance), &[])?;
 
         let empty_tree = Tree::default().encode();
-        let empty_description = EncodedObject::blob(b"");
+        let empty_description = EncodedObject::attachment(b"");
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
@@ -120,7 +123,8 @@ impl Workspace {
         )?;
         workspace.save_cursor(&cursor)?;
         workspace.remote = OnceLock::from(Some(remote));
-        let changes = workspace.changes(empty_tree.id().into(), state)?;
+        let changes =
+            workspace.changes(empty_tree.id().into(), RecordId::Acceptance(tip.acceptance))?;
         workspace.checkout(&changes, None)?;
         workspace.publish_pointer(None, id, Why::Command)?;
         println!(
@@ -133,15 +137,11 @@ impl Workspace {
         Ok(workspace)
     }
 
-    /// The file in the repository's `.origin` holding the remote's event
-    /// cursor as of the last fetch.
-    const CURSOR: &str = "remote-cursor";
-
-    /// The remote's event cursor as of the last fetch, if any, written
-    /// `<generation> <next>`. One that cannot be read is forgotten: the
-    /// next fetch compares every change.
+    /// The remote's event cursor as of the user's last fetch, if any,
+    /// written `<generation> <next>`. One that cannot be read is
+    /// forgotten: the next fetch compares every change.
     fn cursor(&self) -> Option<Cursor> {
-        let path = self.store.root().join(Self::CURSOR);
+        let path = Self::user_file(&self.store, &self.config, "cursor").ok()??;
         let text = fs::read_to_string(path).ok()?;
         let (generation, next) = text.trim_end().split_once(' ')?;
         Some(Cursor {
@@ -154,15 +154,20 @@ impl Workspace {
     /// or none, is as good, only slower to fetch from, and one torn by a
     /// crash doesn't parse, or reads from earlier.
     fn save_cursor(&self, cursor: &Cursor) -> Result<(), WorkspaceError> {
-        let path = self.store.root().join(Self::CURSOR);
+        let Some(path) = Self::user_file(&self.store, &self.config, "cursor")? else {
+            return Ok(());
+        };
         let text = format!("{} {}\n", cursor.generation, cursor.next);
         fs::write(&path, text).map_err(|source| WorkspaceError::io(&path, source))
     }
 
-    /// Forgets the remote's event cursor: the next fetch compares every
-    /// change, for a new remote, or once the user sees more of it.
+    /// Forgets the remote's event cursor as of the user's last fetch: the
+    /// next fetch compares every change, for a new remote, or once the user
+    /// sees more of it.
     pub(super) fn forget_cursor(&self) -> Result<(), WorkspaceError> {
-        let path = self.store.root().join(Self::CURSOR);
+        let Some(path) = Self::user_file(&self.store, &self.config, "cursor")? else {
+            return Ok(());
+        };
         match fs::remove_file(&path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 Err(WorkspaceError::io(&path, error))
@@ -171,14 +176,24 @@ impl Workspace {
         }
     }
 
-    /// The URL of the repository's remote, if it has one.
-    fn remote_url(&self) -> Result<Option<RemoteUrl>, WorkspaceError> {
-        let path = self.store.root().join(Self::REMOTE);
+    /// The URL of the remote of the repository in `store`, if it has one.
+    pub(super) fn remote_url(store: &Store) -> Result<Option<RemoteUrl>, WorkspaceError> {
+        let path = store.root().join(Self::REMOTE);
         match fs::read_to_string(&path) {
             Ok(url) => Ok(Some(RemoteUrl::parse(url.trim_end())?)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(WorkspaceError::io(&path, source)),
         }
+    }
+
+    /// Opens the remote at `url` for the user of `config`, with their
+    /// token for it, if they have one.
+    fn open_remote(url: &RemoteUrl, config: &UserConfig) -> Result<Remote, WorkspaceError> {
+        Ok(Remote::open(
+            url,
+            Self::node_of(config)?,
+            url.token(config),
+        )?)
     }
 
     /// The repository's remote, opened the first time it's needed, if it
@@ -187,20 +202,25 @@ impl Workspace {
         if let Some(remote) = self.remote.get() {
             return Ok(remote.as_ref());
         }
-        let remote = match self.remote_url()? {
-            Some(url) => Some(Remote::open(&url, self.node()?)?),
+        let remote = match Self::remote_url(&self.store)? {
+            Some(url) => Some(Self::open_remote(&url, &self.config)?),
             None => None,
         };
         Ok(self.remote.get_or_init(|| remote).as_ref())
     }
 
-    /// Syncs with `remote`, as this node.
+    /// Syncs with `remote`, as this node, for its user.
     pub(super) fn sync<'s>(&'s self, remote: &'s Remote) -> Sync<'s> {
-        Sync::new(&self.store, remote, self.config.node().clone())
+        Sync::new(
+            &self.store,
+            remote,
+            self.config.node().clone(),
+            self.config.user(),
+        )
     }
 
     /// The repository's remote, which the command needs.
-    fn require_remote(&self) -> Result<&Remote, WorkspaceError> {
+    pub(super) fn require_remote(&self) -> Result<&Remote, WorkspaceError> {
         self.remote()?.ok_or(WorkspaceError::NoRemote)
     }
 
@@ -212,7 +232,7 @@ impl Workspace {
     /// read or written.
     pub fn set_remote(&self, url: Option<&str>) -> Result<(), WorkspaceError> {
         let Some(url) = url else {
-            match self.remote_url()? {
+            match Self::remote_url(&self.store)? {
                 Some(url) => println!("{url}"),
                 None => println!("No remote: set one with `origin remote <url>`."),
             }
@@ -239,10 +259,11 @@ impl Workspace {
     /// Fails if there's no remote, it lacks a target or change asked for,
     /// or the remote or the store fails.
     pub fn fetch(
-        &self,
+        &mut self,
         targets: &[TargetName],
         changes: &[ChangeId],
     ) -> Result<(), WorkspaceError> {
+        self.refresh_access()?;
         let remote = self.require_remote()?;
         let since = self.cursor();
         let Fetch {
@@ -298,7 +319,12 @@ impl Workspace {
                 .map(|change| working_copy.find_change(change))
                 .collect::<Result<_, _>>()?
         };
-        let pushed = self.sync(self.require_remote()?).push(&changes)?;
+        let rights = self.push_access()?;
+        let mut sync = self.sync(self.require_remote()?);
+        if let Some(rights) = rights {
+            sync = sync.writing(rights.paths);
+        }
+        let pushed = sync.push(&changes)?;
         for statement in &pushed.unsent {
             println!(
                 "Statement {} stays here: it needs a statement the remote doesn't have",
@@ -316,25 +342,30 @@ impl Workspace {
         Ok(())
     }
 
-    /// Fetches the snapshots of `trees` the repository lacks, if it has a
-    /// remote: a clone only holds the snapshots it read. Skips what the
-    /// working copy's revision and its base hold. Without a remote, reading
-    /// a missing snapshot fails later.
-    pub(super) fn need(&self, trees: &[TreeId]) -> Result<(), WorkspaceError> {
-        if self.store.held_whole(trees.iter().copied())?.len() == trees.len() {
+    /// Fetches the snapshots of `records`, revisions and acceptances, that
+    /// the repository lacks, if it has a remote: a clone only holds the
+    /// snapshots it read. Skips what the working copy's revision and its
+    /// base hold. Without a remote, reading a missing snapshot fails later.
+    pub(super) fn need(&self, records: &[RecordId]) -> Result<(), WorkspaceError> {
+        let mut lacking = Vec::new();
+        for &record in records {
+            if let Some(snapshot) = self.store.snapshot_of(record)?
+                && !self.store.holds(snapshot)?
+            {
+                lacking.push(record);
+            }
+        }
+        if lacking.is_empty() {
             return Ok(());
         }
         let Some(remote) = self.remote()? else {
             return Ok(());
         };
         let current = self.store.get(self.revision)?;
-        let base = match current.base {
-            Base::Acceptance(id) => self.store.get(id)?.body().state,
-            Base::Revision(id) => self.store.get(id)?.snapshot,
-        };
+        let base = self.store.base_snapshot(current.base)?;
         let sync = self.sync(remote);
-        for &tree in trees {
-            sync.need(tree, &[current.snapshot, base])?;
+        for record in lacking {
+            sync.need(record, &[current.snapshot, base])?;
         }
         Ok(())
     }
