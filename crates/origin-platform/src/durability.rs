@@ -76,7 +76,8 @@ pub struct DurableWrite<'a, P> {
 struct Staged {
     /// Each temporary file and the path it's published to.
     files: Vec<(PathBuf, PathBuf)>,
-    /// The directories whose entries change: the published files' parents.
+    /// The directories whose entries must be durable: the published files'
+    /// parents, and those added with [`DurableWrite::sync_dir_with`].
     dirs: BTreeSet<PathBuf>,
 }
 
@@ -144,6 +145,14 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
         staged.dirs.extend(relied_on);
         staged.files.push((temp, path));
         Ok(())
+    }
+
+    /// Makes the entries of `dir` durable with the batch, as for a file
+    /// staged in it: for a file another write published, which this one
+    /// relies on, and may not have synced yet.
+    pub fn sync_dir_with(&self, dir: impl Into<PathBuf>) {
+        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
+        staged.dirs.insert(dir.into());
     }
 
     fn write_temp(temp: &Path, contents: &[u8]) -> Result<(), Error> {
@@ -431,6 +440,25 @@ mod tests {
                 Call::Dir(root.join("new/sub")),
             ],
             "or with the batch"
+        );
+    }
+
+    #[test]
+    fn syncs_the_directories_of_files_relied_on() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = Recorder::default();
+        let write = DurableWrite::new(&recorder);
+        write.sync_dir_with(root.path().join("other"));
+        write.stage(root.path().join("file"), b"contents").unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            recorder.take(),
+            [
+                Call::Batch(1),
+                Call::Dir(root.path().parent().unwrap().to_owned()),
+                Call::Dir(root.path().to_owned()),
+                Call::Dir(root.path().join("other")),
+            ]
         );
     }
 
