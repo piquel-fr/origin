@@ -1,0 +1,18 @@
+[package]
+name = "origin-src"
+description = "The origin command line and server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "origin"
+path = "src/main.rs"
+
+[dependencies]
+origin-shared.workspace = true
+
+[lints]
+workspace = true
