@@ -9,7 +9,8 @@ review bots read and write at the same time, written in Rust. See
 ## Development
 
 ```sh
-just   # format, lint, test, and audit dependencies
+just         # format, lint, test, and audit dependencies
+just bench   # micro-benchmarks
 ```
 
 rustup installs the toolchain `rust-toolchain.toml` pins. The minimum
