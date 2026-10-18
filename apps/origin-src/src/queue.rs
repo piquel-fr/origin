@@ -27,7 +27,9 @@
 //!    are promoted to it first, and a valid promotion claims what its
 //!    original does, as its original's issuer.
 //! 4. **Missing evidence** leaves the landing waiting, until the statements
-//!    are issued and the landing is retried.
+//!    are issued and the landing is retried, for its submitter, under the
+//!    policy in force then: the [service](crate::service) retries it
+//!    whenever statements about its subject arrive.
 //! 5. **Otherwise** this node signs an acceptance naming what landed, the
 //!    evidence and the policy, and appends it to the target's chain.
 //!
@@ -37,8 +39,8 @@
 //!
 //! The queue of each target lives in `queue/<target id>/`: a `lock` held
 //! while landing, so landings on one target never race, and a file for each
-//! landing that waits, `change-<id>` or `target-<target id>`, so waiting
-//! landings can be listed and retried.
+//! landing that waits, `change-<id>` or `target-<target id>`, naming its
+//! submitter, so waiting landings can be listed and retried.
 
 use std::collections::HashSet;
 use std::fs;
@@ -60,7 +62,7 @@ use crate::ancestry::Ancestry;
 use crate::annotations::{AnnotateError, Annotations, Claim};
 use crate::conflict::Conflicts;
 use crate::oplog::Effect;
-use crate::permissions::{Forbidden, Reader};
+use crate::permissions::{Caller, Forbidden, Reader, Scope};
 use crate::policy::{Policy, PolicyError};
 use crate::store::{Store, StoreError};
 
@@ -70,8 +72,19 @@ pub struct Queue<'a, P = Native> {
     store: &'a Store<P>,
     key: &'a NodeKey,
     node: PrincipalName,
+    /// Who submits the landings, which a waiting one is retried for.
+    submitter: Caller,
     /// What the submitter may do with each path.
-    submitter: PathAccess,
+    paths: PathAccess,
+}
+
+/// A landing that waits, and who submitted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    /// The landing.
+    pub pending: Pending,
+    /// Its submitter, whose rights it lands with when it's retried.
+    pub submitter: Caller,
 }
 
 /// Landings onto one target, holding its queue's lock.
@@ -114,16 +127,18 @@ impl<'a, P: Platform> Queue<'a, P> {
             store,
             key,
             node,
-            submitter: PathAccess::uniform(Level::Write),
+            submitter: Caller::Owner,
+            paths: PathAccess::uniform(Level::Write),
         }
     }
 
-    /// The queues, landing for a submitter who may do `paths`: everything,
-    /// by default.
+    /// The queues, landing for `submitter`, who may do `paths`: the owner,
+    /// who may do everything, by default.
     #[must_use]
-    pub fn submitted_by(self, paths: PathAccess) -> Self {
+    pub fn submitted_by(self, submitter: Caller, paths: PathAccess) -> Self {
         Self {
-            submitter: paths,
+            submitter,
+            paths,
             ..self
         }
     }
@@ -291,9 +306,21 @@ impl<'a, P: Platform> Queue<'a, P> {
     ///
     /// # Errors
     ///
+    /// Fails like [`Queue::waiting`].
+    pub fn pending(store: &Store<P>) -> Result<Vec<Pending>, StoreError> {
+        Ok(Self::waiting(store)?
+            .into_iter()
+            .map(|waiting| waiting.pending)
+            .collect())
+    }
+
+    /// Every landing that waits, with its submitter, sorted by target.
+    ///
+    /// # Errors
+    ///
     /// Fails if the queues cannot be listed, or a landing cannot be read or
     /// is malformed.
-    pub fn pending(store: &Store<P>) -> Result<Vec<Pending>, StoreError> {
+    pub fn waiting(store: &Store<P>) -> Result<Vec<Waiting>, StoreError> {
         let root = store.queue_dir();
         let list = |dir: &PathBuf| match fs::read_dir(dir) {
             Ok(entries) => entries
@@ -312,15 +339,15 @@ impl<'a, P: Platform> Queue<'a, P> {
                 }
                 let text =
                     fs::read_to_string(&path).map_err(|source| StoreError::io(&path, source))?;
-                let mut landing = PendingFile::decode(&text)
+                let mut waiting = PendingFile::decode(&text)
                     .ok_or_else(|| StoreError::Malformed(path.clone()))?;
-                if let Blocked::Conflict { statement, paths } = &mut landing.blocked {
+                if let Blocked::Conflict { statement, paths } = &mut waiting.pending.blocked {
                     *paths = Conflicts::listed(store, &store.get(*statement)?)?.paths();
                 }
-                pending.push(landing);
+                pending.push(waiting);
             }
         }
-        pending.sort_by(|a, b| a.onto.cmp(&b.onto));
+        pending.sort_by(|a, b| a.pending.onto.cmp(&b.pending.onto));
         Ok(pending)
     }
 
@@ -553,9 +580,9 @@ impl<P: Platform> Session<'_, '_, P> {
         if !candidate.trees.is_empty() {
             store.write_all(&candidate.trees)?;
         }
-        if !self.queue.submitter.writes_all() {
+        if !self.queue.paths.writes_all() {
             for change in store.diff(self.state, candidate.state)? {
-                if !self.queue.submitter.writes(&change.path) {
+                if !self.queue.paths.writes(&change.path) {
                     return Err(Forbidden::Write(change.path).into());
                 }
             }
@@ -577,7 +604,7 @@ impl<P: Platform> Session<'_, '_, P> {
             store.write_all(&records)?;
             records.clear();
             // Only from what the submitter sees.
-            let mut reader = Reader::new(store, &self.queue.submitter);
+            let mut reader = Reader::new(store, &self.queue.paths);
             let promotions = self.annotations.promotions(
                 candidate.subject,
                 &self.queue.principal(),
@@ -605,6 +632,7 @@ impl<P: Platform> Session<'_, '_, P> {
                 proposal: candidate.kept_as,
                 subject: candidate.subject,
                 blocked: Blocked::Evidence(missing),
+                expires: self.queue.submitter.expires(),
             };
             self.keep(&pending)?;
             return Ok(Landing::Pending(pending));
@@ -688,6 +716,7 @@ impl<P: Platform> Session<'_, '_, P> {
                 statement,
                 paths: conflicts.paths(),
             },
+            expires: self.queue.submitter.expires(),
         };
         self.keep(&pending)?;
         Ok(Landing::Pending(pending))
@@ -708,7 +737,7 @@ impl<P: Platform> Session<'_, '_, P> {
         let write = self.store().durable_write();
         write.stage(
             self.pending_path(&pending.proposal)?,
-            PendingFile::encode(pending).as_bytes(),
+            PendingFile::encode(pending, &self.queue.submitter).as_bytes(),
         )?;
         let waiting = Effect::Waiting {
             onto: pending.onto.clone(),
@@ -763,10 +792,13 @@ impl PendingFile {
     const HEADER: &str = "origin pending 1";
 
     /// Encodes the landing as lines: the header, `onto <target>`, `change
-    /// <id>` or `target <name>`, `subject <kind> <id>`, then a `missing
-    /// <kind> <verdict> <issuer>` line for each requirement it lacks, or
-    /// `conflict <statement>`, whose payload lists the paths.
-    fn encode(pending: &Pending) -> String {
+    /// <id>` or `target <name>`, `subject <kind> <id>`, `by owner` or `by
+    /// <principal>` for its submitter, then if their token is scoped, an
+    /// `expires <seconds>` line and a `scope <capability>` line for each of
+    /// its capabilities, then a
+    /// `missing <kind> <verdict> <issuer>` line for each requirement it
+    /// lacks, or `conflict <statement>`, whose payload lists the paths.
+    fn encode(pending: &Pending, submitter: &Caller) -> String {
         let mut lines = vec![Self::HEADER.to_owned(), format!("onto {}", pending.onto)];
         lines.push(match &pending.proposal {
             Proposal::Change(change) => format!("change {change}"),
@@ -779,6 +811,18 @@ impl PendingFile {
             RecordId::Acceptance(id) => ("acceptance", id.to_hex()),
         };
         lines.push(format!("subject {kind} {id}"));
+        match submitter {
+            Caller::Principal { principal, scope } => {
+                lines.push(format!("by {principal}"));
+                if let Some(scope) = scope {
+                    lines.push(format!("expires {}", scope.expires));
+                    let capabilities = scope.capabilities.iter();
+                    lines.extend(capabilities.map(|capability| format!("scope {capability}")));
+                }
+            }
+            // Anonymous callers never land.
+            Caller::Owner | Caller::Anonymous => lines.push("by owner".to_owned()),
+        }
         match &pending.blocked {
             Blocked::Evidence(missing) => lines.extend(missing.iter().map(|requirement| {
                 format!(
@@ -793,7 +837,7 @@ impl PendingFile {
 
     /// Decodes what [`PendingFile::encode`] wrote, without the conflicting
     /// paths, or `None` if it's malformed.
-    fn decode(text: &str) -> Option<Pending> {
+    fn decode(text: &str) -> Option<Waiting> {
         let mut lines = text.lines();
         if lines.next()? != Self::HEADER {
             return None;
@@ -811,10 +855,18 @@ impl PendingFile {
             ("acceptance", id) => RecordId::Acceptance(id.parse().ok()?),
             _ => return None,
         };
+        let principal = match lines.next()?.strip_prefix("by ")? {
+            "owner" => None,
+            principal => Some(principal.parse().ok()?),
+        };
+        let mut expires = None;
+        let mut capabilities = Vec::new();
         let mut missing = Vec::new();
         let mut conflict = None;
         for line in lines {
             match line.split_once(' ')? {
+                ("expires", at) => expires = Some(at.parse().ok()?),
+                ("scope", capability) => capabilities.push(capability.parse().ok()?),
                 ("missing", requirement) => {
                     let mut fields = requirement.split(' ');
                     missing.push(Requirement {
@@ -834,11 +886,26 @@ impl PendingFile {
             },
             None => Blocked::Evidence(missing),
         };
-        Some(Pending {
-            onto,
-            proposal,
-            subject,
-            blocked,
+        if expires.is_none() && !capabilities.is_empty() {
+            return None;
+        }
+        let scope = expires.map(|expires| Scope {
+            capabilities,
+            expires,
+        });
+        let submitter = match principal {
+            Some(principal) => Caller::Principal { principal, scope },
+            None => Caller::Owner,
+        };
+        Some(Waiting {
+            pending: Pending {
+                onto,
+                proposal,
+                subject,
+                blocked,
+                expires,
+            },
+            submitter,
         })
     }
 }
@@ -1270,7 +1337,13 @@ pub(crate) mod tests {
         let blind = PathAccess::new(Level::Write, [(secrets, Level::None)]);
         let waiting = repo
             .queue()
-            .submitted_by(blind)
+            .submitted_by(
+                Caller::Principal {
+                    principal: "user:eve".parse().unwrap(),
+                    scope: None,
+                },
+                blind,
+            )
             .land_change(
                 &mut repo.annotations(),
                 ChangeId::from_bytes([2; 16]),
@@ -1497,10 +1570,15 @@ pub(crate) mod tests {
                 verdict: Verdict::Pass,
                 issuer: "group:runners".parse().unwrap(),
             }]),
+            expires: None,
+        };
+        let owner = Waiting {
+            pending: pending.clone(),
+            submitter: Caller::Owner,
         };
         assert_eq!(
-            PendingFile::decode(&PendingFile::encode(&pending)),
-            Some(pending.clone())
+            PendingFile::decode(&PendingFile::encode(&pending, &Caller::Owner)),
+            Some(owner)
         );
         let conflict = Pending {
             proposal: change(9),
@@ -1510,10 +1588,26 @@ pub(crate) mod tests {
             },
             ..pending
         };
-        assert_eq!(
-            PendingFile::decode(&PendingFile::encode(&conflict)),
-            Some(conflict)
-        );
+        let scoped = |capabilities: &[&str]| Waiting {
+            pending: Pending {
+                expires: Some(1_900_000_000),
+                ..conflict.clone()
+            },
+            submitter: Caller::Principal {
+                principal: "user:agent".parse().unwrap(),
+                scope: Some(Scope {
+                    capabilities: capabilities.iter().map(|c| c.parse().unwrap()).collect(),
+                    expires: 1_900_000_000,
+                }),
+            },
+        };
+        // A token scoped to nothing stays scoped.
+        for scoped in [scoped(&["write src", "land *"]), scoped(&[])] {
+            assert_eq!(
+                PendingFile::decode(&PendingFile::encode(&scoped.pending, &scoped.submitter)),
+                Some(scoped)
+            );
+        }
         assert_eq!(PendingFile::decode("origin pending 2\n"), None);
     }
 

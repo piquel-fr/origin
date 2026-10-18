@@ -5,9 +5,11 @@ use std::fs::File;
 use std::path::Path;
 use std::time::SystemTime;
 
+use origin_shared::api::Annotation;
+use origin_shared::pack::Pack;
 use origin_shared::{
-    AttachmentId, EncodedObject, Inputs, Kind, Principal, RecordId, Revision, RevisionId,
-    Statement, Verdict,
+    AttachmentId, EncodedObject, Inputs, Kind, Principal, Record, RecordId, Revision, RevisionId,
+    Statement, StatementId, Verdict,
 };
 
 use super::{WorkingCopy, Workspace, WorkspaceError};
@@ -55,7 +57,8 @@ impl Workspace {
 
     /// `origin annotate <rev> <kind> --pass|--fail|--neutral`: issues a
     /// statement about a revision as the user, superseding the user's
-    /// latest one of the same kind about it.
+    /// latest one of the same kind about it, and resumes the landings
+    /// waiting for evidence about it.
     ///
     /// # Errors
     ///
@@ -97,7 +100,12 @@ impl Workspace {
             payload: payload.as_ref().map(|payload| payload.id().into()),
             promoted_from: None,
         };
-        let id = annotations.issue(&statement, payload)?;
+        // Through the service, which resumes the landings waiting for it.
+        let encoded = statement.encode();
+        let id: StatementId = encoded.id().into();
+        let objects = payload.into_iter().chain([encoded]).collect();
+        self.service(Some(annotations.into_index()))?
+            .put_records(&Caller::Owner, Pack { objects })?;
         println!(
             "Issued statement {}: {} {} about revision {}",
             id.short(),
@@ -184,7 +192,8 @@ impl Workspace {
 
     /// `origin promote [<rev>]`: carries promotable results over to a
     /// revision, the working copy by default, from the records with the
-    /// same input digest, as statements this node issues.
+    /// same input digest, as statements this node issues. Landings waiting
+    /// for them continue.
     ///
     /// # Errors
     ///
@@ -193,15 +202,13 @@ impl Workspace {
     pub fn promote(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
         let revision = working_copy.find_revision(rev)?;
-        let mut annotations = Annotations::new(&self.store, working_copy.index);
-        let promoted =
-            annotations.promote(RecordId::Revision(revision), &self.node_principal(), |_| {
-                Ok(true)
-            })?;
+        let promoted = self
+            .service(Some(working_copy.index))?
+            .promote(&Caller::Owner, RecordId::Revision(revision))?;
         if promoted.is_empty() {
             println!("Nothing to promote to revision {}", revision.short());
         }
-        for (id, statement) in promoted {
+        for Annotation { id, statement, .. } in promoted {
             let Some(original) = statement.promoted_from else {
                 continue;
             };

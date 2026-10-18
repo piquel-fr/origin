@@ -64,7 +64,7 @@ static SETUP: LazyLock<Setup> = LazyLock::new(|| {
         name: "hosted".parse().unwrap(),
         key: Arc::new(NodeKey::from_bytes(&[7; 32])),
     };
-    let initial = Policy::initial(&node.name, &node.key.public());
+    let initial = Policy::initial(&node.name, &node.key.public(), None);
     let create = |name: &str, policy: &str| {
         OriginService::create(repos.path().join(name), node.clone(), policy).unwrap()
     };
