@@ -111,9 +111,17 @@ landing can be verified.
 
 ## Changes
 
-The working copy is always a revision of the current change. Every command
+The working copy is always on a revision of the current change. Every command
 snapshots it first, so there is no `commit` and no staging area. `.origin` and
 `.git` are reserved names, never stored.
+
+A snapshot alone is a **draft**: the files as they are, which commands that
+only read the working copy (`status`, `diff`, `show`, `log`) show without
+recording anything. A command that shares or reshapes the change (`describe`,
+`new`, `edit`, `push`, `land`, `pull`, `converge`, `resolve`, `abandon`,
+`annotate`, `undo`, `workspace new`, a plugin) first records the draft as a
+new revision of the change, if it changed. A change's history then holds the
+points that mattered, not every command run while editing.
 
 - **Starting and editing.** `origin new` starts a change, on the working copy
   or on a target with `--on`. `origin describe` updates the intent, and
@@ -147,8 +155,8 @@ the exact content written there.
 - A path is resolved once a later revision has different content there, or
   when the user runs `origin resolve <path>...` to accept it as it is.
 - Every operation that makes a revision carries unresolved paths forward in
-  its own `core.conflict`: snapshots, `describe`, `new`, `converge`, `pull`,
-  `undo` and `workspace new`.
+  its own `core.conflict`: recording a draft, `describe`, `new`, `converge`,
+  `pull`, `undo` and `workspace new`.
 - The statement is written before the revision, so nothing can find the
   revision without its conflicts, even after a crash.
 - The landing queue refuses a revision with unresolved paths.
@@ -248,7 +256,13 @@ caller can see.
 A promotion counts as its original: the original's kind, verdict and issuer
 are what policy checks. It is only valid if:
 - its kind, verdict, inputs and payload equal the original's;
+- its subject is on the original subject's target: a revision is on the
+  target of the acceptance it's based on, directly or through the revisions
+  below it, an acceptance on its own, and a snapshot on none;
 - its subject's input digest equals the original subject's.
+
+Results carry over within a target, never from one target to another,
+whose checks may differ.
 
 Nodes check this whenever a promotion is used or put.
 
@@ -314,6 +328,10 @@ all                 = ["land *", "annotate *"]
 [[paths]]
 path   = "secrets"
 grants = { all = "none", "group:maintainers" = "write" }
+
+[[paths]]
+path   = "checks.toml"
+grants = { all = "read", "group:maintainers" = "write" }
 ```
 
 The rules for this file:
@@ -354,7 +372,9 @@ and stops at the first one that waits.
    moved meanwhile.
    - When one target lands on another, the merge base is found from both
      histories: the best common ancestors, merged recursively when there are
-     several, as git's recursive strategy does.
+     several, as git's recursive strategy does. The merge is checked as a
+     revision on the tip, authored by the queue's node, so results about the
+     same merge on another target never count.
    - A landing that changes nothing is skipped.
 3. **On conflict,** issue a `core.conflict` statement and keep the landing
    blocked. Nothing fails, and landing again retries it.
@@ -362,8 +382,8 @@ and stops at the first one that waits.
    - this node must be the target's authority;
    - the submitter must be allowed to land there, and must be able to write
      every path the landing changes;
-   - the required statements must be present, promoted where the input
-     digest matches.
+   - the required statements must be present, promoted from the same target
+     where the input digest matches.
 5. **If evidence is missing,** keep the landing waiting, durably, and request
    the checks (`check.requested` events). It resumes by itself when
    statements about its subject arrive, and when the server starts. A landing
@@ -425,8 +445,8 @@ plugin can do nothing the API can't, which keeps the API complete.
   bot, a semantic differ.
 - **Tools** are executables named `origin-<name>` on `PATH`. `origin <name>`
   replaces itself with them, as cargo and git do with their subcommands. Run
-  in a working copy, it snapshots first and sets `ORIGIN_REPOSITORY`,
-  `ORIGIN_REVISION` and `ORIGIN_REMOTE`.
+  in a working copy, it records the draft first and sets
+  `ORIGIN_REPOSITORY`, `ORIGIN_REVISION` and `ORIGIN_REMOTE`.
 
 Official plugins live in `apps/origin-<name>`. The first is `origin-ci`:
 - **Tool mode:** `origin ci run [<rev>]` checks a revision as the user.
@@ -440,7 +460,13 @@ a check, the plugin asks for a promotion and skips the check if a result
 already covers the revision. Results carry the last 64 KiB of output as their
 payload.
 
-`origin-ci` reads the checks from `checks.toml` in the revision being checked:
+`origin-ci` reads the checks from `checks.toml`. A worker takes them from the
+tip of the target being landed on, never from the candidate. The checks that
+guard `main` are the ones already on `main`, so a submitter can't redefine a
+required check by editing it in their change. An edit to `checks.toml` takes
+effect once it has landed, after passing the checks in force. `origin ci run`
+checks a revision with that revision's own `checks.toml`, since it issues
+results as the user.
 
 ```toml
 [checks.lint]
@@ -462,6 +488,8 @@ external = true          # reads the network: never promoted
 - Each check's kind is `ci.<name>`.
 - `checks.toml` itself is always one of a check's inputs, so editing a check
   runs it again.
+- Protecting `checks.toml` with a `[[paths]]` rule, as in the example policy,
+  keeps submitters from changing the checks at all.
 - A change in a toolchain's output only reaches the queue's promotions through
   the inputs. Pin toolchains in an input file, such as `rust-toolchain.toml`.
 
@@ -638,21 +666,23 @@ A working copy adds:
   workspace                              # the working copy's revision
   state                                  # the stat cache
   moving                                 # a move in progress
+  lock                                   # held by the command working in the working copy
   workspaces/<hash>                      # the other workspaces of this repository
   remote                                 # the remote's URL
   access/                                # each user's rights and event cursor on the remote
 ```
 
-Another workspace's `.origin/` holds only `workspace`, `state`, `moving` and
-`repository`, which names the main `.origin`.
+Another workspace's `.origin/` holds only `workspace`, `state`, `moving`,
+`lock` and `repository`, which names the main `.origin`.
 
 - **Durability order.** Each batch writes its files beside their
   destinations, syncs them in one batch sync, renames them into place and
   syncs the directories. Only then is anything published that refers to them.
   Statements are published before the revision they describe.
 - **Locking.** Records are immutable, so writing one needs no lock. Target
-  chains, queues, pushes, the index, the op log and the compactor take
-  `flock`s, which the kernel releases if the process dies.
+  chains, queues, pushes, the index, the op log, the compactor and each
+  working copy's commands take `flock`s, which the kernel releases if the
+  process dies.
 - **Packs.** Statements are the bulk of the data, so loose objects of up to
   16 KiB are packed. The server compacts in the background once about 8,000
   have piled up, and `origin gc` compacts on demand.
@@ -746,3 +776,5 @@ The **swarm scenario** is a skill run from T3 Code:
 - `origin-review` (a UI) and `origin-semantic` (tree-sitter diffs).
 - Signed statements from outside issuers, and identities separate from keys.
 - A git bridge.
+- A local log of drafts, `origin draft list` and `origin draft restore`, to
+  take back a group of edits.
