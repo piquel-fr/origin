@@ -8,8 +8,9 @@ use divan::Bencher;
 use divan::counter::ItemsCount;
 use origin_platform::Native;
 use origin_shared::{
-    Base, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind, ObjectId, Principal,
-    Record, RecordId, RepoPath, Revision, RevisionId, Statement, Tree, TreeEntry, TreeId, Verdict,
+    AcceptanceBody, Base, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind,
+    NodeKey, Principal, Record, RecordId, RepoPath, Revision, RevisionId, Statement, TargetName,
+    Tree, TreeEntry, TreeId, Verdict,
 };
 use origin_src::annotations::Annotations;
 use origin_src::fixture::FixtureTree;
@@ -128,6 +129,19 @@ fn snapshot(version: usize, docs: usize) -> Vec<EncodedObject> {
 /// sources match one of them.
 fn promotion_store() -> (tempfile::TempDir, Store, RevisionId) {
     let (dir, store) = store();
+    // Every revision is on `main`, so results promote between them.
+    let main = AcceptanceBody {
+        target: TargetName::MAIN.id(),
+        seq: 0,
+        prev: None,
+        state: Tree::default().encode().id().into(),
+        landed: Vec::new(),
+        evidence: Vec::new(),
+        policy: None,
+    }
+    .sign(&NodeKey::from_bytes(&[1; 32]))
+    .encode();
+    store.write_all(std::slice::from_ref(&main)).unwrap();
     let revision = |store: &Store, change: usize, version: usize, docs: usize| {
         let objects = snapshot(version, docs);
         let root = TreeId::from(objects.last().unwrap().id());
@@ -137,7 +151,7 @@ fn promotion_store() -> (tempfile::TempDir, Store, RevisionId) {
         let encoded = Revision {
             change: ChangeId::from_bytes(id),
             predecessors: Vec::new(),
-            base: Base::Acceptance(ObjectId::from_bytes([0; 32]).into()),
+            base: Base::Acceptance(main.id().into()),
             deps: Vec::new(),
             snapshot: root,
             description: EncodedObject::blob(b"").id().into(),
