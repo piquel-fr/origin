@@ -111,9 +111,17 @@ landing can be verified.
 
 ## Changes
 
-The working copy is always a revision of the current change. Every command
+The working copy is always on a revision of the current change. Every command
 snapshots it first, so there is no `commit` and no staging area. `.origin` and
 `.git` are reserved names, never stored.
+
+A snapshot alone is a **draft**: the files as they are, which commands that
+only read the working copy (`status`, `diff`, `show`, `log`) show without
+recording anything. A command that shares or reshapes the change (`describe`,
+`new`, `edit`, `push`, `land`, `pull`, `converge`, `resolve`, `abandon`,
+`annotate`, `undo`, `workspace new`, a plugin) first records the draft as a
+new revision of the change, if it changed. A change's history then holds the
+points that mattered, not every command run while editing.
 
 - **Starting and editing.** `origin new` starts a change, on the working copy
   or on a target with `--on`. `origin describe` updates the intent, and
@@ -147,8 +155,8 @@ the exact content written there.
 - A path is resolved once a later revision has different content there, or
   when the user runs `origin resolve <path>...` to accept it as it is.
 - Every operation that makes a revision carries unresolved paths forward in
-  its own `core.conflict`: snapshots, `describe`, `new`, `converge`, `pull`,
-  `undo` and `workspace new`.
+  its own `core.conflict`: recording a draft, `describe`, `new`, `converge`,
+  `pull`, `undo` and `workspace new`.
 - The statement is written before the revision, so nothing can find the
   revision without its conflicts, even after a crash.
 - The landing queue refuses a revision with unresolved paths.
@@ -314,6 +322,10 @@ all                 = ["land *", "annotate *"]
 [[paths]]
 path   = "secrets"
 grants = { all = "none", "group:maintainers" = "write" }
+
+[[paths]]
+path   = "checks.toml"
+grants = { all = "read", "group:maintainers" = "write" }
 ```
 
 The rules for this file:
@@ -425,8 +437,8 @@ plugin can do nothing the API can't, which keeps the API complete.
   bot, a semantic differ.
 - **Tools** are executables named `origin-<name>` on `PATH`. `origin <name>`
   replaces itself with them, as cargo and git do with their subcommands. Run
-  in a working copy, it snapshots first and sets `ORIGIN_REPOSITORY`,
-  `ORIGIN_REVISION` and `ORIGIN_REMOTE`.
+  in a working copy, it records the draft first and sets
+  `ORIGIN_REPOSITORY`, `ORIGIN_REVISION` and `ORIGIN_REMOTE`.
 
 Official plugins live in `apps/origin-<name>`. The first is `origin-ci`:
 - **Tool mode:** `origin ci run [<rev>]` checks a revision as the user.
@@ -440,7 +452,13 @@ a check, the plugin asks for a promotion and skips the check if a result
 already covers the revision. Results carry the last 64 KiB of output as their
 payload.
 
-`origin-ci` reads the checks from `checks.toml` in the revision being checked:
+`origin-ci` reads the checks from `checks.toml`. A worker takes them from the
+tip of the target being landed on, never from the candidate. The checks that
+guard `main` are the ones already on `main`, so a submitter can't redefine a
+required check by editing it in their change. An edit to `checks.toml` takes
+effect once it has landed, after passing the checks in force. `origin ci run`
+checks a revision with that revision's own `checks.toml`, since it issues
+results as the user.
 
 ```toml
 [checks.lint]
@@ -462,6 +480,8 @@ external = true          # reads the network: never promoted
 - Each check's kind is `ci.<name>`.
 - `checks.toml` itself is always one of a check's inputs, so editing a check
   runs it again.
+- Protecting `checks.toml` with a `[[paths]]` rule, as in the example policy,
+  keeps submitters from changing the checks at all.
 - A change in a toolchain's output only reaches the queue's promotions through
   the inputs. Pin toolchains in an input file, such as `rust-toolchain.toml`.
 
@@ -746,3 +766,5 @@ The **swarm scenario** is a skill run from T3 Code:
 - `origin-review` (a UI) and `origin-semantic` (tree-sitter diffs).
 - Signed statements from outside issuers, and identities separate from keys.
 - A git bridge.
+- A local log of drafts, `origin draft list` and `origin draft restore`, to
+  take back a group of edits.
