@@ -314,6 +314,10 @@ all                 = ["land *", "annotate *"]
 [[paths]]
 path   = "secrets"
 grants = { all = "none", "group:maintainers" = "write" }
+
+[[paths]]
+path   = "checks.toml"
+grants = { all = "read", "group:maintainers" = "write" }
 ```
 
 The rules for this file:
@@ -440,7 +444,13 @@ a check, the plugin asks for a promotion and skips the check if a result
 already covers the revision. Results carry the last 64 KiB of output as their
 payload.
 
-`origin-ci` reads the checks from `checks.toml` in the revision being checked:
+`origin-ci` reads the checks from `checks.toml`. A worker takes them from the
+tip of the target being landed on, never from the candidate. The checks that
+guard `main` are the ones already on `main`, so a submitter can't redefine a
+required check by editing it in their change. An edit to `checks.toml` takes
+effect once it has landed, after passing the checks in force. `origin ci run`
+checks a revision with that revision's own `checks.toml`, since it issues
+results as the user.
 
 ```toml
 [checks.lint]
@@ -462,6 +472,8 @@ external = true          # reads the network: never promoted
 - Each check's kind is `ci.<name>`.
 - `checks.toml` itself is always one of a check's inputs, so editing a check
   runs it again.
+- Protecting `checks.toml` with a `[[paths]]` rule, as in the example policy,
+  keeps submitters from changing the checks at all.
 - A change in a toolchain's output only reaches the queue's promotions through
   the inputs. Pin toolchains in an input file, such as `rust-toolchain.toml`.
 
