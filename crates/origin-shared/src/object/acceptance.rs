@@ -192,6 +192,21 @@ impl NodeKey {
 }
 
 /// Never prints the secret key.
+impl NodeKey {
+    /// Signs `bytes`, which must start with a domain of their own, so they
+    /// never pass for anything else this key signs.
+    pub(crate) fn sign(&self, bytes: &[u8]) -> Signature {
+        self.0.sign(bytes)
+    }
+}
+
+impl NodePublicKey {
+    /// Whether `signature` is this key's over `bytes`.
+    pub(crate) fn verifies(&self, bytes: &[u8], signature: &Signature) -> bool {
+        self.0.verify_strict(bytes, signature).is_ok()
+    }
+}
+
 impl fmt::Debug for NodeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("NodeKey").field(&self.public()).finish()

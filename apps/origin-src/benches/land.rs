@@ -93,7 +93,7 @@ impl Repo {
             author: "user:bench".parse().unwrap(),
         }
         .encode();
-        let description = EncodedObject::blob(b"");
+        let description = EncodedObject::attachment(b"");
         self.store.write_all(&[content, tree, description]).unwrap();
         self.store.write_all(&[revision]).unwrap();
         change
