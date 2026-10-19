@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map;
+use std::fmt;
 
 use super::{DecodeError, Field, ObjectKind, Reader, Record};
-use crate::ObjectId;
 use crate::name::names;
+use crate::{ObjectId, TreeId};
 
 names! {
     /// The name of an entry in a tree: one path component. It isn't empty,
@@ -21,9 +22,16 @@ impl EntryName {
             && name != "."
             && name != ".."
             && !name.contains(['/', '\0'])
-            && !Self::RESERVED
-                .iter()
-                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            && !Self::is_reserved(name)
+    }
+
+    /// Whether a name belongs to repository metadata, which working copies
+    /// skip and trees cannot contain.
+    #[must_use]
+    pub fn is_reserved(name: &str) -> bool {
+        Self::RESERVED
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
 }
 
@@ -42,7 +50,12 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
-    fn from_byte(tag: u8) -> Result<Self, DecodeError> {
+    /// The kind a tag byte encodes, as in tree encodings.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the byte encodes no kind.
+    pub fn from_byte(tag: u8) -> Result<Self, DecodeError> {
         match tag {
             1 => Ok(Self::File),
             2 => Ok(Self::Executable),
@@ -62,6 +75,17 @@ impl EntryKind {
     }
 }
 
+impl fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Executable => "executable",
+            Self::Symlink => "symlink",
+            Self::Tree => "directory",
+        })
+    }
+}
+
 /// One entry of a tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TreeEntry {
@@ -69,6 +93,20 @@ pub struct TreeEntry {
     pub kind: EntryKind,
     /// The object it points to.
     pub id: ObjectId,
+}
+
+impl TreeEntry {
+    /// The entry, if it is a file (regular, executable or symlink).
+    #[must_use]
+    pub fn file(self) -> Option<Self> {
+        (!self.kind.is_tree()).then_some(self)
+    }
+
+    /// The tree the entry points to, if it is a directory.
+    #[must_use]
+    pub fn subtree(self) -> Option<TreeId> {
+        self.kind.is_tree().then_some(self.id.into())
+    }
 }
 
 /// A directory listing, sorted by name.
