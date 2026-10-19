@@ -180,12 +180,22 @@ fn promotions_cached(bencher: Bencher<'_, '_>) {
     let (_dir, store, target) = promotion_store();
     let issuer: Principal = "node:queue".parse().unwrap();
     let mut annotations = Annotations::open(&store).unwrap();
-    assert_eq!(annotations.promotions(target, &issuer).unwrap().len(), 9);
+    assert_eq!(
+        annotations
+            .promotions(RecordId::Revision(target), &issuer)
+            .unwrap()
+            .len(),
+        9
+    );
     let index = Index::open(&store).unwrap();
     bencher
         .counter(ItemsCount::new(STATEMENTS))
         .with_inputs(|| Annotations::new(&store, index.clone()))
-        .bench_local_refs(|annotations| annotations.promotions(target, &issuer).unwrap());
+        .bench_local_refs(|annotations| {
+            annotations
+                .promotions(RecordId::Revision(target), &issuer)
+                .unwrap()
+        });
 }
 
 /// The first search, which computes and remembers the digest of each of
@@ -202,5 +212,9 @@ fn promotions_uncached(bencher: Bencher<'_, '_>) {
             fs::remove_file(&log).unwrap();
             Annotations::open(&store).unwrap()
         })
-        .bench_local_refs(|annotations| annotations.promotions(target, &issuer).unwrap());
+        .bench_local_refs(|annotations| {
+            annotations
+                .promotions(RecordId::Revision(target), &issuer)
+                .unwrap()
+        });
 }

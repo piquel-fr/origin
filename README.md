@@ -21,19 +21,42 @@ origin evolog <change>              # every revision of a change
 origin edit <change>                # switch the working copy to another change
 origin abandon --reason "Too slow"  # give a change up, keeping it for others to see
 origin converge <change>            # end a change's divergence
+origin resolve <path>...            # accept conflicted files as they are
 origin index rebuild                # rebuild the record index from the store
 
 origin annotate @ ci.test --pass --inputs src Cargo.toml   # a statement about a revision
 origin statements [<rev>]           # the statements about a revision
 origin promote [<rev>]              # carry results over from revisions with the same inputs
 origin gc                           # drop expired payloads (policy.toml) and pack objects
+
+origin land [<change>] [--onto <target>]   # land a change and the ones below it
+origin land --from <target> --onto <target> # land a target's tip on another
+origin land --status                # the landings waiting for evidence or a conflict fix
+origin targets                      # every target, its tip, authority and requirements
+origin target new <name> --from <target>
+origin new [description] --on <target>     # start a change on a target's tip
 ```
+
+Landing rebases a change onto the target's tip, file by file, checks the
+statements `policy.toml` requires (promoting results whose inputs didn't
+change), and appends an acceptance signed by your node, which must be the
+target's authority. A landing that conflicts or lacks evidence waits: issue
+the statements, or a new revision, and run `origin land` again. Policy is a
+target too: edit it with `origin new --on policy`, then `origin land`.
 
 Changes are named by a unique prefix of their id, or `@` for the working
 copy's. A revision is `@`, a change (for its head), or a unique prefix of
 the revision's id. Your name and node key live in `~/.config/origin` (or
 `$ORIGIN_CONFIG_DIR`): set `user = "<name>"` in its `config.toml` if `$USER`
 isn't the name you want. See [the design](docs/design.md) for the model.
+
+`converge` merges the files of a change's heads. A text file two heads
+changed holds both versions between conflict markers (`<<<<<<<`, `=======`,
+`>>>>>>>`), and a binary one keeps one side. A `core.conflict` statement
+records which files conflict and what the merge wrote there, and the change
+doesn't land while they're unchanged: edit them, or accept a file as it is
+with `origin resolve <path>`. `status` lists those left, and every new
+revision, `describe` included, keeps them.
 
 ## Development
 

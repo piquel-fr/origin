@@ -38,6 +38,10 @@ name = "annotations"
 harness = false
 
 [[bench]]
+name = "land"
+harness = false
+
+[[bench]]
 name = "snapshot"
 harness = false
 

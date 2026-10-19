@@ -11,9 +11,12 @@
 //! command that reads it snapshots it first: when the files changed, they
 //! become a new revision of the change, which evolves from the previous one.
 //! Records are written before anything refers to them: the snapshot's
-//! objects, then the revision, then the `workspace` file naming it.
+//! objects, then the revision, then the `workspace` file naming it. Only
+//! the statements a new revision needs, such as its unresolved conflicts,
+//! come before it, so it's never found without them.
 
 mod annotate;
+mod land;
 
 use std::fs;
 use std::io;
@@ -21,16 +24,19 @@ use std::path::{self, Path, PathBuf};
 
 use origin_platform::{LockedFile, Native};
 use origin_shared::{
-    AcceptanceBody, AcceptanceId, Base, BlobId, ChangeId, EncodedObject, EntryKind, EntryName,
-    Kind, NodePublicKey, Principal, Record, RecordId, Revision, RevisionId, Source, Statement,
-    TargetId, TargetName, Tree, TreeEntry, TreeId,
+    AcceptanceId, Base, BlobId, ChangeId, EncodedObject, Kind, NodePublicKey, Principal, Record,
+    RecordId, RepoPath, Revision, RevisionId, Source, Statement, TargetId, TargetName, Tree,
+    TreeId,
 };
 
-use crate::annotations::AnnotateError;
+use crate::ancestry::Ancestry;
+use crate::annotations::{AnnotateError, Annotations};
 use crate::config::{ConfigError, UserConfig};
+use crate::conflict::Conflicts;
 use crate::index::{FindChangeError, FindError, Index};
 use crate::output::FileDiff;
 use crate::policy::PolicyError;
+use crate::queue::{LandError, Queue};
 use crate::store::{Store, StoreError};
 use crate::worktree::{SnapshotError, StatCache, Worktree};
 
@@ -51,6 +57,8 @@ struct WorkingCopy {
     /// The revision's record, if the snapshot made a new revision, which is
     /// not written yet.
     unsaved: Option<EncodedObject>,
+    /// The revision's unresolved conflicts.
+    conflicts: Conflicts,
     /// Keeps garbage collection away from the objects the snapshot found
     /// stored, until the command that saves it is done.
     _held: LockedFile,
@@ -89,32 +97,10 @@ impl Workspace {
         store.init()?;
         let key = config.node_key()?;
 
-        let (policy, policy_tree) = Self::policy(&config, &key.public());
+        let policy = Self::policy(&config, &key.public());
+        let main = Queue::new(&store, &key, config.node().clone()).init(&policy)?;
         let empty_tree = Tree::default().encode();
         let empty_description = EncodedObject::blob(b"");
-        let genesis = |target: &TargetName, state: &EncodedObject, policy| AcceptanceBody {
-            target: target.id(),
-            seq: 0,
-            prev: None,
-            state: state.id().into(),
-            landed: Vec::new(),
-            evidence: Vec::new(),
-            policy,
-        };
-        store.write_all(&[
-            policy,
-            policy_tree.clone(),
-            empty_tree.clone(),
-            empty_description.clone(),
-        ])?;
-        let policy = store.append(
-            &TargetName::POLICY,
-            &genesis(&TargetName::POLICY, &policy_tree, None).sign(&key),
-        )?;
-        let main = store.append(
-            &TargetName::MAIN,
-            &genesis(&TargetName::MAIN, &empty_tree, Some(policy)).sign(&key),
-        )?;
 
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
@@ -132,7 +118,10 @@ impl Workspace {
             config,
             revision: encoded.id().into(),
         };
-        workspace.save(&[vec![encoded]], workspace.revision)?;
+        workspace.save(
+            &[vec![empty_description], vec![encoded]],
+            workspace.revision,
+        )?;
         println!(
             "Initialized a repository in {}: node:{} is the authority of `policy` and `main`",
             workspace.root.display(),
@@ -142,34 +131,30 @@ impl Workspace {
         Ok(workspace)
     }
 
-    /// The first `policy.toml`, and the snapshot holding it: this node is
-    /// the authority of `policy` and `main`, and neither requires anything,
-    /// so a solo project lands instantly.
-    fn policy(config: &UserConfig, key: &NodePublicKey) -> (EncodedObject, EncodedObject) {
+    /// The first `policy.toml`: this node is the authority of `policy` and
+    /// `main`, and neither requires anything, so a solo project lands
+    /// instantly.
+    fn policy(config: &UserConfig, key: &NodePublicKey) -> String {
         let node = config.node();
-        let policy = format!(
+        format!(
             "# Who may land what. Changing it is a landing on `policy`.\n\
              \n\
+             # Each node's public key.\n\
              [nodes]\n\
              \"{node}\" = \"{key}\"\n\
              \n\
+             # Groups of users and nodes, for requirements:\n\
+             # [groups]\n\
+             # runners = [\"node:ci-1\"]\n\
+             \n\
+             # The node ordering each target, and the statements landing needs.\n\
              [targets.policy]\n\
              authority = \"node:{node}\"\n\
              \n\
              [targets.main]\n\
-             authority = \"node:{node}\"\n"
-        );
-        let policy = EncodedObject::blob(policy.as_bytes());
-        let tree: Tree = [(
-            EntryName::new("policy.toml").expect("a valid name"),
-            TreeEntry {
-                kind: EntryKind::File,
-                id: policy.id(),
-            },
-        )]
-        .into_iter()
-        .collect();
-        (policy, tree.encode())
+             authority = \"node:{node}\"\n\
+             # require = [{{ kind = \"ci.test\", verdict = \"pass\", issuer = \"group:runners\" }}]\n"
+        )
     }
 
     /// Opens the working copy containing `start`.
@@ -221,11 +206,13 @@ impl Workspace {
                 .save(&path)
                 .map_err(|source| WorkspaceError::io(&path, source))?;
         }
+        let conflicts = self.conflicts(self.revision, &revision)?;
         if tree == revision.snapshot {
             return Ok(WorkingCopy {
                 id: self.revision,
                 revision,
                 unsaved: None,
+                conflicts,
                 _held: held,
             });
         }
@@ -236,12 +223,58 @@ impl Workspace {
             ..revision
         };
         let encoded = revision.encode();
+        let conflicts = conflicts.remaining(&self.store, tree)?;
+        if !conflicts.is_empty() {
+            // Now, so the revision never exists without them.
+            self.write(&self.revision_layers(Vec::new(), &encoded, &conflicts))?;
+        }
         Ok(WorkingCopy {
             id: encoded.id().into(),
             revision,
             unsaved: Some(encoded),
+            conflicts,
             _held: held,
         })
+    }
+
+    /// The unresolved conflicts of `revision`, `id`.
+    fn conflicts(&self, id: RevisionId, revision: &Revision) -> Result<Conflicts, WorkspaceError> {
+        let annotations = Annotations::open(&self.store)?;
+        let claims = annotations.claims(RecordId::Revision(id))?;
+        Ok(Conflicts::of(&self.store, &claims, revision)?)
+    }
+
+    /// The unresolved conflicts a new change on `base` starts with, from
+    /// the files of the revision it's on, if it's on one.
+    fn base_conflicts(&self, base: Base) -> Result<Conflicts, WorkspaceError> {
+        match base {
+            Base::Revision(id) => self.conflicts(id, &self.store.get(id)?),
+            Base::Acceptance(_) => Ok(Conflicts::default()),
+        }
+    }
+
+    /// The layers that write `revision`, a new one: `first`, objects it
+    /// refers to, then the statements published with it, then the revision
+    /// itself. The statements are a `core.conflict` about it listing
+    /// `conflicts`, its unresolved ones, if it has any (see
+    /// [`conflict`](crate::conflict)), and any a caller adds to the second
+    /// layer. Whoever finds the revision finds them: an error or a crash
+    /// never publishes it without them, as one batch could, publishing some
+    /// of its files.
+    fn revision_layers(
+        &self,
+        mut first: Vec<EncodedObject>,
+        revision: &EncodedObject,
+        conflicts: &Conflicts,
+    ) -> Vec<Vec<EncodedObject>> {
+        let mut statements = Vec::new();
+        if !conflicts.is_empty() {
+            let subject = RecordId::Revision(revision.id().into());
+            let (payload, statement) = conflicts.statement(subject, self.config.user(), None);
+            first.push(payload);
+            statements.push(statement.encode());
+        }
+        vec![first, statements, vec![revision.clone()]]
     }
 
     /// Snapshots the working copy, saving a new revision if the files
@@ -310,6 +343,9 @@ impl Workspace {
         );
         println!("On top of: {}", self.describe_base(revision.base)?);
         Self::print_divergence(&index, revision.change);
+        if !working_copy.conflicts.is_empty() {
+            Self::print_conflicts(&working_copy.conflicts);
+        }
         let changes = self
             .store
             .diff(self.base_tree(revision.base)?, revision.snapshot)?;
@@ -410,7 +446,9 @@ impl Workspace {
         let encoded = revision.encode();
         let id = encoded.id().into();
         let first = working_copy.unsaved.into_iter().chain([description]);
-        self.save(&[first.collect(), vec![encoded]], id)?;
+        // It starts with the files of the one below, and their conflicts.
+        let layers = self.revision_layers(first.collect(), &encoded, &working_copy.conflicts);
+        self.save(&layers, id)?;
         println!("Working copy: {}", self.headline(&revision)?);
         println!("On top of: {}", self.headline(&working_copy.revision)?);
         Ok(())
@@ -435,8 +473,40 @@ impl Workspace {
         let encoded = revision.encode();
         let id = encoded.id().into();
         let first = working_copy.unsaved.into_iter().chain([description]);
-        self.save(&[first.collect(), vec![encoded]], id)?;
+        let layers = self.revision_layers(first.collect(), &encoded, &working_copy.conflicts);
+        self.save(&layers, id)?;
         println!("Working copy: {}", self.headline(&revision)?);
+        Ok(())
+    }
+
+    /// `origin resolve <path>...`: accepts the files at `paths` as they
+    /// are, resolving their conflicts, with a new revision of the change
+    /// that keeps the others. Paths without one are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the working copy cannot be snapshotted or the revision
+    /// cannot be written.
+    pub fn resolve(&mut self, paths: &[RepoPath]) -> Result<(), WorkspaceError> {
+        let mut working_copy = self.refresh()?;
+        let resolved = working_copy.conflicts.resolve(paths);
+        if resolved.is_empty() {
+            println!("No conflict to resolve there.");
+            return Ok(());
+        }
+        let revision = Revision {
+            predecessors: vec![working_copy.id],
+            author: self.config.user(),
+            ..working_copy.revision
+        };
+        let encoded = revision.encode();
+        let id = encoded.id().into();
+        let layers = self.revision_layers(Vec::new(), &encoded, &working_copy.conflicts);
+        self.save(&layers, id)?;
+        println!("Resolved {}", Self::list_paths(&resolved));
+        if !working_copy.conflicts.is_empty() {
+            Self::print_conflicts(&working_copy.conflicts);
+        }
         Ok(())
     }
 
@@ -508,7 +578,11 @@ impl Workspace {
             author: self.config.user(),
         };
         let encoded = revision.encode();
-        self.write(&[vec![reason, empty], vec![statement, encoded.clone()]])?;
+        let conflicts = self.base_conflicts(revision.base)?;
+        let mut layers = self.revision_layers(vec![reason, empty], &encoded, &conflicts);
+        // Published before the revision that replaces the change.
+        layers[1].push(statement);
+        self.write(&layers)?;
         self.checkout(working_copy.revision.snapshot, revision.snapshot)?;
         self.point_at(encoded.id().into())?;
         println!("Abandoned change {}", change.short());
@@ -518,9 +592,14 @@ impl Workspace {
     }
 
     /// `origin converge <change>`: ends a change's divergence with a
-    /// revision evolving from all its heads. It keeps the files and
-    /// description of the working copy, if it is one of the heads, or else
-    /// of the newest head.
+    /// revision evolving from all its heads. It merges their files, file by
+    /// file, with the changes each made since the latest revision they all
+    /// evolve from. It keeps the base and the description of the working
+    /// copy, if it is one of the heads, or else of the newest head. Where
+    /// heads changed the same text file, it holds each version between
+    /// conflict markers, and a `core.conflict` statement lists the files,
+    /// so the revision doesn't land until a snapshot without the markers:
+    /// see [`conflict`](crate::conflict).
     ///
     /// # Errors
     ///
@@ -539,26 +618,79 @@ impl Workspace {
         } else {
             heads[heads.len() - 1]
         };
+        let kept_revision: Revision = self.store.get(kept)?;
+        let base = self.merge_base(&heads)?;
+        let mut snapshot = kept_revision.snapshot;
+        let mut merged = Conflicts::default();
+        for &head in heads.iter().filter(|&&head| head != kept) {
+            let merge = self.store.merge_marked(
+                base,
+                snapshot,
+                self.store.get(head)?.snapshot,
+                [&kept.short(), &head.short()],
+            )?;
+            // The next merge reads this one's trees.
+            self.write(&[merge.files.into_iter().chain(merge.trees).collect()])?;
+            snapshot = merge.tree;
+            merged = merged.with(merge.conflicts);
+        }
+        // The heads' own, where the merge kept their side.
+        let mut conflicts = Conflicts::default();
+        for &head in &heads {
+            let unresolved = self.conflicts(head, &self.store.get(head)?)?;
+            conflicts = conflicts.with(unresolved.remaining(&self.store, snapshot)?);
+        }
+        let conflicts = conflicts.with(merged);
         let revision = Revision {
             predecessors: heads.clone(),
+            snapshot,
             author: self.config.user(),
-            ..self.store.get(kept)?
+            ..kept_revision
         };
         let encoded = revision.encode();
         let id = encoded.id().into();
-        self.write(&[vec![encoded]])?;
+        self.write(&self.revision_layers(Vec::new(), &encoded, &conflicts))?;
         if change == working_copy.revision.change {
             self.checkout(working_copy.revision.snapshot, revision.snapshot)?;
             self.point_at(id)?;
         }
         println!(
-            "Converged change {}: revision {} evolves from {}, with the files of {}",
+            "Converged change {}: revision {} evolves from {}, merging their files",
             change.short(),
             id.short(),
             Self::list(&heads),
-            kept.short()
         );
+        if !conflicts.is_empty() {
+            Self::print_conflicts(&conflicts);
+        }
         Ok(())
+    }
+
+    /// Lists a revision's unresolved conflicts, and how to resolve them.
+    fn print_conflicts(conflicts: &Conflicts) {
+        println!(
+            "Conflicts: {} hold both versions between conflict markers, or one side for a \
+             binary file. Edit them, or run `origin resolve <path>...` to accept them as they \
+             are.",
+            Self::list_paths(&conflicts.paths())
+        );
+    }
+
+    /// `paths`, separated by commas.
+    fn list_paths(paths: &[RepoPath]) -> String {
+        let paths: Vec<_> = paths.iter().map(ToString::to_string).collect();
+        paths.join(", ")
+    }
+
+    /// The snapshot to merge `heads`, revisions of one change, from: that of
+    /// the newest revision they all evolve from, or the
+    /// [merge](Ancestry::merge_base) of several, if each lacks another.
+    fn merge_base(&self, heads: &[RevisionId]) -> Result<Option<TreeId>, WorkspaceError> {
+        let ancestry = Ancestry::walk(heads, |id| {
+            let revision: Revision = self.store.get(id)?;
+            Ok::<_, StoreError>((revision.predecessors, revision.snapshot))
+        })?;
+        Ok(ancestry.merge_base(&self.store, heads)?)
     }
 
     /// `origin log [<target>]`: prints the working copy's stack of changes
@@ -868,6 +1000,9 @@ pub enum WorkspaceError {
     /// The policy cannot be read.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// A landing failed.
+    #[error(transparent)]
+    Land(#[from] LandError),
 }
 
 impl WorkspaceError {

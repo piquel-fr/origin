@@ -232,17 +232,116 @@ fn divergence_shows_until_converged() {
         converged.starts_with(&format!("Converged change {change}")),
         "{converged}"
     );
-    assert_eq!(
-        repo.read("file"),
-        "right\n",
-        "the working copy's files are kept"
+    assert!(
+        converged.contains("Conflicts: file hold both versions"),
+        "{converged}"
     );
-    assert!(!repo.ok(&["status"]).contains("divergent"));
+    // Both versions, the working copy's first, between markers.
+    let file = repo.read("file");
+    assert!(file.starts_with("<<<<<<< "), "{file}");
+    assert!(file.contains("\nright\n=======\nleft\n>>>>>>> "), "{file}");
+    let status = repo.ok(&["status"]);
+    assert!(!status.contains("divergent"), "{status}");
+    assert!(status.contains("Conflicts: file hold"), "{status}");
     assert!(repo.ok(&["evolog"]).contains("    converges "));
+
+    // It doesn't land until the file changes: describing it keeps the
+    // conflict, an edit resolves it, whatever the file then holds.
+    repo.ok(&["describe", "Shared work, converged"]);
+    let refused = repo.fails(&["land"]);
+    assert!(refused.contains("unresolved conflicts"), "{refused}");
+    assert!(refused.contains("edit file"), "{refused}");
+    repo.write("file", "Heading\n=======\nboth\n");
+    assert!(!repo.ok(&["status"]).contains("Conflicts"));
+    assert!(repo.ok(&["land"]).starts_with("Landed change"));
     assert!(
         repo.fails(&["converge", &change])
             .contains("is not divergent")
     );
+}
+
+#[test]
+fn binary_conflicts_resolve_only_when_accepted() {
+    let repo = Repo::new();
+    repo.write("image", "base\0");
+    repo.write("text", "base\n");
+    repo.ok(&["describe", "Shared work"]);
+    let change = repo.change();
+    let pointer = repo.path(".origin/workspace");
+    let started = fs::read_to_string(&pointer).unwrap();
+    repo.write("image", "left\0");
+    repo.write("text", "left\n");
+    repo.ok(&["status"]);
+    fs::write(&pointer, started).unwrap();
+    repo.write("image", "right\0");
+    repo.write("text", "right\n");
+    repo.ok(&["converge", &change]);
+    assert_eq!(repo.read("image"), "right\0", "the working copy's side");
+
+    // An edit elsewhere leaves it unresolved, even without markers.
+    repo.write("unrelated", "docs\n");
+    assert!(repo.fails(&["land"]).contains("unresolved conflicts"));
+    let resolved = repo.ok(&["resolve", "image", "unrelated"]);
+    assert!(resolved.starts_with("Resolved image\n"), "{resolved}");
+    assert!(resolved.contains("Conflicts: text hold"), "{resolved}");
+    let status = repo.ok(&["status"]);
+    assert!(status.contains("\nConflicts: text hold"), "{status}");
+    repo.ok(&["resolve", "text"]);
+    assert!(repo.ok(&["land"]).starts_with("Landed change"));
+}
+
+#[test]
+fn a_revision_is_published_only_after_its_conflicts() {
+    use origin_shared::{EncodedObject, Record, RecordId, Revision, RevisionId};
+    use origin_src::{annotations::Annotations, conflict::Conflicts, store::Store};
+
+    let repo = Repo::new();
+    repo.write("file", "base\n");
+    repo.ok(&["describe", "Shared work"]);
+    let change = repo.change();
+    let pointer = repo.path(".origin/workspace");
+    let started = fs::read_to_string(&pointer).unwrap();
+    repo.write("file", "left\n");
+    repo.ok(&["status"]);
+    fs::write(&pointer, started).unwrap();
+    repo.write("file", "right\n");
+    repo.ok(&["converge", &change]);
+
+    // The `core.conflict` statement `describe` issues about its revision.
+    let store = Store::new(repo.path(".origin"), origin_platform::Native::default());
+    let converged: RevisionId = fs::read_to_string(&pointer)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let revision: Revision = store.get(converged).unwrap();
+    let claims = Annotations::open(&store)
+        .unwrap()
+        .claims(RecordId::Revision(converged))
+        .unwrap();
+    let conflicts = Conflicts::of(&store, &claims, &revision).unwrap();
+    let issuer = revision.author.clone();
+    let described = Revision {
+        predecessors: vec![converged],
+        description: EncodedObject::blob(b"Described").id().into(),
+        ..revision
+    }
+    .encode();
+    let subject = RecordId::Revision(described.id().into());
+    let (_, statement) = conflicts.statement(subject, issuer, None);
+    let hex = statement.encode().id().to_hex();
+
+    // Writing it fails: its directory is read-only.
+    let dir = repo.path(&format!(".origin/objects/loose/{}", &hex[..2]));
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    repo.fails(&["describe", "Described"]);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // So the revision, which would hide the conflict, wasn't written.
+    assert!(!store.contains(described.id()).unwrap());
+    let refused = repo.fails(&["land"]);
+    assert!(refused.contains("unresolved conflicts"), "{refused}");
 }
 
 #[test]
@@ -460,4 +559,196 @@ fn statements_are_promoted_where_their_inputs_are_unchanged() {
         repo.ok(&["gc"])
             .starts_with("Dropped 0 payloads past their retention")
     );
+}
+
+#[test]
+fn landing_moves_the_working_copy_onto_the_target() {
+    let repo = Repo::new();
+    repo.write("a", "a\n");
+    repo.ok(&["describe", "Add a"]);
+    let first = repo.change();
+    repo.ok(&["new", "Add b"]);
+    let second = repo.change();
+    repo.write("b", "b\n");
+    repo.ok(&["new"]);
+    let empty = repo.change();
+
+    // The stack lands from the bottom; the empty working copy has nothing
+    // to land, and moves onto the new tip.
+    let land = repo.ok(&["land"]);
+    let lines: Vec<_> = land.lines().collect();
+    assert!(
+        lines[0].starts_with(&format!("Landed change {first}, revision ")),
+        "{land}"
+    );
+    assert!(lines[0].ends_with(", on main #1"), "{land}");
+    assert!(
+        lines[1].starts_with(&format!("Landed change {second}, ")),
+        "{land}"
+    );
+    assert_eq!(
+        lines[2],
+        format!("Landing change {empty} would change nothing on `main`")
+    );
+    assert!(
+        repo.ok(&["status"])
+            .contains("On top of: main #2\nNo changes.\n")
+    );
+
+    // Landing the working copy's change starts a new one on the tip.
+    repo.write("c", "c\n");
+    let land = repo.ok(&["land"]);
+    assert!(land.contains(" on main #3\nWorking copy: "), "{land}");
+    assert_ne!(repo.change(), empty);
+    assert!(
+        repo.ok(&["status"])
+            .ends_with("On top of: main #3\nNo changes.\n")
+    );
+    assert_eq!(repo.read("c"), "c\n");
+
+    let targets = repo.ok(&["targets"]);
+    assert!(targets.starts_with("main #3 "), "{targets}");
+    assert!(targets.contains("(node:ada)\npolicy #0 "), "{targets}");
+}
+
+#[test]
+fn targets_fork_and_land_on_each_other() {
+    let repo = Repo::new();
+    repo.ok(&["target", "new", "overhaul", "--from", "main"]);
+    assert!(
+        repo.fails(&["target", "new", "overhaul", "--from", "main"])
+            .contains("already named `overhaul`")
+    );
+    repo.ok(&["new", "--on", "overhaul", "Rework"]);
+    repo.write("rework", "new\n");
+    let land = repo.ok(&["land"]);
+    assert!(
+        land.contains(" on overhaul #1\n"),
+        "lands where it's made: {land}"
+    );
+
+    let land = repo.ok(&["land", "--from", "overhaul", "--onto", "main"]);
+    assert_eq!(land, "Landed `overhaul` on main #1\n");
+    assert!(repo.ok(&["log", "main"]).starts_with("◆ main #1 "));
+    assert!(repo.ok(&["log", "main"]).contains("\n    overhaul #1\n"));
+}
+
+#[test]
+fn landings_wait_for_the_evidence_policy_requires() {
+    let repo = Repo::new();
+    repo.ok(&["new", "--on", "policy", "Require tests"]);
+    let policy = repo
+        .read("policy.toml")
+        .replace("# [groups]", "[groups]")
+        .replace(
+            "# runners = [\"node:ci-1\"]",
+            "runners = [\"node:ci-1\", \"user:ada\"]",
+        )
+        .replace("# require", "require");
+    repo.write("policy.toml", &policy);
+    assert!(repo.ok(&["land"]).contains(" on policy #1\n"));
+    assert!(
+        repo.ok(&["targets"])
+            .contains("    requires ci.test pass from group:runners\n")
+    );
+
+    repo.ok(&["new", "--on", "main", "Feature"]);
+    let change = repo.change();
+    repo.write("src/lib.rs", "fn a() {}\n");
+    let waiting = repo.ok(&["land"]);
+    assert!(
+        waiting.starts_with(&format!(
+            "The landing of change {change} on `main` waits for ci.test pass from group:runners\n"
+        )),
+        "{waiting}"
+    );
+    assert_eq!(repo.ok(&["land", "--status"]), waiting);
+    repo.ok(&["annotate", "@", "ci.test", "--pass", "--inputs", "src"]);
+    assert!(repo.ok(&["land"]).contains(" on main #1\n"));
+    assert_eq!(repo.ok(&["land", "--status"]), "No landing waits.\n");
+
+    // Only the authority lands: here, after a policy edit hands `main` to
+    // another node.
+    repo.ok(&["new", "--on", "policy"]);
+    let policy = repo.read("policy.toml").replace(
+        "[targets.main]\nauthority = \"node:ada\"",
+        "[targets.main]\nauthority = \"node:hosted\"",
+    );
+    // Another node's key: any valid one will do.
+    let key = policy
+        .lines()
+        .find_map(|line| line.strip_prefix("\"ada\" = "))
+        .unwrap();
+    repo.write(
+        "policy.toml",
+        &policy.replace("[nodes]\n", &format!("[nodes]\nhosted = {key}\n")),
+    );
+    repo.ok(&["land"]);
+    repo.ok(&["new", "--on", "main"]);
+    repo.write("x", "x\n");
+    assert!(
+        repo.fails(&["land"])
+            .contains("node:hosted is the authority of `main`")
+    );
+}
+
+#[test]
+fn conflicting_landings_are_flagged_and_wait() {
+    let repo = Repo::new();
+    repo.ok(&["describe", "One"]);
+    repo.write("shared", "one\n");
+    let one = repo.change();
+    repo.ok(&["new", "--on", "main", "Two"]);
+    repo.write("shared", "two\n");
+    let two = repo.change();
+    repo.ok(&["land", &one]);
+
+    let conflict = repo.ok(&["land"]);
+    assert!(
+        conflict.starts_with(&format!(
+            "The landing of change {two} on `main` conflicts in shared\n"
+        )),
+        "{conflict}"
+    );
+    assert!(
+        repo.ok(&["statements"])
+            .contains(" core.conflict by node:ada\n")
+    );
+    assert_eq!(repo.ok(&["land", "--status"]), conflict);
+}
+
+#[test]
+fn converge_merges_the_files_of_every_head() {
+    let repo = Repo::new();
+    for path in ["a", "b", "c"] {
+        repo.write(path, "base\n");
+    }
+    repo.ok(&["describe", "Shared work"]);
+    let change = repo.change();
+    // Three agents revise the same revision, each changing its own file.
+    let pointer = repo.path(".origin/workspace");
+    let started = fs::read_to_string(&pointer).unwrap();
+    for changed in ["a", "b", "c"] {
+        fs::write(&pointer, &started).unwrap();
+        for path in ["a", "b", "c"] {
+            repo.write(
+                path,
+                if path == changed {
+                    "changed\n"
+                } else {
+                    "base\n"
+                },
+            );
+        }
+        repo.ok(&["status"]);
+    }
+    // Merging a third head reads the tree merging the first two.
+    let converged = repo.ok(&["converge", &change]);
+    assert!(
+        converged.ends_with(", merging their files\n"),
+        "{converged}"
+    );
+    for path in ["a", "b", "c"] {
+        assert_eq!(repo.read(path), "changed\n", "{path}");
+    }
 }
