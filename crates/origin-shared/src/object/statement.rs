@@ -5,7 +5,7 @@ use std::str::FromStr;
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
 use crate::name::names;
 use crate::{
-    AcceptanceId, BlobId, Digest, InvalidName, ObjectId, ParseIdError, Principal, RepoPath,
+    AcceptanceId, AttachmentId, Digest, InvalidName, ObjectId, ParseIdError, Principal, RepoPath,
     RevisionId, StatementId, TreeEntry, TreeId,
 };
 
@@ -29,7 +29,7 @@ pub struct Statement {
     /// with the same inputs.
     pub inputs: Option<Inputs>,
     /// Free-form details, defined by whoever owns the kind.
-    pub payload: Option<BlobId>,
+    pub payload: Option<AttachmentId>,
     /// A statement from the same issuer that this one replaces.
     pub supersedes: Option<StatementId>,
     /// The statement this one promotes: its kind, verdict, inputs and
