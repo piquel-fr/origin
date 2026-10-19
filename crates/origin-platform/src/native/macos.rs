@@ -1,12 +1,12 @@
 //! macOS: `F_FULLFSYNC`, which also flushes the drive's cache, `flock`,
-//! clones with `clonefile` (APFS), and file systems told apart by their
-//! `statfs` type name.
+//! clones with `clonefile` (APFS), `pread`, and file systems told apart by
+//! their `statfs` type name.
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op};
+use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, ReadAt};
 
 /// The macOS implementation of [`Platform`](crate::Platform).
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +60,8 @@ impl Durability for MacOs {
 }
 
 impl FileLock for MacOs {}
+
+impl ReadAt for MacOs {}
 
 impl CloneFile for MacOs {
     /// `clonefile` reports `ENOTSUP` on file systems that cannot clone and

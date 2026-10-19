@@ -29,6 +29,7 @@ conformance!(
     clone_failures_are_not_unsupported,
     temp_dirs_are_local,
     inspecting_a_missing_path_fails,
+    positioned_reads_share_a_file,
 );
 
 mod suite {
@@ -233,5 +234,29 @@ mod suite {
             matches!(error, WritableError::Io(Error { op: Op::Inspect, ref path, .. }) if *path == missing),
             "{error:?}"
         );
+    }
+
+    pub fn positioned_reads_share_a_file(platform: &impl Platform) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pack");
+        let contents: Vec<u8> = (0..=u8::MAX).collect();
+        fs::write(&path, &contents).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        thread::scope(|scope| {
+            for offset in [0_usize, 100, 200] {
+                let (file, contents) = (&file, &contents);
+                scope.spawn(move || {
+                    let mut bytes = [0; 56];
+                    let at = u64::try_from(offset).unwrap();
+                    platform.read_exact_at(file, &mut bytes, at).unwrap();
+                    assert_eq!(bytes, contents[offset..][..56]);
+                });
+            }
+        });
+        let mut past_the_end = [0; 2];
+        let error = platform
+            .read_exact_at(&file, &mut past_the_end, 255)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
