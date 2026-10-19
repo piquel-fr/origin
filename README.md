@@ -90,12 +90,46 @@ doesn't land while they're unchanged: edit them, or accept a file as it is
 with `origin resolve <path>`. `status` lists those left, and every new
 revision, `describe` included, keeps them.
 
+## Serving
+
+A server is a node of its own, hosting repositories without a working
+copy, and the authority of their targets: it runs their landing queues,
+and packs their small objects once a few thousand pile up loose.
+
+```sh
+origin repo create repos/demo   # a repository the server orders `policy` and `main` of
+origin serve                    # host the repositories over HTTP
+```
+
+Both read `origin-server.toml` (or `--config <file>`), whose paths are
+relative to it:
+
+```toml
+listen = "127.0.0.1:7878"
+node = "hosted"          # the server's node name
+key = "node.key"         # its secret key, created if missing
+
+[repos]
+demo = "repos/demo"
+```
+
+The HTTP API, under `/api/v1`, puts and fetches records in batches, lists
+statements, revisions, targets and their logs, lands changes and targets,
+and streams events by long-poll: `GET
+/api/v1/repos/<repo>/events?cursor=<n>&wait=30s` answers as soon as there
+are events after the cursor, with a JSON batch and the next cursor.
+[`docs/openapi.json`](docs/openapi.json) describes it, and
+[`origin-client`](crates/origin-client) is its Rust SDK. Nothing
+authenticates callers yet.
+
 ## Development
 
 ```sh
 just             # format, lint, test, and audit dependencies
 just bench       # micro-benchmarks
 just bench-git   # origin against git, with hyperfine (docs/benchmarks.md)
+just openapi     # rewrite docs/openapi.json after changing the API
+just serve       # run `origin serve`
 ```
 
 rustup installs the toolchain `rust-toolchain.toml` pins. The minimum

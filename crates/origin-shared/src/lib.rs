@@ -1,12 +1,18 @@
 //! Types shared by every origin component: the object model, the wire
 //! formats, and the API contracts.
 
+pub mod api;
+pub mod event;
 mod id;
+pub mod landing;
 mod name;
 pub mod object;
+pub mod pack;
 mod path;
+pub mod policy;
 mod principal;
 mod target;
+mod text;
 
 pub use id::{
     AcceptanceId, BlobId, ChangeId, Digest, ObjectId, ParseIdError, RevisionId, StatementId,
@@ -20,4 +26,5 @@ pub use object::{
 };
 pub use path::RepoPath;
 pub use principal::{Principal, PrincipalName};
-pub use target::TargetName;
+pub use target::{Head, TargetName};
+pub use text::{InvalidPeriod, Period};
