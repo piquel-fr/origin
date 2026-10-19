@@ -19,10 +19,10 @@ use crate::tree::Snapshots;
 impl WorkingCopy {
     /// The revision `rev` names: `@` for the working copy, a change for its
     /// head, or else a revision, each by a unique prefix of its id.
-    fn find_revision(&self, index: &Index, rev: &str) -> Result<RevisionId, WorkspaceError> {
-        match self.find_change(index, rev) {
-            Ok(change) => Workspace::single_head(index, change),
-            Err(FindError::NotFound(_)) => Ok(index.find_revision(rev)?),
+    fn find_revision(&self, rev: &str) -> Result<RevisionId, WorkspaceError> {
+        match self.find_change(rev) {
+            Ok(change) => Workspace::single_head(&self.index, change),
+            Err(FindError::NotFound(_)) => Ok(self.index.find_revision(rev)?),
             Err(error) => Err(error.into()),
         }
     }
@@ -35,15 +35,20 @@ impl Workspace {
     }
 
     /// Issues `core.divergent` if `revision`, just saved, made its change
-    /// diverge. The statement is the same for the same heads, so checking
-    /// again writes nothing.
-    pub(super) fn flag_divergence(&self, revision: RevisionId) -> Result<(), WorkspaceError> {
+    /// diverge, as `index`, which has it, tells. The statement is the same
+    /// for the same heads, so checking again writes nothing.
+    pub(super) fn flag_divergence(
+        &self,
+        index: &Index,
+        revision: RevisionId,
+    ) -> Result<(), WorkspaceError> {
         let revision: Revision = self.store.get(revision)?;
         // A new change has a single revision.
-        if revision.predecessors.is_empty() {
+        if revision.predecessors.is_empty() || !index.is_divergent(revision.change) {
             return Ok(());
         }
-        Annotations::open(&self.store)?.flag_divergence(revision.change, self.node_principal())?;
+        Annotations::new(&self.store, index.clone())
+            .flag_divergence(revision.change, self.node_principal())?;
         Ok(())
     }
 
@@ -67,8 +72,8 @@ impl Workspace {
             return Err(WorkspaceError::ReservedKind(kind));
         }
         let working_copy = self.refresh()?;
-        let annotations = Annotations::open(&self.store)?;
-        let revision = working_copy.find_revision(annotations.index(), rev)?;
+        let revision = working_copy.find_revision(rev)?;
+        let annotations = Annotations::new(&self.store, working_copy.index);
         let payload = payload
             .map(|path| {
                 File::open(path)
@@ -117,9 +122,9 @@ impl Workspace {
     ///
     /// Fails if the revision cannot be found or a record cannot be read.
     pub fn statements(&mut self, rev: &str) -> Result<(), WorkspaceError> {
-        let working_copy = self.refresh()?;
-        let annotations = Annotations::open(&self.store)?;
-        let revision = working_copy.find_revision(annotations.index(), rev)?;
+        let working_copy = self.inspect()?;
+        let revision = working_copy.find_revision(rev)?;
+        let annotations = Annotations::new(&self.store, working_copy.index);
         let found = annotations.about(RecordId::Revision(revision))?;
         if found.is_empty() {
             println!("No statements about revision {}", revision.short());
@@ -185,8 +190,8 @@ impl Workspace {
     /// written.
     pub fn promote(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
-        let mut annotations = Annotations::open(&self.store)?;
-        let revision = working_copy.find_revision(annotations.index(), rev)?;
+        let revision = working_copy.find_revision(rev)?;
+        let mut annotations = Annotations::new(&self.store, working_copy.index);
         let promoted = annotations.promote(RecordId::Revision(revision), &self.node_principal())?;
         if promoted.is_empty() {
             println!("Nothing to promote to revision {}", revision.short());
