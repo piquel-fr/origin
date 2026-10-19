@@ -179,7 +179,12 @@ impl<P: Platform> Store<P> {
         }
         self.oplog().init()?;
         let objects = self.root.join("objects");
-        let parent = self.root.parent().unwrap_or(Path::new("."));
+        // A relative root's parent is empty: the current directory.
+        let parent = self
+            .root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         for dir in [&loose, &objects, &self.root, parent] {
             self.sync_dir(dir)?;
         }
@@ -247,9 +252,7 @@ impl<P: Platform> Store<P> {
     /// failure may not be durable.
     pub fn write_all(&self, objects: &[EncodedObject]) -> Result<usize, StoreError> {
         let batch = self.batch();
-        let written = Self::on_every_core(objects, |chunk| batch.write_all(chunk))
-            .into_iter()
-            .sum::<Result<usize, _>>()?;
+        let written = batch.stage_all(objects)?;
         batch.commit()?;
         Ok(written)
     }
@@ -327,6 +330,24 @@ impl<P: Platform> Store<P> {
         Ok(self.path(id).exists() || self.find_packed(id)?.is_some())
     }
 
+    /// Those of `ids` the store has, in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::contains`].
+    pub fn present<I: Into<ObjectId> + Copy>(
+        &self,
+        ids: impl IntoIterator<Item = I>,
+    ) -> Result<Vec<I>, StoreError> {
+        let mut present = Vec::new();
+        for id in ids {
+            if self.contains(id.into())? {
+                present.push(id);
+            }
+        }
+        Ok(present)
+    }
+
     /// When this node stored the object: when its loose file was written,
     /// which packing it keeps.
     ///
@@ -360,6 +381,29 @@ impl<P: Platform> Store<P> {
     pub fn hold_objects(&self) -> Result<LockedFile, StoreError> {
         let path = self.root.join(Self::COLLECTION_LOCK);
         Ok(LockedFile::open(&self.platform, &path, LockMode::Shared)?)
+    }
+
+    /// The file whose lock makes checking a change's heads and publishing
+    /// revisions that move them one step.
+    const PUSH_LOCK: &str = "push";
+
+    /// Waits for the publication of revisions in progress, and keeps
+    /// others waiting while it's held: every put of revisions takes it,
+    /// checking the heads a push expects first (see
+    /// [`OriginService::push`](crate::service::OriginService::push)), and
+    /// the landing queue, checking that the head it rebases still is the
+    /// change's only one.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the lock file cannot be opened.
+    pub fn lock_pushes(&self) -> Result<LockedFile, StoreError> {
+        let path = self.root.join(Self::PUSH_LOCK);
+        Ok(LockedFile::open(
+            &self.platform,
+            &path,
+            LockMode::Exclusive,
+        )?)
     }
 
     /// Waits for the writers holding objects, and keeps new ones waiting
@@ -466,6 +510,61 @@ impl<P: Platform> Store<P> {
     /// Fails if the object is missing, cannot be read, or is corrupt.
     pub fn read(&self, id: ObjectId) -> Result<EncodedObject, StoreError> {
         self.try_read(id)?.ok_or(StoreError::NotFound(id))
+    }
+
+    /// Reads objects the store must have, in order, from every core.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::read`].
+    pub fn read_all(&self, ids: &[ObjectId]) -> Result<Vec<EncodedObject>, StoreError> {
+        let chunks = Self::on_every_core(ids, |chunk| {
+            chunk
+                .iter()
+                .map(|&id| self.read(id))
+                .collect::<Result<Vec<_>, _>>()
+        });
+        let mut objects = Vec::with_capacity(ids.len());
+        for chunk in chunks {
+            objects.extend(chunk?);
+        }
+        Ok(objects)
+    }
+
+    /// Reads the objects `ids` names, in order, handing each to `each` until
+    /// it returns `false`. They're read from every core a chunk at a time,
+    /// chunks growing while their objects are small and shrinking while
+    /// they're large, so a chunk holds a few MiB.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::read`], or as `each` does.
+    pub fn read_each<E: From<StoreError>>(
+        &self,
+        ids: &[ObjectId],
+        mut each: impl FnMut(EncodedObject) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        /// The bytes a chunk aims for.
+        const TARGET: usize = 8 << 20;
+        let mut size = 16;
+        let mut rest = ids;
+        while !rest.is_empty() {
+            let (chunk, after) = rest.split_at(size.min(rest.len()));
+            rest = after;
+            let objects = self.read_all(chunk)?;
+            let bytes: usize = objects.iter().map(|object| object.bytes().len()).sum();
+            if bytes < TARGET / 2 {
+                size = (size * 2).min(4096);
+            } else if bytes > TARGET * 2 {
+                size = (size / 2).max(1);
+            }
+            for object in objects {
+                if !each(object)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reads and decodes the record `id` names.
@@ -586,11 +685,26 @@ impl<P: Platform> Batch<'_, P> {
         Ok(self.store.packs.find(id).is_some())
     }
 
-    /// Stages each of `objects` in turn, returning how many were new.
-    fn write_all(&self, objects: &[EncodedObject]) -> Result<usize, StoreError> {
-        objects.iter().try_fold(0, |written, object| {
-            Ok(written + usize::from(self.write(object)?))
+    /// Makes `path`, a file or a directory written in place, durable before
+    /// anything the batch stages is published.
+    pub(crate) fn sync_first(&self, path: impl Into<PathBuf>) {
+        self.write.sync_with(path);
+    }
+
+    /// Stages `objects` from every core, returning how many were new, as
+    /// [`Store::write_all`] does.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Batch::write`].
+    pub fn stage_all(&self, objects: &[EncodedObject]) -> Result<usize, StoreError> {
+        Store::<P>::on_every_core(objects, |chunk| {
+            chunk.iter().try_fold(0, |written, object| {
+                Ok(written + usize::from(self.write(object)?))
+            })
         })
+        .into_iter()
+        .sum()
     }
 
     /// Publishes every object staged, durably, and logs the new records in
@@ -666,6 +780,9 @@ pub enum StoreError {
     /// A file isn't in the format the store writes.
     #[error("malformed file {}", .0.display())]
     Malformed(PathBuf),
+    /// The operating system has no randomness to give.
+    #[error("cannot draw a random id")]
+    Random(#[source] getrandom::Error),
     /// The op log no longer keeps the entries after a cursor: retention
     /// deleted them.
     #[error("the op log no longer keeps the entries after #{after}: its oldest is #{oldest}")]

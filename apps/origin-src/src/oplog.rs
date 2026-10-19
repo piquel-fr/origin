@@ -17,6 +17,7 @@
 //!
 //! ```text
 //! .origin/oplog/
+//!   generation                 a random id, made with the log
 //!   lock                       held exclusively while appending
 //!   writers/<n>                held by each writer while it writes
 //!   <first sequence number>    segments of entries, 16 hex digits each
@@ -25,7 +26,9 @@
 //! A segment is a file of [frames](crate::frames), an entry each. Entries are
 //! appended to the last segment until it's full, then to a new one, and the
 //! oldest segments are deleted beyond a cap: the log keeps the latest 16 MiB
-//! of entries, and a cursor older than that has expired.
+//! of entries, and a cursor older than that has expired. So has a cursor
+//! of another log, such as the one a restored repository had: the log's
+//! generation tells them apart ([`OpLog::generation`]).
 //!
 //! **Writing.** Events and the index come from the entries, so every entry
 //! must be durable before a reader moves past it: a power loss could drop
@@ -455,17 +458,56 @@ impl<'a, P: Platform> OpLog<'a, P> {
         let writers = self.dir().join(Self::WRITERS);
         fs::create_dir_all(&writers).map_err(|source| StoreError::io(&writers, source))?;
         self.start_segment(1, &[])?;
+        self.generation()?;
+        Ok(())
+    }
+
+    /// The file holding the log's generation.
+    const GENERATION: &str = "generation";
+
+    /// The log's generation: a random id made with it, which a log made
+    /// later, as when a repository is restored from a copy of its records,
+    /// doesn't share. The cursors of one log mean nothing in another.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the generation cannot be read, or made and written.
+    pub fn generation(&self) -> Result<String, StoreError> {
+        let path = self.dir().join(Self::GENERATION);
+        let read = |path: &Path| match fs::read_to_string(path) {
+            Ok(generation) => Ok(Some(generation.trim_end().to_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StoreError::io(path, source)),
+        };
+        if let Some(generation) = read(&path)? {
+            return Ok(generation);
+        }
+        // A log made without one. Writers racing to make it each write
+        // theirs, and the last stays: a cursor from another only costs a
+        // full read.
+        self.create_dir()?;
+        let generation = getrandom::u64().map_err(StoreError::Random)?;
+        let write = self.store.durable_write();
+        write.stage(&path, format!("{generation:016x}\n").as_bytes())?;
+        write.commit()?;
+        Ok(read(&path)?.unwrap_or_default())
+    }
+
+    /// Creates the log's directory, durably, if it's missing.
+    fn create_dir(&self) -> Result<(), StoreError> {
+        let dir = self.dir();
+        if !dir.is_dir() {
+            fs::create_dir_all(&dir).map_err(|source| StoreError::io(&dir, source))?;
+            self.store.sync_dir(self.store.root())?;
+        }
         Ok(())
     }
 
     /// Opens and locks one of the log's lock files, creating the log's
     /// directory, durably, if it's missing.
     fn lock(&self, name: &str, mode: LockMode) -> Result<LockedFile, StoreError> {
+        self.create_dir()?;
         let dir = self.dir();
-        if !dir.is_dir() {
-            fs::create_dir_all(&dir).map_err(|source| StoreError::io(&dir, source))?;
-            self.store.sync_dir(self.store.root())?;
-        }
         Ok(LockedFile::open(
             &self.store.platform,
             &dir.join(name),

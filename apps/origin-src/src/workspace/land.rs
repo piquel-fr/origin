@@ -3,7 +3,10 @@
 //!
 //! They go through the repository's
 //! [`OriginService`](crate::service::OriginService), whose queue runs in
-//! this process, as this node. After a landing, the
+//! this process, as this node, unless the repository has a remote that has
+//! the target: then they go to the remote, whose node must be the target's
+//! authority, and `land` pushes the stack first, and fetches the target's
+//! chain and the stack's records after. After a landing, the
 //! working copy of the workspace that ran it follows its change: when it
 //! landed, the working copy starts a new change on the target's tip; when
 //! the queue rebased it, the working copy becomes the rebased revision; and
@@ -16,7 +19,7 @@
 //! the working copy doesn't land until they change or are accepted with
 //! `origin resolve` (see [`conflict`](crate::conflict)).
 
-use std::mem;
+use std::{mem, slice};
 
 use origin_shared::api::{LandRequest, Landings, NewTarget};
 use origin_shared::landing::{Blocked, Landing, Pending, Proposal};
@@ -29,6 +32,7 @@ use super::{Behind, WorkingCopy, Workspace, WorkspaceError};
 use crate::conflict::Conflicts;
 use crate::index::Index;
 use crate::oplog::Why;
+use crate::remote::Remote;
 use crate::service::Caller;
 use crate::tree::Merge;
 
@@ -48,13 +52,36 @@ impl Workspace {
     ) -> Result<(), WorkspaceError> {
         let mut working_copy = self.inspect()?;
         let change = working_copy.find_change(change.unwrap_or("@"))?;
+        let onto = if let Some(onto) = onto {
+            onto
+        } else {
+            let head = Self::single_head(&working_copy.index, change)?;
+            self.store.stack_target(head)?
+        };
         let request = LandRequest {
             proposal: Proposal::Change(change),
-            onto,
+            onto: Some(onto.clone()),
         };
-        let Landings { onto, landings } = self
-            .service(Some(mem::take(&mut working_copy.index)))?
-            .land(&Caller::Owner, &request)?;
+        let Landings { onto, landings } = match self.remote_queue(&onto)? {
+            Some(remote) => {
+                let sync = self.sync(remote);
+                sync.push(&[change])?;
+                let landed = remote.land(&request)?;
+                sync.fetch_chains(slice::from_ref(&landed.onto))?;
+                let mut changes = vec![change];
+                changes.extend(landed.landings.iter().filter_map(
+                    |landing| match landing.proposal() {
+                        Proposal::Change(change) => Some(*change),
+                        Proposal::Target(_) => None,
+                    },
+                ));
+                sync.fetch_changes(&changes)?;
+                landed
+            }
+            None => self
+                .service(Some(mem::take(&mut working_copy.index)))?
+                .land(&Caller::Owner, &request)?,
+        };
         for landing in &landings {
             self.print_landing(landing, &onto)?;
         }
@@ -77,20 +104,31 @@ impl Workspace {
             proposal: Proposal::Target(from.clone()),
             onto: Some(onto.clone()),
         };
-        let landed = self.service(None)?.land(&Caller::Owner, &request)?;
+        let landed = match self.remote_queue(onto)? {
+            Some(remote) => {
+                let landed = remote.land(&request)?;
+                self.sync(remote).fetch_chains(slice::from_ref(onto))?;
+                landed
+            }
+            None => self.service(None)?.land(&Caller::Owner, &request)?,
+        };
         for landing in &landed.landings {
             self.print_landing(landing, onto)?;
         }
         Ok(())
     }
 
-    /// `origin land --status`: lists the landings that wait, and why.
+    /// `origin land --status`: lists the landings that wait, and why: in
+    /// this node's queues, then in the remote's.
     ///
     /// # Errors
     ///
     /// Fails if the queues cannot be read.
     pub fn land_status(&self) -> Result<(), WorkspaceError> {
-        let pending = self.service(None)?.landings(&Caller::Owner)?;
+        let mut pending = self.service(None)?.landings(&Caller::Owner)?;
+        if let Some(remote) = self.remote()? {
+            pending.extend(remote.landings()?);
+        }
         if pending.is_empty() {
             println!("No landing waits.");
         }
@@ -112,9 +150,16 @@ impl Workspace {
             name: name.clone(),
             from: from.clone(),
         };
-        let head = self
-            .service(None)?
-            .create_target(&Caller::Owner, &request)?;
+        let head = match self.remote_queue(name)? {
+            Some(remote) => {
+                let head = remote.create_target(&request)?;
+                self.sync(remote).fetch_chains(slice::from_ref(name))?;
+                head
+            }
+            None => self
+                .service(None)?
+                .create_target(&Caller::Owner, &request)?,
+        };
         let landed = self.store.get(head.acceptance)?.body().landed.clone();
         let from = match landed[..] {
             [Source::Target(from)] => self.describe_acceptance(from)?,
@@ -125,13 +170,22 @@ impl Workspace {
     }
 
     /// `origin targets`: lists every target with its tip, its authority and
-    /// what landing on it requires.
+    /// what landing on it requires: the remote's, if the repository has
+    /// one, since this one only holds those it follows, and this one's own.
     ///
     /// # Errors
     ///
-    /// Fails if the targets or the policy cannot be read.
+    /// Fails if the remote fails, or the targets or the policy cannot be
+    /// read.
     pub fn targets(&self) -> Result<(), WorkspaceError> {
-        for target in self.service(None)?.targets(&Caller::Owner)? {
+        let mut targets = self.service(None)?.targets(&Caller::Owner)?;
+        if let Some(remote) = self.remote()? {
+            let remote = remote.targets()?;
+            targets.retain(|own| !remote.iter().any(|target| target.name == own.name));
+            targets.extend(remote);
+            targets.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        for target in targets {
             let authority = target
                 .authority
                 .map_or_else(|| "no authority".to_owned(), |node| format!("node:{node}"));
@@ -148,6 +202,20 @@ impl Workspace {
         Ok(())
     }
 
+    /// The remote to submit landings on `target` to, or `None` if they land
+    /// here: if the repository has no remote, or the target is this
+    /// repository's own, which the remote doesn't have. The chains of the
+    /// others are copies of the remote's, which only the remote extends,
+    /// even when this node is their authority.
+    fn remote_queue(&self, target: &TargetName) -> Result<Option<&Remote>, WorkspaceError> {
+        let Some(remote) = self.remote()? else {
+            return Ok(None);
+        };
+        let own = self.store.head(target)?.is_some()
+            && !remote.targets()?.iter().any(|known| known.name == *target);
+        Ok((!own).then_some(remote))
+    }
+
     /// `origin new [description] --on <target>`: starts a change on the tip
     /// of a target.
     ///
@@ -162,17 +230,22 @@ impl Workspace {
         self.start_on(&mut working_copy, target, description, files)
     }
 
-    /// `origin pull`: moves the working copy where its change went without
-    /// it, merging the edits made since: onto the tip of the target it
+    /// `origin pull`: fetches, if the repository has a remote, then moves
+    /// the working copy where its change went without it, merging the edits
+    /// made since: onto the tip of the target it
     /// landed on, as a new change, or onto the landing queue's rebase of it.
     /// Otherwise rebases it onto the tip of the target its stack is on:
     /// once the change below it landed, or once the target it's on moved.
     ///
     /// # Errors
     ///
-    /// Fails if the working copy cannot be snapshotted, a file was edited
-    /// while it moved, or the records cannot be read or written.
+    /// Fails like [`Workspace::fetch`], or if the working copy cannot be
+    /// snapshotted, a file was edited while it moved, or the records cannot
+    /// be read or written.
     pub fn pull(&mut self) -> Result<(), WorkspaceError> {
+        if self.remote()?.is_some() {
+            self.fetch(&[], &[])?;
+        }
         let mut working_copy = self.inspect()?;
         if self.follow(&mut working_copy)? {
             return Ok(());
@@ -209,6 +282,7 @@ impl Workspace {
             .head(target)?
             .ok_or_else(|| WorkspaceError::UnknownTarget(target.clone()))?;
         let state = self.store.get(tip.acceptance)?.body().state;
+        self.need(&[state])?;
         let tip_label = format!("{target} #{}", tip.seq);
         let merge = self.store.merge_marked(
             Some(base),
@@ -309,7 +383,7 @@ impl Workspace {
 
     /// Rebases the working copy, made on `base`, onto the tip of `onto`, as
     /// the module explains.
-    fn rebase_onto_tip(
+    pub(super) fn rebase_onto_tip(
         &mut self,
         working_copy: &mut WorkingCopy,
         base: TreeId,
@@ -320,6 +394,7 @@ impl Workspace {
             .head(onto)?
             .ok_or_else(|| WorkspaceError::UnknownTarget(onto.clone()))?;
         let state = self.store.get(tip.acceptance)?.body().state;
+        self.need(&[state])?;
         let current = &working_copy.revision;
         let tip_label = format!("{onto} #{}", tip.seq);
         let merge = self.store.merge_marked(

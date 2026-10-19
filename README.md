@@ -42,7 +42,13 @@ origin workspace list | rm <path>
 
 origin op log [-n <count>]          # what this node did, operation by operation, in every workspace
 origin undo                         # move this workspace's working copy back one operation
-origin watch [--kind <kind>] [--subject <id>] [--since <cursor>]  # events, as they happen
+origin watch [--kind <kind>] [--subject <id>] [--since <cursor>] [--local]  # events, as they happen
+
+origin clone <url> [<path>] [--target <target>]  # follow a remote's target, starting a change on its tip
+origin remote [<url>]               # show or set the remote: http://host:port/<repo>, or a path
+origin push [<change>...]           # share changes and the ones below them; lands nothing
+origin fetch [--target <t>] [--change <id>]  # new acceptances, and the records of known changes
+origin pull                         # fetch, then move the working copy onto its target's tip
 ```
 
 Landing rebases a change onto the target's tip, file by file, checks the
@@ -75,6 +81,25 @@ op log, one a line starting with a cursor: `statement.issued`,
 `revision.created`, `target.advanced` and `check.requested`. `--kind`
 takes an event name or a statement kind (`core.conflict`, `ci.*`), and
 `--since` resumes after a cursor.
+
+A repository can have one remote, a server or another repository's path,
+shared by its workspaces. A clone holds the chains of the targets it
+follows, `policy` and one other, verified against their authorities' keys,
+and the records of the changes it knows, which each `fetch` brings as they
+move: it asks the remote's events what moved since the last fetch, so a
+fetch that brings nothing is quick however long the history. It fetches
+snapshots only when a command reads them, starting with its target's tip.
+`push` shares revisions, their files and statements, and refuses a change
+the remote has a newer revision of, even one pushed while it sends:
+`fetch`, then `converge` it. A statement that needs one the remote lacks
+stays, and the push says so. A landing is decided on the evidence the
+remote holds when it's tried: send a statement together with the one it
+supersedes, as `push` does, or a landing waiting on the first may take it.
+`land`, `land --from` and `target
+new` go to the remote's queue for every target the remote has, after pushing
+what lands, and `watch` long-polls the remote's events (`--local` for this
+node's). Fetching never changes your files; `pull` then moves the working
+copy onto its target's new tip, like a landing elsewhere does.
 
 Changes are named by a unique prefix of their id, or `@` for the working
 copy's. A revision is `@`, a change (for its head), or a unique prefix of
@@ -113,11 +138,18 @@ key = "node.key"         # its secret key, created if missing
 demo = "repos/demo"
 ```
 
-The HTTP API, under `/api/v1`, puts and fetches records in batches, lists
-statements, revisions, targets and their logs, lands changes and targets,
-and streams events by long-poll: `GET
+The HTTP API, under `/api/v1`, puts records in batches, if the changes
+they revise are where the client saw them, and fetches them by id, walks
+snapshots for the trees and blobs a client lacks (the only way files leave
+a server), in parts of at most 64 MiB each way, compares the records of
+changes, lists statements, revisions, targets and their logs, lands
+changes and targets, and streams
+events by long-poll: `GET
 /api/v1/repos/<repo>/events?cursor=<n>&wait=30s` answers as soon as there
-are events after the cursor, with a JSON batch and the next cursor.
+are events after the cursor, with a JSON batch, the next cursor, and the
+generation of the op log it's of: pass it back as `generation`, and a
+cursor of another log, such as from before the repository was restored,
+is refused as expired.
 [`docs/openapi.json`](docs/openapi.json) describes it, and
 [`origin-client`](crates/origin-client) is its Rust SDK. Nothing
 authenticates callers yet.

@@ -48,6 +48,58 @@
         }
       }
     },
+    "/api/v1/repos/{repo}/changes/inventory": {
+      "post": {
+        "summary": "Lists what the repository holds of some changes: their revisions,\nheads and statements, by id.",
+        "operationId": "inventory",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InventoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "An inventory for each change, in the order asked: empty for a change the repository never heard of",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Inventory"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/repos/{repo}/changes/{change}/revisions": {
       "get": {
         "summary": "Lists the revisions of a change, and its heads.",
@@ -119,6 +171,15 @@
               "type": "integer",
               "format": "int64",
               "minimum": 0
+            }
+          },
+          {
+            "name": "generation",
+            "in": "query",
+            "description": "The generation of the op log the cursor is of, as its page said. A\ncursor of another generation, such as from before the repository\nwas restored, has expired.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -338,6 +399,17 @@
               "format": "int64",
               "minimum": 0
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Return at most this many acceptances: all by default.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -369,7 +441,7 @@
     },
     "/api/v1/repos/{repo}/records": {
       "put": {
-        "summary": "Puts a batch of objects, as a pack: snapshots, revisions and\nstatements, each needing only objects the batch or the repository has,\nof the kinds it names.",
+        "summary": "Puts a batch of objects, as a pack: snapshots, revisions and\nstatements, each needing only objects the batch or the repository has,\nof the kinds it names. With `expect`, only if the changes it names have\nthe heads it says when the records are published.",
         "operationId": "put_records",
         "parameters": [
           {
@@ -377,6 +449,15 @@
             "in": "path",
             "description": "The repository",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "expect",
+            "in": "query",
+            "description": "The heads of changes as the caller saw them, comma-separated, each\n`<change>=<head>+<head>`, or `<change>=` for a change the repository\ndidn't have. The batch is refused if one's heads differ now.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -423,13 +504,23 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "A change of `expect` has other heads now",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         }
       }
     },
     "/api/v1/repos/{repo}/records/fetch": {
       "post": {
-        "summary": "Fetches objects by id, as a pack.",
+        "summary": "Fetches records by id, each with the blob it carries, as a pack.",
         "operationId": "fetch_records",
         "parameters": [
           {
@@ -454,7 +545,82 @@
         },
         "responses": {
           "200": {
-            "description": "The objects, in the order asked, as a pack: each a 32-byte id, a little-endian u64 length and the object's encoding",
+            "description": "The records, in the order asked, each followed by its description or payload if the repository has it, as a pack: each object a 32-byte id, a little-endian u64 length and the object's encoding. At most 64 MiB, but for a record alone",
+            "headers": {
+              "origin-more": {
+                "schema": {
+                  "type": "boolean"
+                },
+                "description": "Present if the pack stopped short: ask again for the records after the last it holds"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An object is a blob or a tree, which only leave by walking a snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or a record does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{repo}/snapshots/fetch": {
+      "post": {
+        "summary": "Fetches the objects of a snapshot the caller lacks, as a pack: the only\nway trees and blobs leave a repository.",
+        "operationId": "fetch_snapshot",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FetchSnapshot"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The trees and blobs, parents before children, as a pack, of at most 64 MiB, but for an object alone",
+            "headers": {
+              "origin-more": {
+                "schema": {
+                  "type": "boolean"
+                },
+                "description": "Present if the pack stopped short: ask again, skipping the objects it holds"
+              }
+            },
             "content": {
               "application/octet-stream": {
                 "schema": {
@@ -464,7 +630,7 @@
             }
           },
           "404": {
-            "description": "The repository or an object does not exist",
+            "description": "The repository or the snapshot does not exist",
             "content": {
               "application/json": {
                 "schema": {
@@ -1047,7 +1213,7 @@
       },
       "FetchRecords": {
         "type": "object",
-        "description": "Asks for records, and any other objects, by id.",
+        "description": "Asks for records by id: revisions, statements and acceptances. Each\ncomes with the blob it carries, if the repository has it: a revision's\ndescription, a statement's payload. Snapshots are fetched with\n[`FetchSnapshot`] instead.",
         "required": [
           "ids"
         ],
@@ -1057,7 +1223,40 @@
             "items": {
               "$ref": "#/components/schemas/ObjectId"
             },
-            "description": "The objects, returned in this order."
+            "description": "The records, returned in this order, each followed by its blob. A\nresponse that stops short, with the [`MORE`] header, holds those up\nto the last record it has: ask again for those after it."
+          }
+        }
+      },
+      "FetchSnapshot": {
+        "type": "object",
+        "description": "Asks for the objects of a snapshot that the caller lacks: its trees and\nblobs, walked from its root. This is the only way blobs and trees leave\na repository, so what each caller may read can be checked by path.",
+        "required": [
+          "snapshot"
+        ],
+        "properties": {
+          "have": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TreeId"
+            },
+            "description": "Snapshots the caller holds whole. Whatever one of them holds at the\nsame path is skipped, so only what changed since comes. Those the\nrepository doesn't have are ignored."
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoPath"
+            },
+            "description": "Only these files and directories, with everything under them, and\nthe trees on the way to them. Everything by default."
+          },
+          "skip": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Skip this many of the objects, which earlier parts brought: a\nresponse that stops short has the [`MORE`] header.",
+            "minimum": 0
+          },
+          "snapshot": {
+            "$ref": "#/components/schemas/TreeId",
+            "description": "The snapshot."
           }
         }
       },
@@ -1109,6 +1308,59 @@
           "toolchain": {
             "$ref": "#/components/schemas/Digest",
             "description": "The tools that ran it, such as the hash of `rustc -V`."
+          }
+        }
+      },
+      "Inventory": {
+        "type": "object",
+        "description": "What a repository holds of a change: its records, by id, to compare\nwith another node's.",
+        "required": [
+          "change",
+          "revisions",
+          "heads",
+          "statements"
+        ],
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/ChangeId",
+            "description": "The change."
+          },
+          "heads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RevisionId"
+            },
+            "description": "Those no other revision of the change evolves from."
+          },
+          "revisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RevisionId"
+            },
+            "description": "Its revisions, in the order the repository received them: none if it\nhas never heard of the change."
+          },
+          "statements": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatementId"
+            },
+            "description": "The statements about its revisions, and about those statements, in\nno particular order."
+          }
+        }
+      },
+      "InventoryRequest": {
+        "type": "object",
+        "description": "Asks what a repository holds of some changes.",
+        "required": [
+          "changes"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChangeId"
+            },
+            "description": "The changes."
           }
         }
       },
@@ -1282,6 +1534,10 @@
               "$ref": "#/components/schemas/Event"
             },
             "description": "The events, oldest first."
+          },
+          "generation": {
+            "type": "string",
+            "description": "The generation of the op log the cursor is of: pass it with the\ncursor, which means nothing in another."
           },
           "next": {
             "type": "integer",
