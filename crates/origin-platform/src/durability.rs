@@ -64,6 +64,10 @@ pub trait Durability {
 /// Staging beside the destination keeps each rename within one directory,
 /// so writes to different directories never contend on a shared one.
 ///
+/// [`DurableWrite::sync_with`] adds a file written in place, such as an
+/// append-only log, to the batch sync, so it becomes durable no later than
+/// the batch is published, at no extra sync.
+///
 /// Files can be staged from several threads at once.
 #[derive(Debug)]
 pub struct DurableWrite<'a, P> {
@@ -79,6 +83,8 @@ struct Staged {
     /// The directories whose entries must be durable: the published files'
     /// parents, and those added with [`DurableWrite::sync_dir_with`].
     dirs: BTreeSet<PathBuf>,
+    /// Files written in place, synced with the batch but never renamed.
+    in_place: Vec<PathBuf>,
 }
 
 /// Distinguishes the temporary files of one process.
@@ -170,6 +176,14 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
         staged.dirs.insert(dir.into());
     }
 
+    /// Makes `path`, a file already written in place, durable with the
+    /// batch: [`DurableWrite::commit`] syncs it with the staged files, before
+    /// publishing any of them.
+    pub fn sync_with(&self, path: impl Into<PathBuf>) {
+        let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
+        staged.in_place.push(path.into());
+    }
+
     /// Creates the missing parent directories of `path`, outermost first,
     /// syncing the directory each is created in right after creating it.
     ///
@@ -223,8 +237,9 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
         (dir != Path::new(".") && dir.parent().is_some()).then(|| Self::parent(dir))
     }
 
-    /// Syncs every staged file, renames them into place, then syncs each
-    /// directory involved once.
+    /// Syncs every staged file and every file added with
+    /// [`DurableWrite::sync_with`], renames the staged files into place, then
+    /// syncs each directory involved once.
     ///
     /// # Errors
     ///
@@ -236,8 +251,9 @@ impl<'a, P: Durability> DurableWrite<'a, P> {
             .staged
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner);
+        let temps = staged.files.iter().map(|(temp, _)| temp.as_path());
         self.platform
-            .sync_batch(staged.files.iter().map(|(temp, _)| temp.as_path()))?;
+            .sync_batch(temps.chain(staged.in_place.iter().map(PathBuf::as_path)))?;
         Self::rename_all(&staged.files)?;
         // Every file is published, so dropping the write removes none.
         staged.files.clear();
@@ -522,6 +538,29 @@ mod tests {
         assert_eq!(write.commit().unwrap_err().op, Op::Sync);
         assert_eq!(names(root.path()), Vec::<String>::new(), "nothing is left");
         assert_eq!(recorder.take(), [], "no directory is synced");
+    }
+
+    #[test]
+    fn files_written_in_place_are_synced_with_the_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("log");
+        fs::write(&log, b"appended").unwrap();
+        let recorder = Recorder::default();
+        let write = DurableWrite::new(&recorder);
+        write.stage(root.path().join("file"), b"contents").unwrap();
+        write.sync_with(&log);
+        write.commit().unwrap();
+
+        assert_eq!(
+            recorder.take(),
+            [
+                Call::Batch(2),
+                Call::Dir(root.path().parent().unwrap().to_owned()),
+                Call::Dir(root.path().to_owned())
+            ],
+            "the log is synced in the batch, and its directory isn't"
+        );
+        assert_eq!(fs::read(&log).unwrap(), b"appended", "it stays in place");
     }
 
     #[test]
