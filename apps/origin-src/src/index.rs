@@ -1,7 +1,10 @@
 //! The record index: what reading every record would tell, without reading
 //! them. It knows each change's revisions and heads (more than one head is
-//! divergence), the statements about each record, and the order this node
-//! received its records in.
+//! divergence), the statements about each record and those they claim to
+//! supersede, the promotable statements by kind, issuer and declared
+//! inputs, and the order this node received its records in. It also caches the input
+//! digests of promotable statements, which take reading their subjects'
+//! trees to compute.
 //!
 //! The index is derived from the store, so it is never trusted over it: a
 //! missing or corrupt index is rebuilt from the store's records
@@ -10,9 +13,9 @@
 //! On disk it is one append-only file, `index/log`: a header, then frames.
 //! A frame is its payload's `u32` length, the payload, the first 8 bytes of
 //! the payload's BLAKE3 hash, and the length again, so the last frame can be
-//! checked from the end. A payload is either what the index keeps of each
-//! record of a batch, or the mark that the batch at some offset was
-//! published.
+//! checked from the end. A payload is what the index keeps of each record
+//! of a batch, the mark that the batch at some offset was published, or
+//! input digests computed since.
 //!
 //! [`Batch::commit`](crate::store::Batch::commit) appends a batch's entries
 //! before publishing its records, and the batch sync makes them durable
@@ -32,6 +35,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -56,6 +60,15 @@ pub struct Index {
     changes: HashMap<ChangeId, Change>,
     /// The statements about each record, in arrival order.
     statements: HashMap<RecordId, Vec<StatementId>>,
+    /// The statements claiming to supersede each statement. Only those from
+    /// the same issuer do, which reading them tells.
+    superseders: HashMap<StatementId, Vec<StatementId>>,
+    /// The promotable statements, by their
+    /// [promotion group](Statement::promotion_group), in arrival order.
+    promotable: HashMap<Digest, Vec<StatementId>>,
+    /// The input digests of promotable statements computed so far, see
+    /// [`Index::remember_digests`].
+    digests: HashMap<StatementId, Digest>,
 }
 
 /// The revisions of one change.
@@ -116,11 +129,20 @@ impl Index {
             let record = entry.record();
             (order.get(&record).copied().unwrap_or(usize::MAX), record)
         });
-        store.write_index(&entries)?;
         let mut index = Self::default();
-        for entry in entries {
-            index.insert(entry);
+        for entry in &entries {
+            index.insert(entry.clone());
         }
+        // Digests never change, so those of statements still there stay.
+        let mut digests: Vec<_> = old
+            .digests
+            .iter()
+            .filter(|(id, _)| index.known.contains(&RecordId::Statement(**id)))
+            .map(|(&id, &digest)| (id, digest))
+            .collect();
+        digests.sort_unstable();
+        store.write_index(&entries, &digests)?;
+        index.digests.extend(digests);
         Ok(index)
     }
 
@@ -140,19 +162,22 @@ impl Index {
             .iter()
             .filter_map(|(_, frame)| match frame {
                 Frame::Published(offset) => Some(*offset),
-                Frame::Records(_) => None,
+                Frame::Records(_) | Frame::Digests(_) => None,
             })
             .collect();
         let mut index = Self::default();
         for (offset, frame) in frames {
-            let Frame::Records(entries) = frame else {
-                continue;
-            };
-            let trusted = published.contains(&offset);
-            for entry in entries.into_owned() {
-                if trusted || store.contains(entry.id())? {
-                    index.insert(entry);
+            match frame {
+                Frame::Records(entries) => {
+                    let trusted = published.contains(&offset);
+                    for entry in entries.into_owned() {
+                        if trusted || store.contains(entry.id())? {
+                            index.insert(entry);
+                        }
+                    }
                 }
+                Frame::Published(_) => {}
+                Frame::Digests(digests) => index.digests.extend(digests.iter().copied()),
             }
         }
         Ok((index, tail != Tail::Damaged))
@@ -174,8 +199,19 @@ impl Index {
                 change.revisions.push(id);
                 change.superseded.extend(predecessors);
             }
-            Entry::Statement { id, subject } => {
+            Entry::Statement {
+                id,
+                subject,
+                supersedes,
+                group,
+            } => {
                 self.statements.entry(subject).or_default().push(id);
+                if let Some(superseded) = supersedes {
+                    self.superseders.entry(superseded).or_default().push(id);
+                }
+                if let Some(group) = group {
+                    self.promotable.entry(group).or_default().push(id);
+                }
             }
             Entry::Acceptance(_) => {}
         }
@@ -222,6 +258,50 @@ impl Index {
         self.statements.get(&subject).map_or(&[], Vec::as_slice)
     }
 
+    /// The statements claiming to supersede `statement`, in arrival order.
+    /// Only those from its issuer do.
+    #[must_use]
+    pub fn superseders(&self, statement: StatementId) -> &[StatementId] {
+        self.superseders.get(&statement).map_or(&[], Vec::as_slice)
+    }
+
+    /// The promotable statements, by their
+    /// [promotion group](Statement::promotion_group), each group in arrival
+    /// order.
+    pub fn promotable(&self) -> impl Iterator<Item = (Digest, &[StatementId])> {
+        self.promotable
+            .iter()
+            .map(|(&group, statements)| (group, statements.as_slice()))
+    }
+
+    /// The input digest of a promotable statement, if it was computed and
+    /// remembered.
+    #[must_use]
+    pub fn digest(&self, statement: StatementId) -> Option<Digest> {
+        self.digests.get(&statement).copied()
+    }
+
+    /// Remembers the input digests of promotable statements, so they're
+    /// computed once. Since the index is a cache, they aren't synced: a
+    /// crash only costs computing them again.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the index cannot be appended to.
+    pub fn remember_digests<P: Platform>(
+        &mut self,
+        store: &Store<P>,
+        digests: &[(StatementId, Digest)],
+    ) -> Result<(), StoreError> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        let _lock = store.lock_index(LockMode::Shared)?;
+        store.append_to_index(&Frame::Digests(Cow::Borrowed(digests)))?;
+        self.digests.extend(digests.iter().copied());
+        Ok(())
+    }
+
     /// The one change whose id starts with `prefix`, a few hex digits.
     ///
     /// # Errors
@@ -229,46 +309,82 @@ impl Index {
     /// Fails if no change, or more than one, has an id starting with
     /// `prefix`.
     pub fn find_change(&self, prefix: &str) -> Result<ChangeId, FindChangeError> {
+        ChangeId::find(prefix, self.changes.keys().copied())
+    }
+
+    /// The one revision whose id starts with `prefix`, a few hex digits.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no revision, or more than one, has an id starting with
+    /// `prefix`.
+    pub fn find_revision(&self, prefix: &str) -> Result<RevisionId, FindError<RevisionId>> {
+        let revisions = self.changes.values().flat_map(|change| &change.revisions);
+        RevisionId::find(prefix, revisions.copied())
+    }
+}
+
+/// Ids that can be named by a unique prefix of their hex digits.
+pub trait Prefixed: Copy + Ord + fmt::Display {
+    /// What the ids identify, for errors.
+    const WHAT: &str;
+
+    /// The one id of `ids` starting with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `prefix` isn't hex digits, or no id or more than one starts
+    /// with it.
+    fn find(prefix: &str, ids: impl Iterator<Item = Self>) -> Result<Self, FindError<Self>> {
         let prefix = prefix.to_ascii_lowercase();
         if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(FindChangeError::Invalid(prefix));
+            return Err(FindError::Invalid(prefix));
         }
-        let mut matches: Vec<ChangeId> = self
-            .changes
-            .keys()
-            .filter(|change| change.to_hex().starts_with(&prefix))
-            .copied()
+        let mut matches: Vec<Self> = ids
+            .filter(|id| id.to_string().starts_with(&prefix))
             .collect();
         match matches.len() {
-            0 => Err(FindChangeError::NotFound(prefix)),
+            0 => Err(FindError::NotFound(prefix)),
             1 => Ok(matches[0]),
             _ => {
                 matches.sort_unstable();
-                Err(FindChangeError::Ambiguous { prefix, matches })
+                Err(FindError::Ambiguous { prefix, matches })
             }
         }
     }
 }
 
-/// A change id prefix that doesn't name exactly one change.
+impl Prefixed for ChangeId {
+    const WHAT: &str = "change";
+}
+
+impl Prefixed for RevisionId {
+    const WHAT: &str = "revision";
+}
+
+/// An id prefix that doesn't name exactly one change.
+pub type FindChangeError = FindError<ChangeId>;
+
+/// An id prefix that doesn't name exactly one id.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum FindChangeError {
+pub enum FindError<I: Prefixed> {
     /// It isn't hex digits.
-    #[error("`{0}` is not a change id")]
+    #[error("`{0}` is not a {what} id", what = I::WHAT)]
     Invalid(String),
-    /// No change has an id starting with it.
-    #[error("no change has an id starting with `{0}`")]
+    /// No id starts with it.
+    #[error("no {what} has an id starting with `{0}`", what = I::WHAT)]
     NotFound(String),
-    /// Several changes do.
+    /// Several do.
     #[error(
-        "`{prefix}` could be any of the changes {}",
-        matches.iter().map(ChangeId::to_hex).collect::<Vec<_>>().join(", ")
+        "`{prefix}` could be any of the {what}s {}",
+        matches.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        what = I::WHAT
     )]
     Ambiguous {
         /// The prefix.
         prefix: String,
-        /// The changes whose ids start with it.
-        matches: Vec<ChangeId>,
+        /// The ids starting with it.
+        matches: Vec<I>,
     },
 }
 
@@ -284,6 +400,9 @@ pub(crate) enum Entry {
     Statement {
         id: StatementId,
         subject: RecordId,
+        supersedes: Option<StatementId>,
+        /// Its promotion group, if it's promotable.
+        group: Option<Digest>,
     },
     Acceptance(AcceptanceId),
 }
@@ -307,10 +426,15 @@ impl Entry {
                     predecessors: revision.predecessors,
                 })
             }
-            ObjectKind::Statement => Some(Self::Statement {
-                id: id.into(),
-                subject: object.decode_as::<Statement>()?.subject,
-            }),
+            ObjectKind::Statement => {
+                let statement: Statement = object.decode_as()?;
+                Some(Self::Statement {
+                    id: id.into(),
+                    subject: statement.subject,
+                    supersedes: statement.supersedes,
+                    group: statement.promotion_group(),
+                })
+            }
             ObjectKind::Acceptance => {
                 // Decoding checks it's well formed, as for other records.
                 object.decode_as::<origin_shared::Acceptance>()?;
@@ -333,7 +457,8 @@ impl Entry {
 
     /// Appends the entry: its record's kind and id, then for a revision its
     /// change and a `u32` count of predecessors and their ids, and for a
-    /// statement its subject's kind and id.
+    /// statement its subject's kind and id, and the statement it supersedes
+    /// and its promotion group, each a 0 byte, or a 1 byte and the id.
     fn write(&self, out: &mut Vec<u8>) {
         Log::write_record(self.record(), out);
         match self {
@@ -349,7 +474,16 @@ impl Entry {
                     out.extend_from_slice(predecessor.as_bytes());
                 }
             }
-            Self::Statement { subject, .. } => Log::write_record(*subject, out),
+            Self::Statement {
+                subject,
+                supersedes,
+                group,
+                ..
+            } => {
+                Log::write_record(*subject, out);
+                Log::write_option(supersedes.as_ref().map(StatementId::as_bytes), out);
+                Log::write_option(group.as_ref().map(Digest::as_bytes), out);
+            }
             Self::Acceptance(_) => {}
         }
     }
@@ -371,6 +505,8 @@ impl Entry {
             RecordId::Statement(id) => Self::Statement {
                 id,
                 subject: Log::read_record(reader)?,
+                supersedes: reader.option()?.map(|id| ObjectId::from_bytes(id).into()),
+                group: reader.option()?.map(Digest::from_bytes),
             },
             RecordId::Acceptance(id) => Self::Acceptance(id),
             RecordId::Snapshot(_) => return None,
@@ -385,11 +521,14 @@ enum Frame<'a> {
     Records(Cow<'a, [Entry]>),
     /// The records of the batch at this offset are published.
     Published(u64),
+    /// Input digests of promotable statements, computed from the store.
+    Digests(Cow<'a, [(StatementId, Digest)]>),
 }
 
 impl Frame<'_> {
     const RECORDS: u8 = 1;
     const PUBLISHED: u8 = 2;
+    const DIGESTS: u8 = 3;
 
     /// Encodes the frame: its payload's length, the payload (a tag and the
     /// contents), a check, and the length again, so the last frame of a log
@@ -406,6 +545,13 @@ impl Frame<'_> {
             Self::Published(offset) => {
                 out.push(Self::PUBLISHED);
                 out.extend_from_slice(&offset.to_le_bytes());
+            }
+            Self::Digests(digests) => {
+                out.push(Self::DIGESTS);
+                for (statement, digest) in digests.iter() {
+                    out.extend_from_slice(statement.as_bytes());
+                    out.extend_from_slice(digest.as_bytes());
+                }
             }
         }
         let len = u32::try_from(out.len() - 4)
@@ -429,6 +575,14 @@ impl Frame<'_> {
                 Self::Records(Cow::Owned(entries))
             }
             Self::PUBLISHED => Self::Published(u64::from_le_bytes(reader.array()?)),
+            Self::DIGESTS => {
+                let mut digests = Vec::new();
+                while !reader.0.is_empty() {
+                    let statement = ObjectId::from_bytes(reader.array()?).into();
+                    digests.push((statement, Digest::from_bytes(reader.array()?)));
+                }
+                Self::Digests(Cow::Owned(digests))
+            }
             _ => return None,
         };
         reader.0.is_empty().then_some(frame)
@@ -440,7 +594,7 @@ struct Log;
 
 impl Log {
     /// The start of every log, with the format's version.
-    const HEADER: &[u8] = b"origin index 1\n";
+    const HEADER: &[u8] = b"origin index 2\n";
 
     /// The length of a frame's check.
     const CHECK: usize = 8;
@@ -454,12 +608,15 @@ impl Log {
             .expect("a digest is longer than a check")
     }
 
-    /// Encodes a log holding `entries`, all published.
-    fn encode(entries: &[Entry]) -> Vec<u8> {
+    /// Encodes a log holding `entries`, all published, and `digests`.
+    fn encode(entries: &[Entry], digests: &[(StatementId, Digest)]) -> Vec<u8> {
         let mut log = Self::HEADER.to_vec();
         let offset = log.len() as u64;
         log.extend(Frame::Records(Cow::Borrowed(entries)).encode());
         log.extend(Frame::Published(offset).encode());
+        if !digests.is_empty() {
+            log.extend(Frame::Digests(Cow::Borrowed(digests)).encode());
+        }
         log
     }
 
@@ -526,6 +683,17 @@ impl Log {
         Ok(Self::payload(&bytes).is_ok())
     }
 
+    /// Appends a 0 byte for `None`, or a 1 byte and the id.
+    fn write_option(id: Option<&[u8; 32]>, out: &mut Vec<u8>) {
+        match id {
+            None => out.push(0),
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(id);
+            }
+        }
+    }
+
     /// Appends a record's kind and id.
     fn write_record(record: RecordId, out: &mut Vec<u8>) {
         let (kind, id) = Self::split(record);
@@ -587,6 +755,19 @@ impl Reader<'_> {
         self.0 = rest;
         Some(*array)
     }
+
+    /// Reads what [`Log::write_option`] wrote, or `None` if it's malformed.
+    #[expect(
+        clippy::option_option,
+        reason = "like every read here, `None` is a malformed entry, and the value is an option"
+    )]
+    fn option<const N: usize>(&mut self) -> Option<Option<[u8; N]>> {
+        match self.array::<1>()?[0] {
+            0 => Some(None),
+            1 => self.array().map(Some),
+            _ => None,
+        }
+    }
 }
 
 impl<P: Platform> Store<P> {
@@ -602,10 +783,15 @@ impl<P: Platform> Store<P> {
         Ok(LockedFile::open(&self.platform, &dir.join("lock"), mode)?)
     }
 
-    /// Durably replaces the index with one holding `entries`.
-    pub(crate) fn write_index(&self, entries: &[Entry]) -> Result<(), StoreError> {
+    /// Durably replaces the index with one holding `entries` and
+    /// `digests`.
+    pub(crate) fn write_index(
+        &self,
+        entries: &[Entry],
+        digests: &[(StatementId, Digest)],
+    ) -> Result<(), StoreError> {
         let write = self.durable_write();
-        write.stage(self.index_log(), &Log::encode(entries))?;
+        write.stage(self.index_log(), &Log::encode(entries, digests))?;
         Ok(write.commit()?)
     }
 
@@ -705,7 +891,7 @@ mod tests {
     use std::thread;
 
     use origin_platform::Native;
-    use origin_shared::{Base, BlobId, Kind, Record, Tree, Verdict};
+    use origin_shared::{Base, BlobId, Inputs, Kind, Record, Tree, Verdict};
 
     use super::*;
 
@@ -744,6 +930,7 @@ mod tests {
             inputs: None,
             payload: None,
             supersedes: None,
+            promoted_from: None,
         }
         .encode()
     }
@@ -828,11 +1015,25 @@ mod tests {
             RecordId::Snapshot(Tree::default().encode().id().into()),
             "lint",
         );
+        // A promotable result, and its rerun superseding it.
+        let mut result: Statement = statement(RecordId::Revision(b1.id().into()), "ci.test")
+            .decode_as()
+            .unwrap();
+        result.inputs = Some(Inputs {
+            paths: Vec::new(),
+            definition: Digest::of(b"cargo test"),
+            toolchain: Digest::of(b"rustc"),
+            external: false,
+        });
+        let rerun = Statement {
+            supersedes: Some(result.encode().id().into()),
+            ..result.clone()
+        };
         let batches = [
             // A successor before its predecessor, as a fetch can deliver.
             vec![a2, on_a2, EncodedObject::blob(b"file")],
-            vec![a1.clone(), b1, on_statement],
-            vec![b2, on_snapshot, a1],
+            vec![a1.clone(), b1, on_statement, rerun.encode()],
+            vec![b2, on_snapshot, a1, result.encode()],
         ];
         for batch in &batches {
             store.write_all(batch).unwrap();
@@ -844,8 +1045,15 @@ mod tests {
         let (_dir, store) = store();
         write_history(&store);
         let updated = Index::open(&store).unwrap();
-        assert_eq!(updated.arrivals().len(), 7, "every record once, no blob");
+        assert_eq!(updated.arrivals().len(), 9, "every record once, no blob");
         assert_eq!(updated.heads(change(1)).len(), 1);
+        let promotable: Vec<_> = updated.promotable().collect();
+        assert_eq!(promotable.len(), 1);
+        assert_eq!(promotable[0].1.len(), 2, "a result and its rerun");
+        assert_eq!(
+            updated.superseders(promotable[0].1[1]),
+            [promotable[0].1[0]]
+        );
 
         assert_eq!(Index::rebuild(&store).unwrap(), updated);
         assert_eq!(Index::open(&store).unwrap(), updated, "rebuilt on disk");
@@ -861,7 +1069,11 @@ mod tests {
         for change in index.changes.values_mut() {
             change.revisions.sort();
         }
-        for statements in index.statements.values_mut() {
+        let lists = index
+            .statements
+            .values_mut()
+            .chain(index.superseders.values_mut());
+        for statements in lists.chain(index.promotable.values_mut()) {
             statements.sort();
         }
         index

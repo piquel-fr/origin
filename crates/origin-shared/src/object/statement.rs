@@ -1,14 +1,18 @@
 use std::borrow::Cow;
+use std::fmt;
 
 use super::{DecodeError, Field, ObjectKind, Reader, Record, fields, tagged};
 use crate::name::names;
-use crate::{AcceptanceId, BlobId, Digest, Principal, RepoPath, RevisionId, StatementId, TreeId};
+use crate::{
+    AcceptanceId, BlobId, Digest, Principal, RepoPath, RevisionId, StatementId, TreeEntry, TreeId,
+};
 
 /// An attributable claim about another record: a check result, a review, a
 /// conflict, an abandonment.
 ///
 /// Statements are permanent. An issuer revises one by issuing another that
-/// supersedes it.
+/// supersedes it. A promoted statement carries another one over to a record
+/// with the same input digest, pointing at it instead of copying its issuer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Statement {
     /// The record the claim is about.
@@ -26,6 +30,10 @@ pub struct Statement {
     pub payload: Option<BlobId>,
     /// A statement from the same issuer that this one replaces.
     pub supersedes: Option<StatementId>,
+    /// The statement this one promotes: its kind, verdict, inputs and
+    /// payload hold here too, because the input digests are equal. The
+    /// issuer is whoever promoted it, the original's stays on the original.
+    pub promoted_from: Option<StatementId>,
 }
 
 fields!(Statement {
@@ -36,10 +44,47 @@ fields!(Statement {
     inputs,
     payload,
     supersedes,
+    promoted_from,
 });
 
 impl Record for Statement {
     const KIND: ObjectKind = ObjectKind::Statement;
+}
+
+impl Statement {
+    /// The BLAKE3 key derivation context of promotion groups.
+    const GROUP_CONTEXT: &str = "origin 2026-10 promotion group";
+
+    /// Whether the statement can be promoted to other records: it declares
+    /// inputs and depends on nothing outside them, its subject has a
+    /// snapshot to take the input digest of (it isn't a statement), it
+    /// isn't itself a promotion, whose original is promoted instead, and
+    /// its kind isn't reserved: abandonments, conflicts and divergence are
+    /// about one revision, whatever its inputs.
+    #[must_use]
+    pub fn is_promotable(&self) -> bool {
+        self.promoted_from.is_none()
+            && !self.kind.is_reserved()
+            && !matches!(self.subject, RecordId::Statement(_))
+            && self.inputs.as_ref().is_some_and(|inputs| !inputs.external)
+    }
+
+    /// Identifies the statements this one is interchangeable with when
+    /// promoting, if it's promotable: those of its kind, from its issuer,
+    /// declaring the same inputs. A record needs only one result of a
+    /// group. It hashes the [`Inputs::spec`], then the kind and the issuer
+    /// as they're encoded.
+    #[must_use]
+    pub fn promotion_group(&self) -> Option<Digest> {
+        let inputs = self.inputs.as_ref().filter(|_| self.is_promotable())?;
+        let mut encoded = inputs.spec().as_bytes().to_vec();
+        self.kind.write(&mut encoded);
+        self.issuer.write(&mut encoded);
+        Some(Digest::from_bytes(blake3::derive_key(
+            Self::GROUP_CONTEXT,
+            &encoded,
+        )))
+    }
 }
 
 /// A record a statement can be about.
@@ -78,6 +123,12 @@ impl Kind {
     /// The change has more than one head.
     pub const DIVERGENT: Self = Self(Cow::Borrowed("core.divergent"));
 
+    /// Whether the kind is reserved for origin itself: `core.` and below.
+    #[must_use]
+    pub fn is_reserved(&self) -> bool {
+        self.0.starts_with("core.")
+    }
+
     fn is_valid(name: &str) -> bool {
         name.split('.').all(|segment| {
             !segment.is_empty()
@@ -98,6 +149,16 @@ pub enum Verdict {
     Fail = 2,
     /// Neither: informational.
     Neutral = 3,
+}
+
+impl fmt::Display for Verdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Neutral => "neutral",
+        })
+    }
 }
 
 impl Field for Verdict {
@@ -143,9 +204,138 @@ fields!(Inputs {
     external,
 });
 
+impl Inputs {
+    /// The BLAKE3 key derivation contexts, which keep these hashes apart
+    /// from every other.
+    const SPEC_CONTEXT: &str = "origin 2026-10 input spec";
+    const DIGEST_CONTEXT: &str = "origin 2026-10 input digest";
+
+    /// The paths, sorted and without duplicates: the order they're declared
+    /// in doesn't matter.
+    fn sorted_paths(&self) -> Vec<&RepoPath> {
+        let mut paths: Vec<_> = self.paths.iter().collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// Identifies what the inputs declare: equal for statements reading the
+    /// same paths with the same definition and toolchain, whatever their
+    /// order. It hashes the definition, the toolchain, and each path's
+    /// `u32` length and bytes.
+    #[must_use]
+    pub fn spec(&self) -> Digest {
+        let mut hasher = blake3::Hasher::new_derive_key(Self::SPEC_CONTEXT);
+        hasher.update(self.definition.as_bytes());
+        hasher.update(self.toolchain.as_bytes());
+        for path in self.sorted_paths() {
+            let mut encoded = Vec::new();
+            Reader::write_str(path.as_str(), &mut encoded);
+            hasher.update(&encoded);
+        }
+        Digest::from_bytes(*hasher.finalize().as_bytes())
+    }
+
+    /// The input digest of a snapshot: the [`Inputs::spec`], then for each
+    /// path, in its order, a 0 byte if the snapshot has nothing there, or a
+    /// 1 byte, the entry's kind and its id. `entry_at` looks up what the
+    /// snapshot stores at a path; at the root, that's the snapshot's tree.
+    ///
+    /// Records with equal digests agree on everything the inputs cover, so
+    /// a promotable statement about one holds for the other.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `entry_at` does.
+    pub fn digest<E>(
+        &self,
+        mut entry_at: impl FnMut(&RepoPath) -> Result<Option<TreeEntry>, E>,
+    ) -> Result<Digest, E> {
+        let mut hasher = blake3::Hasher::new_derive_key(Self::DIGEST_CONTEXT);
+        hasher.update(self.spec().as_bytes());
+        for path in self.sorted_paths() {
+            match entry_at(path)? {
+                None => hasher.update(&[0]),
+                Some(entry) => hasher
+                    .update(&[1, entry.kind as u8])
+                    .update(entry.id.as_bytes()),
+            };
+        }
+        Ok(Digest::from_bytes(*hasher.finalize().as_bytes()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+
     use super::*;
+    use crate::{EncodedObject, EntryKind};
+
+    fn inputs(paths: &[&str], definition: &str) -> Inputs {
+        Inputs {
+            paths: paths
+                .iter()
+                .map(|path| RepoPath::new(path).unwrap())
+                .collect(),
+            definition: Digest::of(definition.as_bytes()),
+            toolchain: Digest::of(b"rustc 1.99.0"),
+            external: false,
+        }
+    }
+
+    /// The digest of `inputs` over a snapshot holding `files`.
+    fn digest(inputs: &Inputs, files: &[(&str, &str)]) -> Digest {
+        let files: HashMap<_, _> = files
+            .iter()
+            .map(|&(path, content)| {
+                let entry = TreeEntry {
+                    kind: EntryKind::File,
+                    id: EncodedObject::blob(content.as_bytes()).id(),
+                };
+                (RepoPath::new(path).unwrap(), entry)
+            })
+            .collect();
+        inputs
+            .digest(|path| Ok::<_, Infallible>(files.get(path).copied()))
+            .unwrap()
+    }
+
+    #[test]
+    fn digests_cover_exactly_the_inputs() {
+        let lint = inputs(&["src", "Cargo.toml"], "cargo clippy");
+        let base = digest(&lint, &[("src", "v1"), ("Cargo.toml", "a"), ("docs", "x")]);
+        assert_eq!(
+            digest(&lint, &[("src", "v1"), ("Cargo.toml", "a"), ("docs", "y")]),
+            base,
+            "docs isn't an input"
+        );
+        assert_ne!(
+            digest(&lint, &[("src", "v2"), ("Cargo.toml", "a")]),
+            base,
+            "src is"
+        );
+        assert_ne!(
+            digest(&lint, &[("src", "v1")]),
+            base,
+            "a missing path differs from any content"
+        );
+        let reordered = inputs(&["Cargo.toml", "src", "src"], "cargo clippy");
+        assert_eq!(
+            reordered.spec(),
+            lint.spec(),
+            "order and repeats don't matter"
+        );
+        assert_eq!(
+            digest(&reordered, &[("src", "v1"), ("Cargo.toml", "a")]),
+            base
+        );
+
+        let test = inputs(&["src", "Cargo.toml"], "cargo test");
+        assert_ne!(test.spec(), lint.spec());
+        assert_ne!(digest(&test, &[("src", "v1"), ("Cargo.toml", "a")]), base);
+    }
 
     #[test]
     fn kinds_are_validated() {
@@ -159,6 +349,8 @@ mod tests {
         }
         for reserved in [Kind::ABANDON, Kind::CONFLICT, Kind::DIVERGENT] {
             assert!(Kind::is_valid(reserved.as_str()), "{reserved:?}");
+            assert!(reserved.is_reserved(), "{reserved:?}");
         }
+        assert!(!Kind::new("corex.test").unwrap().is_reserved());
     }
 }

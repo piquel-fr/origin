@@ -322,6 +322,7 @@ pub(crate) mod tests {
             }),
             payload: Some(id("log")),
             supersedes: None,
+            promoted_from: Some(id("original")),
         }
     }
 
@@ -382,8 +383,8 @@ pub(crate) mod tests {
                 "ab13bedf42e8",
                 "d06087ffcfd2",
                 "8783b1fca530",
-                "7b197c6a55d3",
-                "dd9cf3d13c33",
+                "b4f235b57ce9",
+                "f0442b2f9f6c",
             ]
         );
     }
@@ -420,8 +421,9 @@ pub(crate) mod tests {
                 tag: 9
             })
         );
-        // `external` is the last byte before the payload and supersedes.
-        let external = encoded.bytes().len() - (1 + ObjectId::LEN) - 1 - 1;
+        // `external` is the last byte before the payload, supersedes and
+        // the promoted statement.
+        let external = encoded.bytes().len() - 2 * (1 + ObjectId::LEN) - 1 - 1;
         assert_eq!(
             decode(&|bytes| bytes[external] = 2),
             Err(DecodeError::UnknownTag {
