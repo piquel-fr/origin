@@ -1,9 +1,12 @@
 //! Helpers for the end-to-end tests, which run the real `origin` binary.
+//! The tests of plugins, in other packages, include them too.
 
 // Each test binary uses its own subset of the helpers, and the others would
 // warn as unused in it.
 #![allow(dead_code)]
 
+use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -11,6 +14,29 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+
+/// The `origin` binary: this package's, or for a plugin's tests, the one
+/// built beside the plugin's, in the target directory holding the tests.
+pub fn origin() -> PathBuf {
+    if let Some(origin) = option_env!("CARGO_BIN_EXE_origin") {
+        return PathBuf::from(origin);
+    }
+    let exe = env::current_exe().unwrap();
+    let origin = exe.parent().unwrap().parent().unwrap().join("origin");
+    assert!(
+        origin.exists(),
+        "build `origin` first, such as with `cargo build --bin origin`"
+    );
+    origin
+}
+
+/// `$PATH`, starting with the directory holding `origin` and the plugins
+/// built with it.
+pub fn path_with_plugins() -> OsString {
+    let bin = origin().parent().unwrap().to_owned();
+    let paths = env::var_os("PATH").unwrap_or_default();
+    env::join_paths([bin].into_iter().chain(env::split_paths(&paths))).unwrap()
+}
 
 /// A user, with a configuration directory, and so a node key, of their
 /// own, and the token they send servers, if any. Clones share it.
@@ -57,13 +83,37 @@ impl User {
         self.config.path()
     }
 
-    /// `origin` with `args`, run in `cwd` as this user.
+    /// Starts a long-running command in `cwd`, returning it and its output
+    /// lines as they come.
+    pub fn spawn(&self, cwd: &Path, args: &[&str]) -> (Child, mpsc::Receiver<String>) {
+        let mut child = self
+            .command(cwd, args)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            for line in stdout.lines() {
+                if send.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        (child, receive)
+    }
+
+    /// `origin` with `args`, run in `cwd` as this user, with the plugins
+    /// built with it on `$PATH`, keeping their state in the configuration
+    /// directory.
     pub fn command(&self, cwd: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_origin"));
+        let mut command = Command::new(origin());
         command
             .args(args)
             .current_dir(cwd)
             .env("ORIGIN_CONFIG_DIR", self.config())
+            .env("XDG_STATE_HOME", self.config().join("state"))
+            .env("PATH", path_with_plugins())
             .env_remove("ORIGIN_TOKEN");
         if let Some(token) = &self.token {
             command.env("ORIGIN_TOKEN", token);
@@ -116,6 +166,11 @@ impl Repo {
         self.user.config()
     }
 
+    /// The repository's user.
+    pub fn user(&self) -> &User {
+        &self.user
+    }
+
     /// Runs `origin` in `cwd` as the repository's user.
     pub fn run(&self, cwd: &Path, args: &[&str]) -> Output {
         self.user.command(cwd, args).output().unwrap()
@@ -124,22 +179,7 @@ impl Repo {
     /// Starts a long-running command, such as `watch`, returning it and its
     /// output lines as they come.
     pub fn spawn(&self, args: &[&str]) -> (Child, mpsc::Receiver<String>) {
-        let mut child = self
-            .user
-            .command(self.root(), args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let (send, receive) = mpsc::channel();
-        thread::spawn(move || {
-            for line in stdout.lines() {
-                if send.send(line.unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        (child, receive)
+        self.user.spawn(self.root(), args)
     }
 
     /// The revision the working copy is, in full.
@@ -240,6 +280,12 @@ impl Server {
     }
 
     pub fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// Starts a server whose repository `origin repo create` made with
+    /// `args`, such as `--admin user:alice`.
+    pub fn start_with(args: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("origin-server.toml");
         let tokens: Vec<_> = Self::USERS
@@ -255,12 +301,12 @@ impl Server {
             ),
         )
         .unwrap();
-        let origin = |args: &[&str]| {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_origin"));
+        let server = |args: &[&str]| {
+            let mut command = Command::new(origin());
             command.args(args).arg("--config").arg(&config);
             command
         };
-        let created = origin(&["repo", "create"])
+        let created = server(&[&["repo", "create"], args].concat())
             .arg(dir.path().join("repos/demo"))
             .output()
             .unwrap();
@@ -269,7 +315,16 @@ impl Server {
             "{}",
             String::from_utf8_lossy(&created.stderr)
         );
-        let mut child = origin(&["serve"])
+        let (child, base) = Self::serve(&config);
+        Self { dir, child, base }
+    }
+
+    /// Runs `origin serve` with `config`, returning it and its base URL
+    /// once it listens.
+    fn serve(config: &Path) -> (Child, String) {
+        let mut child = Command::new(origin())
+            .args(["serve", "--config"])
+            .arg(config)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -283,7 +338,23 @@ impl Server {
             .strip_prefix("Listening on ")
             .unwrap()
             .to_owned();
-        Self { dir, child, base }
+        (child, base)
+    }
+
+    /// Kills the server, runs `meanwhile`, then serves the repository again
+    /// at the same address.
+    pub fn restart(&mut self, meanwhile: impl FnOnce()) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        meanwhile();
+        let config = self.dir().join("origin-server.toml");
+        let address = self.base.strip_prefix("http://").unwrap();
+        let toml = fs::read_to_string(&config).unwrap();
+        let toml = toml.replace("127.0.0.1:0", address);
+        fs::write(&config, toml).unwrap();
+        let (child, base) = Self::serve(&config);
+        assert_eq!(base, self.base);
+        self.child = child;
     }
 
     /// The directory holding the server's configuration, key and
@@ -324,7 +395,7 @@ impl Server {
 
     /// Signs a token for `principal` with `scope` with the server's key.
     pub fn issue_token(&self, principal: &str, scope: &[&str]) -> String {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_origin"));
+        let mut command = Command::new(origin());
         command
             .args(["token", "issue", "--as", principal, "--config"])
             .arg(self.dir().join("origin-server.toml"));

@@ -51,6 +51,9 @@ origin fetch [--target <t>] [--change <id>]  # new acceptances, and the records 
 origin pull                         # fetch, then move the working copy onto its target's tip
 origin whoami | permissions         # who the remote thinks you are, and what you may do there
 origin token issue --scope "write src" [--ttl 1h]  # a short-lived token for an agent
+
+origin ci run [<rev>]               # run the checks of checks.toml, and issue their results
+origin ci worker --remote <url>     # run the checks a server's landings wait for
 ```
 
 Landing rebases a change onto the target's tip, file by file, checks the
@@ -59,6 +62,8 @@ change), and appends an acceptance signed by your node, which must be the
 target's authority. A landing that conflicts or lacks evidence waits: issue
 the statements, or a new revision, and run `origin land` again. Policy is a
 target too: edit it with `origin new --on policy`, then `origin land`.
+Issuing a statement a waiting landing lacks, to the repository that orders
+its target, lets it continue: the queue retries it for whoever submitted it.
 
 Workspaces work like git worktrees: each has its own current change and
 shares the repository's records, so agents can work side by side. A new
@@ -111,6 +116,60 @@ isn't the name you want, and the token to send each server under
 `[tokens]`, by its URL (`"http://127.0.0.1:7878" = "<token>"`), or in
 `$ORIGIN_TOKEN`. See [the design](docs/design.md) for the model.
 
+## Plugins and CI
+
+`origin <name>` runs `origin-<name>` from `PATH` when `<name>` isn't a
+built-in command, with its arguments; its output and exit code are the
+command's. Run in a working copy, which it snapshots first, it passes the
+plugin `ORIGIN_REPOSITORY`, the directory holding the repository's store,
+`ORIGIN_REVISION`, the working copy's revision, and `ORIGIN_REMOTE`, the
+remote, if there's one. Plugins use origin's public API only: a server's
+over HTTP, or for a local path, the same service in-process.
+
+The first is [`origin-ci`](apps/origin-ci). It reads the checks from
+`checks.toml`:
+
+```toml
+[checks.test]
+command   = "cargo test"
+inputs    = ["src", "Cargo.toml", "Cargo.lock"]   # the whole snapshot by default
+toolchain = "rustc -V"                            # its output is hashed
+
+[checks.links]
+command  = "lychee docs"
+inputs   = ["docs"]
+external = true          # reads the network: never promoted
+```
+
+Each check runs in a checkout of the revision of its own, removed
+afterwards, and issues a `ci.<name>` statement: `pass` if the command exits
+with 0, with the last 64 KiB of its output as the payload, declaring its
+inputs, `checks.toml` always among them, command and toolchain output, so
+its result is promoted to every revision where they're the same. A check a
+result of the same issuer already covers, ran or promoted, is skipped.
+`origin ci run` reads the checks from the revision it checks. A worker
+reads them from the tip of the target being landed on, never from the
+candidate, so a change can't redefine the checks that guard the target: an
+edit to `checks.toml` takes effect once it has landed, after passing the
+checks in force. Until then, the worker's results about a candidate that
+edits it are never promoted. A target without a `checks.toml` gets no
+answer from the worker.
+Each command runs in a process group of its own. On Linux, what it leaves
+running is killed once it ends, or if the run was killed, by the next run.
+On macOS, where origin can't tell which processes are still the check's,
+nothing a check leaves running is killed, so stop it yourself. The
+landing queue promotes results without running the toolchain command, so
+new tools with unchanged inputs don't stop old results from being
+promoted: pin the toolchain in an input, such as `rust-toolchain.toml`.
+`origin ci run` checks a revision of this repository as you, and fails if a
+check fails. `origin ci worker` answers a remote's `check.requested` events
+with a token of its own, such as one from `origin token issue --scope "read
+/" --scope "annotate ci.*"`: its statements land what waited for them. When
+it starts, once the remote is back after going away, and every minute, it
+also answers every landing that waits for a check it hasn't run, so no
+check is lost to a missed event, a restart or a failed run. Its checkouts
+live in `$XDG_STATE_HOME/origin-ci/` (or `~/.local/state/`).
+
 ## Permissions
 
 What each user may do lives in `policy.toml`, so changing it is a landing
@@ -162,7 +221,10 @@ for a token acting for you with a narrower scope, such as `write src`,
 without storing it. A server's operator signs one for any principal with
 `origin token issue --config origin-server.toml --as user:agent-1 --scope
 ...`. A token never grants more than its principal's rights, lasts at most
-7 days, and a token issued with a token expires with it.
+7 days, and a token issued with a token expires with it. A landing that
+waits is retried for its submitter when its evidence arrives, until their
+token expires: then `origin land --status` says so, and it waits for
+someone to land it again.
 
 `converge` merges the files of a change's heads. A text file two heads
 changed holds both versions between conflict markers (`<<<<<<<`, `=======`,
@@ -179,9 +241,13 @@ copy, and the authority of their targets: it runs their landing queues,
 and packs their small objects once a few thousand pile up loose.
 
 ```sh
-origin repo create repos/demo   # a repository the server orders `policy` and `main` of
+origin repo create repos/demo [--admin user:alice]  # a repository the server orders
 origin serve                    # host the repositories over HTTP
 ```
+
+`--admin` names who changes the new repository's policy over the API;
+without it, only the server's operator does, by landing through the
+repository's path.
 
 Both read `origin-server.toml` (or `--config <file>`), whose paths are
 relative to it:

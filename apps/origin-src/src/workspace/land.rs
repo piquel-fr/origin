@@ -494,6 +494,7 @@ impl Workspace {
             proposal,
             subject,
             blocked,
+            ..
         } = pending;
         let retry = match proposal {
             Proposal::Change(change) => format!("origin land {} --onto {onto}", change.short()),
@@ -506,10 +507,18 @@ impl Workspace {
                     "The landing of {proposal} on `{onto}` waits for {}",
                     missing.join(", ")
                 );
-                println!(
-                    "    about {}: once they're issued, run `{retry}`",
-                    Self::describe_record(*subject)
-                );
+                if pending.expired() {
+                    println!(
+                        "    about {}, but the token it was submitted with expired, so it's no \
+                         longer retried: run `{retry}`",
+                        Self::describe_record(*subject)
+                    );
+                } else {
+                    println!(
+                        "    about {}: once they're issued, run `{retry}`",
+                        Self::describe_record(*subject)
+                    );
+                }
             }
             Blocked::Conflict { paths, .. } => {
                 println!(

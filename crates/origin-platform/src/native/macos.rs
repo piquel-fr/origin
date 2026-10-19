@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
-use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, ReadAt};
+use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, Processes, ReadAt};
 
 /// The macOS implementation of [`Platform`](crate::Platform).
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +60,14 @@ impl Durability for MacOs {
 }
 
 impl FileLock for MacOs {}
+
+impl Processes for MacOs {
+    /// macOS lists the files a process holds only through `libproc`,
+    /// which needs `unsafe`: never sure, it says no.
+    fn group_holds(&self, _id: u32, _path: &Path) -> io::Result<bool> {
+        Ok(false)
+    }
+}
 
 impl ReadAt for MacOs {}
 

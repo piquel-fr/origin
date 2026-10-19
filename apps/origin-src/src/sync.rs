@@ -2225,6 +2225,40 @@ mod tests {
     }
 
     #[test]
+    fn a_push_in_parts_never_lands_a_result_its_replacement_follows() {
+        let server = Repo::new(
+            "[targets.main]\nauthority = \"node:queue\"\n\
+             require = [{ kind = \"ci.test\", verdict = \"pass\", issuer = \"user:ada\" }]\n",
+        );
+        let revision = server.change_on_main(1, &[("src/a", "a")]);
+        let change = ChangeId::from_bytes([1; 16]);
+        let waits = server.land(1);
+        assert!(matches!(
+            waits[..],
+            [origin_shared::landing::Landing::Pending(_)]
+        ));
+        let client = Client::new(&server);
+        client.sync().fetch_chains(&[TargetName::MAIN]).unwrap();
+        client.sync().fetch_changes(&[change]).unwrap();
+        // The check passed, then failed when it ran again: both go, one
+        // object a request but for them.
+        let pass = ci_test(revision, "user:ada");
+        let fail = Statement {
+            verdict: Some(Verdict::Fail),
+            supersedes: Some(pass.encode().id().into()),
+            ..pass.clone()
+        };
+        client
+            .store
+            .write_all(&[pass.encode(), fail.encode()])
+            .unwrap();
+        let tip = server.tip(&TargetName::MAIN);
+        let pushed = client.sync().with_pack_limit(1).push(&[change]).unwrap();
+        assert_eq!(pushed.statements, 2);
+        assert_eq!(server.tip(&TargetName::MAIN), tip);
+    }
+
+    #[test]
     fn a_push_in_parts_never_lands_an_abandoned_revision() {
         use std::os::unix::fs::PermissionsExt;
         // Requests of one object, or of the default size, which the

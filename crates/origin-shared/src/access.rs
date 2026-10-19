@@ -513,7 +513,8 @@ impl Token {
         }
     }
 
-    fn now() -> u64 {
+    /// Now, in seconds since the Unix epoch, as expiries count.
+    pub(crate) fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs())
