@@ -526,6 +526,68 @@
         }
       }
     },
+    "/api/v1/repos/{repo}/promote": {
+      "post": {
+        "summary": "Promotes results to a record from the records with the same input\ndigest, as statements this server issues, and retries the landings\nwaiting for them.",
+        "operationId": "promote",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromoteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The statements promoted: none if nothing matched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Annotation"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller isn't signed in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or the record does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/repos/{repo}/records": {
       "put": {
         "summary": "Puts a batch of objects, as a pack: snapshots, revisions and\nstatements, each needing only objects the batch or the repository has,\nof the kinds it names. With `expect`, only if the changes it names have\nthe heads it says when the records are published.",
@@ -1957,6 +2019,15 @@
             "$ref": "#/components/schemas/Blocked",
             "description": "Why it waits."
           },
+          "expires": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the token of its submitter, whom it's retried for, expires, in\nseconds since the Unix epoch, if it's a scoped one. Once it has, the\nlanding is no longer retried: it waits until it's landed again.",
+            "minimum": 0
+          },
           "onto": {
             "$ref": "#/components/schemas/TargetName",
             "description": "The target it lands on."
@@ -1988,6 +2059,19 @@
         "examples": [
           "group:runners"
         ]
+      },
+      "PromoteRequest": {
+        "type": "object",
+        "description": "Asks for the results of other records to be promoted to one.",
+        "required": [
+          "subject"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "The record: a revision, an acceptance, or a waiting landing's\nsnapshot."
+          }
+        }
       },
       "Proposal": {
         "oneOf": [

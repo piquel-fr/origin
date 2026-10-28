@@ -1,6 +1,7 @@
 //! File operations that differ between platforms: durable writes, file
 //! locks, copy-on-write clones, positioned reads, and telling local file
-//! systems from network ones.
+//! systems from network ones. And stopping commands whole, with what they
+//! started.
 //!
 //! Each operation is a trait. Every supported platform implements them in its
 //! own module under [`native`], and [`Native`] picks the one for the build
@@ -16,6 +17,7 @@ mod error;
 mod file_system;
 mod lock;
 pub mod native;
+mod process;
 mod read;
 
 pub use clone::{CloneError, CloneFile};
@@ -24,6 +26,7 @@ pub use error::{Error, Op};
 pub use file_system::{FileSystem, FsKind, WritableError};
 pub use lock::{FileLock, LockMode, LockedFile};
 pub use native::Native;
+pub use process::Processes;
 pub use read::ReadAt;
 
 /// Everything origin needs from the platform it runs on, shared by all the
