@@ -1,7 +1,12 @@
-//! Comparing trees.
+//! Comparing trees, and looking up what they hold.
+
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use origin_platform::Platform;
-use origin_shared::{EntryName, RepoPath, Tree, TreeEntry, TreeId};
+use origin_shared::{
+    Digest, EntryKind, EntryName, Inputs, ObjectId, RepoPath, Tree, TreeEntry, TreeId,
+};
 
 use crate::store::{Store, StoreError};
 
@@ -79,8 +84,106 @@ impl<P: Platform> Store<P> {
     }
 }
 
+/// Looks up the entries of snapshots by path, reading each tree once,
+/// however many snapshots share it.
+#[derive(Debug)]
+pub struct Snapshots<'a, P> {
+    store: &'a Store<P>,
+    trees: HashMap<TreeId, Tree>,
+}
+
+impl<'a, P: Platform> Snapshots<'a, P> {
+    /// Looks up snapshots in `store`.
+    pub fn new(store: &'a Store<P>) -> Self {
+        Self {
+            store,
+            trees: HashMap::new(),
+        }
+    }
+
+    /// What `snapshot` stores at `path`, or `None` if nothing is there. At
+    /// the root, that's the snapshot's own tree.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree on the way cannot be read.
+    pub fn entry_at(
+        &mut self,
+        snapshot: TreeId,
+        path: &RepoPath,
+    ) -> Result<Option<TreeEntry>, StoreError> {
+        let mut entry = TreeEntry {
+            kind: EntryKind::Tree,
+            id: snapshot.into(),
+        };
+        for name in path.components() {
+            let Some(id) = entry.subtree() else {
+                return Ok(None);
+            };
+            let tree = match self.trees.entry(id) {
+                Entry::Occupied(tree) => tree.into_mut(),
+                Entry::Vacant(vacant) => vacant.insert(self.store.get(id)?),
+            };
+            match tree.get(name) {
+                Some(&next) => entry = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(entry))
+    }
+
+    /// The input digest of `snapshot`: one lookup per path of `inputs`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree on the way to a path cannot be read.
+    pub fn input_digest(
+        &mut self,
+        snapshot: TreeId,
+        inputs: &Inputs,
+    ) -> Result<Digest, StoreError> {
+        inputs.digest(|path| self.entry_at(snapshot, path))
+    }
+}
+
+impl<P: Platform> Store<P> {
+    /// Adds every object the trees `roots` reach to `reached`: the trees
+    /// themselves, their subtrees and their files. Trees already in
+    /// `reached` are not read again, and those the store doesn't have, as
+    /// after a lazy clone, are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a tree cannot be read.
+    pub fn reach(
+        &self,
+        roots: impl IntoIterator<Item = TreeId>,
+        reached: &mut HashSet<ObjectId>,
+    ) -> Result<(), StoreError> {
+        let mut pending: Vec<TreeId> = roots.into_iter().collect();
+        while let Some(id) = pending.pop() {
+            if !reached.insert(id.into()) {
+                continue;
+            }
+            let tree: Tree = match self.get(id) {
+                Err(StoreError::NotFound(_)) => continue,
+                tree => tree?,
+            };
+            for (_, entry) in &tree {
+                match entry.subtree() {
+                    Some(subtree) => pending.push(subtree),
+                    None => {
+                        reached.insert(entry.id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use origin_platform::Native;
@@ -152,7 +255,7 @@ mod tests {
         }
     }
 
-    fn build(store: &Store, files: &[(&str, &str)]) -> TreeId {
+    pub(crate) fn build(store: &Store, files: &[(&str, &str)]) -> TreeId {
         let mut builder = TreeBuilder::default();
         for (path, content) in files {
             builder.insert(path, file(content));
@@ -204,5 +307,31 @@ mod tests {
         assert_eq!(store.diff(old, old).unwrap(), []);
         let empty = build(&store, &[]);
         assert_eq!(store.diff(empty, old).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn looks_entries_up_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join(".origin"), Native::default());
+        store.init().unwrap();
+        let root = build(&store, &[("src/lib.rs", "lib"), ("README", "r")]);
+        let mut snapshots = Snapshots::new(&store);
+        let mut at = |path: &str| {
+            snapshots
+                .entry_at(root, &RepoPath::new(path).unwrap())
+                .unwrap()
+        };
+
+        assert_eq!(at("src/lib.rs"), Some(file("lib")));
+        assert_eq!(at("").unwrap().id, root.into(), "the root is the snapshot");
+        assert!(at("src").unwrap().kind.is_tree());
+        for missing in ["nope", "src/nope", "README/inside"] {
+            assert_eq!(at(missing), None, "{missing}");
+        }
+
+        let mut reached = HashSet::new();
+        store.reach([root], &mut reached).unwrap();
+        assert_eq!(reached.len(), 4, "two trees and two files");
+        assert!(reached.contains(&file("lib").id));
     }
 }
