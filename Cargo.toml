@@ -23,12 +23,16 @@ origin-platform = { version = "0.1.0", path = "crates/origin-platform" }
 origin-shared = { version = "0.1.0", path = "crates/origin-shared" }
 
 # External
+blake3 = "1.8.7"
 divan = "0.1.21"
+ed25519-dalek = { version = "3.0.0", default-features = false }
+getrandom = "0.4.3"
 reflink-copy = "0.1.30"
 # Only in origin-platform. The version and features reflink-copy uses on Linux.
 rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+zstd = "0.14.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
