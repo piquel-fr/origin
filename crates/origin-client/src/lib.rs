@@ -19,27 +19,28 @@
 //! in `docs/openapi.json`, for other languages.
 
 use origin_shared::api::{
-    Annotation, ApiError, EventsQuery, FetchRecords, LandRequest, Landings, LogEntry, LogQuery,
-    NewTarget, RepoName, RepoSummary, Revisions, StatementsQuery, Stored, TargetInfo,
+    Annotation, ApiError, EventsQuery, FetchRecords, FetchSnapshot, Inventory, InventoryRequest,
+    LandRequest, Landings, LogEntry, LogQuery, MORE, NewTarget, PutQuery, RepoName, RepoSummary,
+    Revisions, StatementsQuery, Stored, TargetInfo,
 };
 use origin_shared::event::Page;
 use origin_shared::landing::Pending;
-use origin_shared::pack::{Pack, PackError};
+use origin_shared::pack::{Pack, PackError, Part};
 use origin_shared::{ChangeId, Head};
 use reqwest::{Method, RequestBuilder};
 use serde::de::DeserializeOwned;
 
 /// Defines endpoints as methods. Each sends one request, built from an HTTP
 /// method, a path relative to its owner's, which can name the arguments
-/// like `format!` does, and optionally a body applied by a
-/// [`RequestBuilder`] method (`query`, `json` or `body`), then reads the
-/// response with a [`Response`] method.
+/// like `format!` does, and what [`RequestBuilder`] methods (`query`,
+/// `json` or `body`) apply, then reads the response with a [`Response`]
+/// method.
 macro_rules! endpoints {
     ($(
         impl $owner:ident {$(
             $(#[doc = $doc:literal])*
             fn $name:ident($($arg:ident: $type:ty),*) -> $output:ty =
-                $method:ident $path:literal $(, $send:ident($body:expr))? => $read:ident;
+                $method:ident $path:literal $(, $send:ident($body:expr))* => $read:ident;
         )*}
     )*) => {$(
         impl $owner {$(
@@ -49,7 +50,7 @@ macro_rules! endpoints {
             ///
             /// Fails if the server cannot be reached or refuses the request.
             pub async fn $name(&self, $($arg: $type),*) -> Result<$output, Error> {
-                let request = self.request(Method::$method, &format!($path))$(.$send($body))?;
+                let request = self.request(Method::$method, &format!($path))$(.$send($body))*;
                 Response::send(request).await?.$read().await
             }
         )*}
@@ -65,16 +66,34 @@ endpoints! {
     }
 
     impl Repo {
-        /// Fetches objects by id, in the order asked.
-        fn fetch_records(request: &FetchRecords) -> Pack =
-            POST "records/fetch", json(request) => pack;
+        /// Fetches records by id, in the order asked, each followed by the
+        /// blob it carries if the server has it: a revision's description,
+        /// a statement's payload. A part that stops short holds those up to
+        /// the last record it has.
+        fn fetch_records(request: &FetchRecords) -> Part =
+            POST "records/fetch", json(request) => part;
+        /// Fetches the trees and blobs of a snapshot that none of the
+        /// request's snapshots holds at the same path, parents first. A
+        /// part that stops short is followed by asking again, skipping the
+        /// objects it holds.
+        fn fetch_snapshot(request: &FetchSnapshot) -> Part =
+            POST "snapshots/fetch", json(request) => part;
         /// Puts a batch of objects: snapshots, revisions and statements,
         /// each needing only objects the batch or the repository has.
         fn put_records(pack: &Pack) -> Stored = PUT "records", body(pack.encode()) => json;
+        /// Puts a batch of objects like `put_records`, if each change the
+        /// query names has the heads it says when its revisions are
+        /// published: a compare-and-swap, refused with a conflict.
+        fn push_records(pack: &Pack, query: &PutQuery) -> Stored =
+            PUT "records", query(query), body(pack.encode()) => json;
         /// The statements about a record, in the order the repository
         /// received them.
         fn statements(query: &StatementsQuery) -> Vec<Annotation> =
             GET "statements", query(query) => json;
+        /// What the server holds of some changes: their revisions, heads
+        /// and statements, by id.
+        fn inventory(request: &InventoryRequest) -> Vec<Inventory> =
+            POST "changes/inventory", json(request) => json;
         /// The revisions of a change, and its heads.
         fn revisions(change: ChangeId) -> Revisions = GET "changes/{change}/revisions" => json;
         /// Every target, with its tip, authority and requirements.
@@ -170,8 +189,10 @@ impl Response {
         Ok(self.0.json().await?)
     }
 
-    async fn pack(self) -> Result<Pack, Error> {
-        Ok(Pack::decode(&self.0.bytes().await?)?)
+    async fn part(self) -> Result<Part, Error> {
+        let more = self.0.headers().contains_key(MORE);
+        let pack = Pack::decode(&self.0.bytes().await?)?;
+        Ok(Part { pack, more })
     }
 }
 

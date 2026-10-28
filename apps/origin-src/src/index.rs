@@ -352,6 +352,11 @@ impl Index {
         &self.arrivals
     }
 
+    /// Every change with a revision, in no particular order.
+    pub fn changes(&self) -> impl Iterator<Item = ChangeId> {
+        self.changes.keys().copied()
+    }
+
     /// The revisions of `change`, in arrival order.
     #[must_use]
     pub fn revisions(&self, change: ChangeId) -> &[RevisionId] {

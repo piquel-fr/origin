@@ -69,18 +69,12 @@ impl Workspace {
         let root = self.new_root(path, revision.change)?;
         self.write(&records)?;
         self.write_durably(self.registered(&root), &Self::path_bytes(&root))?;
-        let mut workspace = Self {
-            store: self
-                .store
-                .clone()
-                .with_actor(self.store.actor().in_workspace(&root)),
-            root,
-            config: self.config.clone(),
-            revision: id,
-            unlogged: None,
-        };
+        let store = self.store.clone();
+        let store = store.with_actor(self.store.actor().in_workspace(&root));
+        let mut workspace = Self::at(root, store, self.config.clone(), id);
         let empty = Tree::default().encode().id().into();
-        workspace.checkout(empty, revision.snapshot, None)?;
+        let changes = workspace.changes(empty, revision.snapshot)?;
+        workspace.checkout(&changes, None)?;
         let repository = Self::path_bytes(self.store.root());
         workspace.write_durably(workspace.meta(Self::REPOSITORY), &repository)?;
         workspace.publish_pointer(None, id, Why::Command)?;
