@@ -2,20 +2,29 @@
 //! change on a target with `new --on`.
 //!
 //! The queue runs in this process, as this node. After a landing, the
-//! working copy follows its change: when it landed, the working copy starts
-//! a new change on the target's tip; when the queue rebased it, the working
-//! copy becomes the rebased revision; and when it sits on a change that
-//! landed, it is rebased onto the tip, if that merges cleanly.
+//! working copy of the workspace that ran it follows its change: when it
+//! landed, the working copy starts a new change on the target's tip; when
+//! the queue rebased it, the working copy becomes the rebased revision; and
+//! when it sits on a change that landed, it is rebased onto the tip.
+//!
+//! Other workspaces are left alone, behind their change, until `origin
+//! pull` follows it the same way, merging the edits made since. Where edits
+//! conflict with what they're merged onto, the files hold both versions
+//! between conflict markers, and a `core.conflict` statement lists them, so
+//! the working copy doesn't land until they change or are accepted with
+//! `origin resolve` (see [`conflict`](crate::conflict)).
 
 use origin_shared::{
     Base, ChangeId, EncodedObject, Record, RecordId, Revision, RevisionId, Source, TargetName,
     TreeId,
 };
 
-use super::{WorkingCopy, Workspace, WorkspaceError};
+use super::{Behind, WorkingCopy, Workspace, WorkspaceError};
+use crate::conflict::Conflicts;
 use crate::index::Index;
 use crate::policy::Policy;
 use crate::queue::{Blocked, Landing, Pending, Proposal, Queue};
+use crate::tree::Merge;
 
 impl Workspace {
     /// `origin land [<change>] [--onto <target>]`: lands a change, the
@@ -31,12 +40,11 @@ impl Workspace {
         change: Option<&str>,
         onto: Option<TargetName>,
     ) -> Result<(), WorkspaceError> {
-        let working_copy = self.refresh()?;
-        let index = Index::open(&self.store)?;
-        let change = working_copy.find_change(&index, change.unwrap_or("@"))?;
+        let mut working_copy = self.save_draft()?;
+        let change = working_copy.find_change(change.unwrap_or("@"))?;
         let onto = match onto {
             Some(onto) => onto,
-            None => self.target_of(Self::single_head(&index, change)?)?,
+            None => self.target_of(Self::single_head(&working_copy.index, change)?)?,
         };
         let key = self.config.node_key()?;
         let landings =
@@ -44,7 +52,11 @@ impl Workspace {
         for landing in &landings {
             self.print_landing(landing, &onto)?;
         }
-        self.follow(&working_copy, &onto, &landings)
+        working_copy.index = Index::open(&self.store)?;
+        working_copy.behind =
+            self.behind(&working_copy.index, working_copy.id, &working_copy.revision)?;
+        self.follow(&working_copy)?;
+        Ok(())
     }
 
     /// `origin land --from <target> --onto <target>`: lands the tip of
@@ -133,41 +145,122 @@ impl Workspace {
     /// # Errors
     ///
     /// Fails if the target doesn't exist, the working copy cannot be
-    /// snapshotted, or the change cannot be written or checked out.
+    /// snapshotted or is behind its change, or the change cannot be written
+    /// or checked out.
     pub fn new_on(&mut self, target: &TargetName, description: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
-        self.start_on(target, description, working_copy.revision.snapshot)
+        self.start_on(&working_copy, target, description, working_copy.files)
+    }
+
+    /// `origin pull`: moves the working copy where its change went without
+    /// it, merging the edits made since: onto the tip of the target it
+    /// landed on, as a new change, or onto the landing queue's rebase of it.
+    /// Otherwise rebases it onto the tip of the target its stack is on:
+    /// once the change below it landed, or once the target it's on moved.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the working copy cannot be snapshotted, a file was edited
+    /// while it moved, or the records cannot be read or written.
+    pub fn pull(&mut self) -> Result<(), WorkspaceError> {
+        let working_copy = self.save_draft()?;
+        if self.follow(&working_copy)? {
+            return Ok(());
+        }
+        let Base::Acceptance(base) = working_copy.revision.base else {
+            println!("The working copy is on a stack of changes, which stays where it is.");
+            return Ok(());
+        };
+        let target = self.target_name(self.store.get(base)?.body().target)?;
+        let tip = self
+            .store
+            .head(&target)?
+            .ok_or_else(|| WorkspaceError::UnknownTarget(target.clone()))?;
+        if tip.acceptance == base {
+            println!("The working copy is on the tip of `{target}`.");
+            return Ok(());
+        }
+        let files = self.base_tree(working_copy.revision.base)?;
+        self.rebase_onto_tip(&working_copy, files, &target)
     }
 
     /// Starts a change described by `description` on the tip of `target`,
-    /// and checks it out over the files of `files`.
+    /// with the edits that made the working copy's files from `base`, and
+    /// checks it out over them, as the module explains.
     fn start_on(
         &mut self,
+        working_copy: &WorkingCopy,
         target: &TargetName,
         description: &str,
-        files: TreeId,
+        base: TreeId,
     ) -> Result<(), WorkspaceError> {
         let tip = self
             .store
             .head(target)?
             .ok_or_else(|| WorkspaceError::UnknownTarget(target.clone()))?;
+        let state = self.store.get(tip.acceptance)?.body().state;
+        let tip_label = format!("{target} #{}", tip.seq);
+        let merge = self.store.merge_marked(
+            Some(base),
+            working_copy.files,
+            state,
+            [Self::OURS, &tip_label],
+        )?;
         let description = EncodedObject::blob(description.as_bytes());
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
             base: Base::Acceptance(tip.acceptance),
             deps: Vec::new(),
-            snapshot: self.store.get(tip.acceptance)?.body().state,
+            snapshot: merge.tree,
             description: description.id().into(),
             author: self.config.user(),
         };
         let encoded = revision.encode();
-        self.write(&[vec![description], vec![encoded.clone()]])?;
-        self.checkout(files, revision.snapshot)?;
-        self.point_at(encoded.id().into())?;
-        println!("Working copy: {}", self.headline(&revision)?);
-        println!("On top of: {}", self.describe_base(revision.base)?);
-        Ok(())
+        let (conflicts, layers) =
+            self.write_merge(working_copy, merge, vec![description], &encoded)?;
+        self.move_to(
+            working_copy,
+            encoded.id().into(),
+            &revision,
+            &layers,
+            &conflicts,
+        )
+    }
+
+    /// How conflict markers name the working copy's side.
+    const OURS: &str = "working copy";
+
+    /// Follows the working copy's change where it went without it, merging
+    /// the edits made since, or rebases the working copy onto the tip once
+    /// the change below it landed, as the module explains. Returns whether
+    /// it moved.
+    fn follow(&mut self, working_copy: &WorkingCopy) -> Result<bool, WorkspaceError> {
+        match &working_copy.behind {
+            Some(Behind::Landed { target, .. }) => {
+                let base = working_copy.revision.snapshot;
+                self.start_on(working_copy, &target.clone(), "", base)?;
+                return Ok(true);
+            }
+            Some(Behind::Rebased(rebased)) => {
+                self.move_onto(working_copy, *rebased)?;
+                return Ok(true);
+            }
+            None => {}
+        }
+        let Base::Revision(below) = working_copy.revision.base else {
+            return Ok(false);
+        };
+        let below: Revision = self.store.get(below)?;
+        let [head] = working_copy.index.heads(below.change)[..] else {
+            return Ok(false);
+        };
+        let Some(landing) = self.store.landing(head, &self.store.get(head)?)? else {
+            return Ok(false);
+        };
+        let target = self.target_name(landing.body().target)?;
+        self.rebase_onto_tip(working_copy, below.snapshot, &target)?;
+        Ok(true)
     }
 
     /// The target a revision's stack is on: that of the acceptance at its
@@ -184,56 +277,42 @@ impl Workspace {
         }
     }
 
-    /// Moves the working copy after `landings` on `onto`, as the module
-    /// explains.
-    fn follow(
+    /// Moves the working copy onto `rebased`, the landing queue's rebase of
+    /// it, with the edits made since in a revision after it.
+    fn move_onto(
         &mut self,
         working_copy: &WorkingCopy,
-        onto: &TargetName,
-        landings: &[Landing],
+        rebased: RevisionId,
     ) -> Result<(), WorkspaceError> {
-        let revision = &working_copy.revision;
-        let files = revision.snapshot;
-        let landed = |change: ChangeId| {
-            landings.iter().any(|landing| {
-                matches!(landing, Landing::Landed { proposal, .. }
-                    if *proposal == Proposal::Change(change))
-            })
+        let theirs: Revision = self.store.get(rebased)?;
+        if working_copy.files == working_copy.revision.snapshot {
+            return self.move_to(working_copy, rebased, &theirs, &[], &Conflicts::default());
+        }
+        let merge = self.store.merge_marked(
+            Some(working_copy.revision.snapshot),
+            working_copy.files,
+            theirs.snapshot,
+            [Self::OURS, &rebased.short()],
+        )?;
+        let revision = Revision {
+            predecessors: vec![rebased],
+            snapshot: merge.tree,
+            author: self.config.user(),
+            ..theirs
         };
-        if landed(revision.change) {
-            return self.start_on(onto, "", files);
-        }
-        for landing in landings {
-            if let Landing::Pending(Pending {
-                proposal: Proposal::Change(change),
-                subject: RecordId::Revision(rebased),
-                ..
-            }) = landing
-                && *change == revision.change
-                && *rebased != working_copy.id
-            {
-                let rebased = *rebased;
-                self.checkout(files, self.store.get(rebased)?.snapshot)?;
-                self.point_at(rebased)?;
-                println!(
-                    "Working copy: {}",
-                    self.headline(&self.store.get(rebased)?)?
-                );
-                return Ok(());
-            }
-        }
-        let Base::Revision(below) = revision.base else {
-            return Ok(());
-        };
-        let below = self.store.get(below)?;
-        if !landed(below.change) {
-            return Ok(());
-        }
-        self.rebase_onto_tip(working_copy, below.snapshot, onto)
+        let encoded = revision.encode();
+        let (conflicts, layers) = self.write_merge(working_copy, merge, Vec::new(), &encoded)?;
+        self.move_to(
+            working_copy,
+            encoded.id().into(),
+            &revision,
+            &layers,
+            &conflicts,
+        )
     }
 
-    /// Rebases the working copy, made on `base`, onto the tip of `onto`, if
-    /// that merges cleanly.
+    /// Rebases the working copy, made on `base`, onto the tip of `onto`, as
+    /// the module explains.
     fn rebase_onto_tip(
         &mut self,
         working_copy: &WorkingCopy,
@@ -246,14 +325,13 @@ impl Workspace {
             .ok_or_else(|| WorkspaceError::UnknownTarget(onto.clone()))?;
         let state = self.store.get(tip.acceptance)?.body().state;
         let current = &working_copy.revision;
-        let merge = self.store.merge(Some(base), current.snapshot, state)?;
-        if !merge.conflicts.is_empty() {
-            println!(
-                "The working copy stays where it is: it conflicts with `{onto}` in {}",
-                Self::list_paths(&merge.conflicts.paths())
-            );
-            return Ok(());
-        }
+        let tip_label = format!("{onto} #{}", tip.seq);
+        let merge = self.store.merge_marked(
+            Some(base),
+            current.snapshot,
+            state,
+            [Self::OURS, &tip_label],
+        )?;
         let revision = Revision {
             predecessors: vec![working_copy.id],
             base: Base::Acceptance(tip.acceptance),
@@ -262,11 +340,56 @@ impl Workspace {
             ..current.clone()
         };
         let encoded = revision.encode();
-        self.write(&[merge.trees, vec![encoded.clone()]])?;
-        self.checkout(current.snapshot, revision.snapshot)?;
-        self.point_at(encoded.id().into())?;
-        println!("Working copy: {}", self.headline(&revision)?);
+        let (conflicts, layers) = self.write_merge(working_copy, merge, Vec::new(), &encoded)?;
+        self.move_to(
+            working_copy,
+            encoded.id().into(),
+            &revision,
+            &layers,
+            &conflicts,
+        )
+    }
+
+    /// Writes the objects `merge` of the working copy's files made, for
+    /// `revision`, which it made. Returns the revision's unresolved
+    /// conflicts, those the merge left and those of the working copy it
+    /// still has, and the layers that write it, with `with`, and with a
+    /// `core.conflict` statement about it listing them: written once it's
+    /// checked out.
+    fn write_merge(
+        &self,
+        working_copy: &WorkingCopy,
+        merge: Merge,
+        with: Vec<EncodedObject>,
+        revision: &EncodedObject,
+    ) -> Result<(Conflicts, Vec<Vec<EncodedObject>>), WorkspaceError> {
+        // Finding the working copy's conflicts that remain reads its trees.
+        self.write(&[merge.files.into_iter().chain(merge.trees).collect()])?;
+        let conflicts = working_copy.conflicts.clone();
+        let conflicts = conflicts
+            .remaining(&self.store, merge.tree)?
+            .with(merge.conflicts);
+        let layers = self.revision_layers(with, revision, &conflicts);
+        Ok((conflicts, layers))
+    }
+
+    /// Checks `revision`, `id`, out over the working copy, writes
+    /// `unwritten`, the layers that write it if it's new, makes it the
+    /// working copy, and says so, listing its unresolved `conflicts`.
+    fn move_to(
+        &mut self,
+        working_copy: &WorkingCopy,
+        id: RevisionId,
+        revision: &Revision,
+        unwritten: &[Vec<EncodedObject>],
+        conflicts: &Conflicts,
+    ) -> Result<(), WorkspaceError> {
+        self.switch_to(working_copy, id, revision, unwritten)?;
+        println!("Working copy: {}", self.headline(revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
+        if !conflicts.is_empty() {
+            Self::print_conflicts(conflicts);
+        }
         Ok(())
     }
 
