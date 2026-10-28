@@ -52,6 +52,9 @@ enum WorkspaceCommand {
         /// What the new change is for.
         #[arg(default_value = "")]
         description: String,
+        /// Start it on the tip of this target instead.
+        #[arg(long)]
+        on: Option<TargetName>,
     },
     /// Describe what the current change is for.
     Describe {
@@ -76,6 +79,12 @@ enum WorkspaceCommand {
     Converge {
         /// The change.
         change: String,
+    },
+    /// Accept conflicted files as they are, resolving their conflicts.
+    Resolve {
+        /// The files, from the root of the repository.
+        #[arg(required = true)]
+        paths: Vec<RepoPath>,
     },
     /// Show the working copy's changes and the target they're on.
     Log {
@@ -113,6 +122,44 @@ enum WorkspaceCommand {
     /// Drop the payloads past the retention set in `policy.toml`, pack
     /// small objects, and remove the leftovers of crashed writes.
     Gc,
+    /// Land a change on a target, with the changes below it the target
+    /// doesn't have yet. The queue rebases it onto the target's tip, checks
+    /// the evidence `policy.toml` requires, and if it's there, appends a
+    /// signed acceptance. A landing that conflicts or lacks evidence waits.
+    Land(LandArgs),
+    /// Manage targets.
+    #[command(subcommand)]
+    Target(TargetCommand),
+    /// List the targets, with their tips, authorities and requirements.
+    Targets,
+}
+
+#[derive(Debug, Args)]
+struct LandArgs {
+    /// The change: the working copy's by default.
+    #[arg(conflicts_with_all = ["from", "status"])]
+    change: Option<String>,
+    /// The target to land on: by default, the one the change is on.
+    #[arg(long)]
+    onto: Option<TargetName>,
+    /// Land the tip of this target instead of a change.
+    #[arg(long, requires = "onto")]
+    from: Option<TargetName>,
+    /// List the landings that wait, and why.
+    #[arg(long, conflicts_with_all = ["onto", "from"])]
+    status: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum TargetCommand {
+    /// Create a target at the tip of another.
+    New {
+        /// Its name, such as `release/v3`.
+        name: TargetName,
+        /// The target it starts from.
+        #[arg(long)]
+        from: TargetName,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -229,8 +276,12 @@ impl WorkspaceCommand {
             Self::Status => workspace.status()?,
             Self::Diff => workspace.diff()?,
             Self::Show { change } => workspace.show(change.as_deref())?,
-            Self::New { description } => workspace.new_change(&description)?,
+            Self::New { description, on } => match on {
+                Some(target) => workspace.new_on(&target, &description)?,
+                None => workspace.new_change(&description)?,
+            },
             Self::Describe { description } => workspace.describe(&description)?,
+            Self::Resolve { paths } => workspace.resolve(&paths)?,
             Self::Edit { change } => workspace.edit(&change)?,
             Self::Abandon { change, reason } => workspace.abandon(change.as_deref(), &reason)?,
             Self::Converge { change } => workspace.converge(&change)?,
@@ -247,6 +298,15 @@ impl WorkspaceCommand {
             Self::Statements { rev } => workspace.statements(&rev)?,
             Self::Promote { rev } => workspace.promote(&rev)?,
             Self::Gc => workspace.gc()?,
+            Self::Land(args) => match (args.from, args.onto) {
+                _ if args.status => workspace.land_status()?,
+                (Some(from), Some(onto)) => workspace.land_target(&from, &onto)?,
+                (_, onto) => workspace.land(args.change.as_deref(), onto)?,
+            },
+            Self::Target(TargetCommand::New { name, from }) => {
+                workspace.target_new(&name, &from)?;
+            }
+            Self::Targets => workspace.targets()?,
         }
         Ok(())
     }
