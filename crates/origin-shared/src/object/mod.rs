@@ -6,7 +6,10 @@
 //! its own hash domain: objects of different kinds never share an id, and a
 //! record of one kind can never be mistaken for another.
 //!
-//! - Blob: the content, as is.
+//! - Blob: a file's content, as is.
+//! - Attachment: a revision's description or a statement's payload, as is.
+//!   It is a kind of its own, so no record can carry a file's content as
+//!   its attachment: whoever may read a record may not read every file.
 //! - Tree: its entries, see [`Tree`].
 //! - Revision, statement and acceptance: their fields in declaration order.
 //!   Integers are little endian, ids their raw bytes, names and paths a
@@ -40,7 +43,7 @@ mod tree;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ObjectKind {
-    /// File contents, a description or a payload.
+    /// A file's content.
     Blob = 1,
     /// A directory listing.
     Tree = 2,
@@ -50,6 +53,8 @@ pub enum ObjectKind {
     Statement = 4,
     /// One landing on a target.
     Acceptance = 5,
+    /// A revision's description or a statement's payload.
+    Attachment = 6,
 }
 
 impl ObjectKind {
@@ -60,6 +65,7 @@ impl ObjectKind {
             3 => Ok(Self::Revision),
             4 => Ok(Self::Statement),
             5 => Ok(Self::Acceptance),
+            6 => Ok(Self::Attachment),
             _ => Err(DecodeError::UnknownObjectKind(byte)),
         }
     }
@@ -73,11 +79,12 @@ impl fmt::Display for ObjectKind {
             Self::Revision => "revision",
             Self::Statement => "statement",
             Self::Acceptance => "acceptance",
+            Self::Attachment => "attachment",
         })
     }
 }
 
-/// An object with structure: every kind but blobs.
+/// An object with structure: every kind but blobs and attachments.
 pub trait Record: Field {
     /// The kind every encoding of this record starts with.
     const KIND: ObjectKind;
@@ -96,8 +103,10 @@ macro_rules! object {
         /// A decoded object.
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub enum Object {
-            /// File contents, a description or a payload.
+            /// A file's content.
             Blob(Vec<u8>),
+            /// A revision's description or a statement's payload.
+            Attachment(Vec<u8>),
             $(#[doc = concat!("A ", stringify!($record), ".")] $record($record),)*
         }
 
@@ -107,6 +116,7 @@ macro_rules! object {
             pub fn kind(&self) -> ObjectKind {
                 match self {
                     Self::Blob(_) => ObjectKind::Blob,
+                    Self::Attachment(_) => ObjectKind::Attachment,
                     $(Self::$record(_) => $record::KIND,)*
                 }
             }
@@ -116,6 +126,7 @@ macro_rules! object {
             pub fn encode(&self) -> EncodedObject {
                 match self {
                     Self::Blob(content) => EncodedObject::blob(content),
+                    Self::Attachment(content) => EncodedObject::attachment(content),
                     $(Self::$record(record) => record.encode(),)*
                 }
             }
@@ -130,6 +141,7 @@ macro_rules! object {
             pub fn decode(&self) -> Result<Object, DecodeError> {
                 match self.kind()? {
                     ObjectKind::Blob => Ok(Object::Blob(self.bytes[1..].to_vec())),
+                    ObjectKind::Attachment => Ok(Object::Attachment(self.bytes[1..].to_vec())),
                     $(ObjectKind::$record => self.decode_as().map(Object::$record),)*
                 }
             }
@@ -169,9 +181,24 @@ impl EncodedObject {
     /// # Errors
     ///
     /// Fails if reading fails.
-    pub fn read_blob(mut reader: impl Read, len_hint: usize) -> io::Result<Self> {
+    pub fn read_blob(reader: impl Read, len_hint: usize) -> io::Result<Self> {
+        Self::read_raw(ObjectKind::Blob, reader, len_hint)
+    }
+
+    /// Encodes an attachment, reading its content to the end, like
+    /// [`EncodedObject::read_blob`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if reading fails.
+    pub fn read_attachment(reader: impl Read, len_hint: usize) -> io::Result<Self> {
+        Self::read_raw(ObjectKind::Attachment, reader, len_hint)
+    }
+
+    /// Encodes content read to the end as is, as an object of `kind`.
+    fn read_raw(kind: ObjectKind, mut reader: impl Read, len_hint: usize) -> io::Result<Self> {
         let mut bytes = Vec::with_capacity(len_hint + 1);
-        bytes.push(ObjectKind::Blob as u8);
+        bytes.push(kind as u8);
         reader.read_to_end(&mut bytes)?;
         Ok(Self::hash(bytes))
     }
@@ -179,8 +206,19 @@ impl EncodedObject {
     /// Encodes a blob from its content.
     #[must_use]
     pub fn blob(content: &[u8]) -> Self {
+        Self::raw(ObjectKind::Blob, content)
+    }
+
+    /// Encodes an attachment from its content.
+    #[must_use]
+    pub fn attachment(content: &[u8]) -> Self {
+        Self::raw(ObjectKind::Attachment, content)
+    }
+
+    /// Encodes content as is, as an object of `kind`.
+    fn raw(kind: ObjectKind, content: &[u8]) -> Self {
         let mut bytes = Vec::with_capacity(content.len() + 1);
-        bytes.push(ObjectKind::Blob as u8);
+        bytes.push(kind as u8);
         bytes.extend_from_slice(content);
         Self::hash(bytes)
     }
@@ -230,7 +268,22 @@ impl EncodedObject {
     ///
     /// Fails if the object is not a blob.
     pub fn blob_content(&self) -> Result<&[u8], DecodeError> {
-        self.expect_kind(ObjectKind::Blob)?;
+        self.content(ObjectKind::Blob)
+    }
+
+    /// An attachment's content, without copying it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the object is not an attachment: a blob, a file's content,
+    /// is never read as one.
+    pub fn attachment_content(&self) -> Result<&[u8], DecodeError> {
+        self.content(ObjectKind::Attachment)
+    }
+
+    /// The content of an object of `kind` stored as is.
+    fn content(&self, kind: ObjectKind) -> Result<&[u8], DecodeError> {
+        self.expect_kind(kind)?;
         Ok(&self.bytes[1..])
     }
 

@@ -3,6 +3,7 @@
 
 pub mod ancestry;
 pub mod annotations;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod conflict;
@@ -14,6 +15,7 @@ pub mod http;
 pub mod index;
 pub mod oplog;
 pub mod output;
+pub mod permissions;
 pub mod policy;
 pub mod queue;
 pub mod remote;

@@ -166,6 +166,7 @@ fn a_move_that_cannot_fetch_moves_nothing() {
     let url = origin.root().to_str().unwrap();
     let clone = Repo::clone(&ada, url, &[]);
     clone.ok(&["fetch", "--change", &change]);
+    let own = clone.change();
 
     // The remote is gone while `edit` needs the change's files from it.
     let away = origin.root().with_extension("away");
@@ -179,4 +180,9 @@ fn a_move_that_cannot_fetch_moves_nothing() {
     fs::rename(&away, origin.root()).unwrap();
     clone.ok(&["edit", &change]);
     assert_eq!(clone.read("x"), "x\n");
+
+    // A move that needs nothing from it works without it.
+    fs::rename(origin.root(), &away).unwrap();
+    clone.ok(&["edit", &own]);
+    assert_eq!(clone.read("notes"), "mine\n");
 }

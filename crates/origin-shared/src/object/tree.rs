@@ -96,6 +96,20 @@ impl fmt::Display for EntryKind {
     }
 }
 
+impl std::str::FromStr for EntryKind {
+    type Err = String;
+
+    fn from_str(kind: &str) -> Result<Self, Self::Err> {
+        match kind {
+            "file" => Ok(Self::File),
+            "executable" => Ok(Self::Executable),
+            "symlink" => Ok(Self::Symlink),
+            "directory" => Ok(Self::Tree),
+            _ => Err(format!("invalid entry kind `{kind}`")),
+        }
+    }
+}
+
 /// One entry of a tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TreeEntry {
