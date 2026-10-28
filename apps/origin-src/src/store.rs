@@ -99,10 +99,10 @@ impl<P: Platform> Store<P> {
     }
 
     /// Removes the temporary files that crashed writes left behind: those
-    /// older than [`Store::STALE_TEMP`]. It walks every loose object, so
-    /// only garbage collection calls it. It leaves the packs directory to
-    /// the compactor, which removes what crashed compactions left there
-    /// under its lock, so a long compaction never loses its pack.
+    /// older than an hour. It walks every loose object, so only garbage
+    /// collection calls it. It leaves the packs directory to the compactor,
+    /// which removes what crashed compactions left there under its lock, so
+    /// a long compaction never loses its pack.
     ///
     /// # Errors
     ///
