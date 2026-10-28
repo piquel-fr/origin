@@ -1,9 +1,10 @@
-//! Target names.
+//! Target names, and where a target is.
 
 use std::borrow::Cow;
+use std::fmt;
 
-use crate::TargetId;
 use crate::name::names;
+use crate::{AcceptanceId, TargetId};
 
 names! {
     /// The name of a target, such as `main` or `release/v3`: `/`-separated
@@ -36,6 +37,23 @@ impl TargetName {
     #[must_use]
     pub fn id(&self) -> TargetId {
         TargetId::of(self.as_str())
+    }
+}
+
+/// The latest acceptance of a target.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+pub struct Head {
+    /// Its position in the log, from 0.
+    pub seq: u64,
+    /// The acceptance.
+    pub acceptance: AcceptanceId,
+}
+
+impl fmt::Display for Head {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "acceptance {} ({})", self.seq, self.acceptance.short())
     }
 }
 
