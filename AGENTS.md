@@ -9,8 +9,8 @@ review bots read and write at the same time, written in Rust.
 - `crates/origin-shared`: the object model, wire formats, and API contracts
   shared by every component.
 - `crates/origin-platform`: everything that differs between platforms
-  (durable writes, file locks, copy-on-write clones, refusing network file
-  systems), behind traits. It is the only place that may depend on the
+  (durable writes, file locks, copy-on-write clones, positioned reads,
+  refusing network file systems), behind traits. It is the only place that may depend on the
   target OS.
 - `crates/origin-client`: the HTTP client, generated from the server's OpenAPI
   document. Never edit generated code by hand.
