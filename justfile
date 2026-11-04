@@ -27,3 +27,7 @@ doc-test:
 
 deny:
     @cargo deny check
+
+# Micro-benchmarks of the hot paths (hashing, storage).
+bench *ARGS:
+    @cargo bench --locked --workspace -- {{ARGS}}
