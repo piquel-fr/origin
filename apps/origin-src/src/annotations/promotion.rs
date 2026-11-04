@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use origin_platform::Platform;
-use origin_shared::{Principal, Record, RecordId, RevisionId, Statement, StatementId, TreeId};
+use origin_shared::{Principal, Record, RecordId, Statement, StatementId, TreeId};
 
 use super::Annotations;
 use crate::store::{Store, StoreError};
@@ -134,13 +134,14 @@ impl<P: Platform> Annotations<'_, P> {
         self.index.remember_digests(self.store, &digests.concat())
     }
 
-    /// The statements promoting results to `revision`, as `issuer` would
+    /// The statements promoting results to `subject`, as `issuer` would
     /// issue them, without writing them, sorted by kind: for each
     /// [promotion group](Statement::promotion_group), the latest statement
-    /// about another record with the same input digest as the revision,
+    /// about another record with the same input digest as the subject,
     /// unless its issuer superseded it. Groups whose kind and issuer the
-    /// revision already has a result of, directly or promoted, are skipped:
-    /// a result that ran there wins.
+    /// subject already has a result of, directly or promoted, are skipped:
+    /// a result that ran there wins. A statement has no snapshot, so
+    /// nothing is promoted to one.
     ///
     /// # Errors
     ///
@@ -148,11 +149,12 @@ impl<P: Platform> Annotations<'_, P> {
     /// be remembered.
     pub fn promotions(
         &mut self,
-        revision: RevisionId,
+        subject: RecordId,
         issuer: &Principal,
     ) -> Result<Vec<Statement>, StoreError> {
-        let subject = RecordId::Revision(revision);
-        let snapshot = self.store.get(revision)?.snapshot;
+        let Some(snapshot) = self.store.snapshot_of(subject)? else {
+            return Ok(Vec::new());
+        };
         self.compute_digests()?;
 
         // The results the revision has that hold, by kind and original
@@ -197,7 +199,7 @@ impl<P: Platform> Annotations<'_, P> {
         Ok(promotions)
     }
 
-    /// Issues the [`promotions`](Self::promotions) to `revision` as
+    /// Issues the [`promotions`](Self::promotions) to `subject` as
     /// `issuer`, returning them.
     ///
     /// # Errors
@@ -206,10 +208,10 @@ impl<P: Platform> Annotations<'_, P> {
     /// be written.
     pub fn promote(
         &mut self,
-        revision: RevisionId,
+        subject: RecordId,
         issuer: &Principal,
     ) -> Result<Vec<(StatementId, Statement)>, StoreError> {
-        let promotions = self.promotions(revision, issuer)?;
+        let promotions = self.promotions(subject, issuer)?;
         let encoded: Vec<_> = promotions.iter().map(Statement::encode).collect();
         self.store.write_all(&encoded)?;
         Ok(encoded
