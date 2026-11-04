@@ -12,11 +12,12 @@ use divan::{Bencher, black_box};
 use origin_platform::{
     CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Native, Platform, ReadAt,
 };
+use origin_shared::event::Filter;
 use origin_shared::{
     AcceptanceBody, Base, ChangeId, EncodedObject, Kind, NodeKey, Record, RecordId, Revision,
     Statement, TargetName, Tree, TreeId, Verdict,
 };
-use origin_src::events::{Events, Filter};
+use origin_src::events::Events;
 use origin_src::index::Index;
 use origin_src::store::Store;
 

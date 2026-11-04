@@ -4,6 +4,9 @@ unmaintained = "workspace"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+skip = [
+  { crate = "syn@2.0.119", reason = "divan-macros and tracing-attributes have not moved to syn 3 yet" },
+]
 
 [licenses]
 confidence-threshold = 0.8
