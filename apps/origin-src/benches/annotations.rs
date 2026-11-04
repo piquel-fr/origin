@@ -182,7 +182,7 @@ fn promotions_cached(bencher: Bencher<'_, '_>) {
     let mut annotations = Annotations::open(&store).unwrap();
     assert_eq!(
         annotations
-            .promotions(RecordId::Revision(target), &issuer)
+            .promotions(RecordId::Revision(target), &issuer, |_| Ok(true))
             .unwrap()
             .len(),
         9
@@ -193,7 +193,7 @@ fn promotions_cached(bencher: Bencher<'_, '_>) {
         .with_inputs(|| Annotations::new(&store, index.clone()))
         .bench_local_refs(|annotations| {
             annotations
-                .promotions(RecordId::Revision(target), &issuer)
+                .promotions(RecordId::Revision(target), &issuer, |_| Ok(true))
                 .unwrap()
         });
 }
@@ -214,7 +214,7 @@ fn promotions_uncached(bencher: Bencher<'_, '_>) {
         })
         .bench_local_refs(|annotations| {
             annotations
-                .promotions(RecordId::Revision(target), &issuer)
+                .promotions(RecordId::Revision(target), &issuer, |_| Ok(true))
                 .unwrap()
         });
 }

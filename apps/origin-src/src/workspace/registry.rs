@@ -3,8 +3,8 @@
 //!
 //! The main working copy's `.origin/workspaces/` has a file for each other
 //! workspace, named by the hash of its root and holding that root. Records
-//! are immutable, and only target chains and the index are locked, so
-//! commands run concurrently in different workspaces.
+//! are immutable, and only target chains, the index and each working copy
+//! are locked, so commands run concurrently in different workspaces.
 //!
 //! Creating a workspace registers it, checks out its files, and only then
 //! publishes its `.origin/workspace`, so a crash never leaves partial files
@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{self, Path, PathBuf};
 
 use origin_platform::DurableWrite;
-use origin_shared::{ChangeId, Digest, EncodedObject, Record, Revision, Tree};
+use origin_shared::{ChangeId, Digest, EncodedObject, Record, RecordId, Revision, Tree};
 
 use super::{Workspace, WorkspaceError};
 use crate::oplog::Why;
@@ -49,7 +49,7 @@ impl Workspace {
             let head = Self::single_head(&working_copy.index, change)?;
             (head, self.store.get(head)?, Vec::new())
         } else {
-            let description = EncodedObject::blob(b"");
+            let description = EncodedObject::attachment(b"");
             let base = working_copy.revision.base;
             let revision = Revision {
                 change: ChangeId::random().map_err(WorkspaceError::Random)?,
@@ -73,7 +73,7 @@ impl Workspace {
         let store = store.with_actor(self.store.actor().in_workspace(&root));
         let mut workspace = Self::at(root, store, self.config.clone(), id);
         let empty = Tree::default().encode().id().into();
-        let changes = workspace.changes(empty, revision.snapshot)?;
+        let changes = workspace.changes(empty, RecordId::Revision(id))?;
         workspace.checkout(&changes, None)?;
         let repository = Self::path_bytes(self.store.root());
         workspace.write_durably(workspace.meta(Self::REPOSITORY), &repository)?;
@@ -115,7 +115,10 @@ impl Workspace {
     /// Fails if `path` is the main working copy or no workspace, if the
     /// workspace is behind its change with edits, which no revision holds
     /// then, or if it cannot be snapshotted or deleted.
-    pub fn remove_workspace(&self, path: &Path) -> Result<(), WorkspaceError> {
+    pub fn remove_workspace(&mut self, path: &Path) -> Result<(), WorkspaceError> {
+        // It works in the workspace it removes, which may be this one, and
+        // opening it takes its lock.
+        self.lock = None;
         let root = Self::canonical(path)?;
         if root == self.main_root() {
             return Err(WorkspaceError::RemoveMain(root));

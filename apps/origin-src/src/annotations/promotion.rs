@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use origin_platform::Platform;
-use origin_shared::{Principal, Record, RecordId, Statement, StatementId, TreeId};
+use origin_shared::{Principal, Record, RecordId, Statement, StatementId};
 
 use super::Annotations;
 use crate::store::{Store, StoreError};
@@ -135,10 +135,12 @@ impl<P: Platform> Annotations<'_, P> {
     }
 
     /// The statements promoting results to `subject`, as `issuer` would
-    /// issue them, without writing them, sorted by kind: for each
+    /// issue them for a caller who `sees` some records, without writing
+    /// them, sorted by kind: for each
     /// [promotion group](Statement::promotion_group), the latest statement
-    /// about another record with the same input digest as the subject,
-    /// unless its issuer superseded it. Groups whose kind and issuer the
+    /// about another record the caller sees with the same input digest as
+    /// the subject, unless its issuer superseded it. So a promotion never
+    /// copies a result, and its payload, that the caller can't read. Groups whose kind and issuer the
     /// subject already has a result of, directly or promoted, are skipped:
     /// a result that ran there wins. A statement has no snapshot, so
     /// nothing is promoted to one.
@@ -151,6 +153,7 @@ impl<P: Platform> Annotations<'_, P> {
         &mut self,
         subject: RecordId,
         issuer: &Principal,
+        mut sees: impl FnMut(RecordId) -> Result<bool, StoreError>,
     ) -> Result<Vec<Statement>, StoreError> {
         let Some(snapshot) = self.store.snapshot_of(subject)? else {
             return Ok(Vec::new());
@@ -182,7 +185,7 @@ impl<P: Platform> Annotations<'_, P> {
                     continue;
                 }
                 let statement = self.store.get(id)?;
-                if self.superseded_by(id, &statement)?.is_none() {
+                if self.superseded_by(id, &statement)?.is_none() && sees(statement.subject)? {
                     promotions.push(Statement {
                         subject,
                         issuer: issuer.clone(),
@@ -200,7 +203,7 @@ impl<P: Platform> Annotations<'_, P> {
     }
 
     /// Issues the [`promotions`](Self::promotions) to `subject` as
-    /// `issuer`, returning them.
+    /// `issuer`, for a caller who `sees` some records, returning them.
     ///
     /// # Errors
     ///
@@ -210,8 +213,9 @@ impl<P: Platform> Annotations<'_, P> {
         &mut self,
         subject: RecordId,
         issuer: &Principal,
+        sees: impl FnMut(RecordId) -> Result<bool, StoreError>,
     ) -> Result<Vec<(StatementId, Statement)>, StoreError> {
-        let promotions = self.promotions(subject, issuer)?;
+        let promotions = self.promotions(subject, issuer, sees)?;
         let encoded: Vec<_> = promotions.iter().map(Statement::encode).collect();
         self.store.write_all(&encoded)?;
         Ok(encoded
@@ -223,21 +227,6 @@ impl<P: Platform> Annotations<'_, P> {
 }
 
 impl<P: Platform> Store<P> {
-    /// The snapshot of a record a statement is about, which its input
-    /// digest is taken from. Statements have none.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the record cannot be read.
-    pub fn snapshot_of(&self, subject: RecordId) -> Result<Option<TreeId>, StoreError> {
-        Ok(match subject {
-            RecordId::Snapshot(id) => Some(id),
-            RecordId::Revision(id) => Some(self.get(id)?.snapshot),
-            RecordId::Acceptance(id) => Some(self.get(id)?.body().state),
-            RecordId::Statement(_) => None,
-        })
-    }
-
     /// Checks the claim `statement`, `id`, makes. A statement that promotes
     /// none makes its own. A promotion must name an original the store has
     /// that is [promotable](Statement::is_promotable), match its kind,
