@@ -178,8 +178,8 @@ impl Conflicts {
     }
 
     /// The conflicts a `core.conflict` statement lists. Its payload is the
-    /// list, which a repository always keeps, so one it lacks fails rather
-    /// than reading as no conflicts.
+    /// list, which retention keeps, as it does every reserved kind's, so
+    /// one the repository lacks fails rather than reading as no conflicts.
     ///
     /// # Errors
     ///
