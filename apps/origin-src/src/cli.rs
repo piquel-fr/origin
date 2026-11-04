@@ -1,0 +1,140 @@
+//! The `origin` command line: argument parsing. The commands themselves are
+//! methods of [`Workspace`], which print their output.
+
+use std::env;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use origin_shared::TargetName;
+
+use crate::config::UserConfig;
+use crate::workspace::Workspace;
+
+/// A modern, git-compatible source control system.
+#[derive(Debug, Parser)]
+#[command(version)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Create a repository, with the targets `policy` and `main`.
+    Init {
+        /// Where to create it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    #[command(flatten)]
+    Workspace(WorkspaceCommand),
+}
+
+/// Commands run in the repository containing the current directory. Those
+/// that read the working copy snapshot it first. Changes are named by a
+/// unique prefix of their id, or `@` for the working copy's.
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    /// Show the working copy's change and the files it changes.
+    Status,
+    /// Show the working copy's changes, line by line.
+    Diff,
+    /// Show a change and its diff: the working copy's by default.
+    Show {
+        /// The change.
+        change: Option<String>,
+    },
+    /// Finish the current change, and start a new one on top of it.
+    New {
+        /// What the new change is for.
+        #[arg(default_value = "")]
+        description: String,
+    },
+    /// Describe what the current change is for.
+    Describe {
+        /// The description.
+        description: String,
+    },
+    /// Switch the working copy to a change.
+    Edit {
+        /// The change.
+        change: String,
+    },
+    /// Give a change up, keeping it and the reason for others to see.
+    Abandon {
+        /// The change: the working copy's by default, which then starts a
+        /// new change where it started.
+        change: Option<String>,
+        /// Why it was given up.
+        #[arg(long)]
+        reason: String,
+    },
+    /// End a change's divergence, with a revision evolving from every head.
+    Converge {
+        /// The change.
+        change: String,
+    },
+    /// Show the working copy's changes and the target they're on.
+    Log {
+        /// Show this target's history instead.
+        target: Option<TargetName>,
+        /// Show at most this many acceptances.
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+    },
+    /// Show every revision of a change.
+    Evolog {
+        /// The change.
+        #[arg(default_value = "@")]
+        change: String,
+    },
+    /// Manage the record index.
+    #[command(subcommand)]
+    Index(IndexCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexCommand {
+    /// Rebuild the index from the store.
+    Rebuild,
+}
+
+impl Cli {
+    /// Runs the command, printing its output.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the command fails; the error is meant for the user.
+    pub fn run(self) -> Result<()> {
+        let config = UserConfig::load()?;
+        match self.command {
+            Command::Init { path } => {
+                Workspace::init(&path, config)?;
+            }
+            Command::Workspace(command) => command.run(config)?,
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceCommand {
+    fn run(self, config: UserConfig) -> Result<()> {
+        let cwd = env::current_dir().context("cannot read the current directory")?;
+        let mut workspace = Workspace::discover(&cwd, config)?;
+        match self {
+            Self::Status => workspace.status()?,
+            Self::Diff => workspace.diff()?,
+            Self::Show { change } => workspace.show(change.as_deref())?,
+            Self::New { description } => workspace.new_change(&description)?,
+            Self::Describe { description } => workspace.describe(&description)?,
+            Self::Edit { change } => workspace.edit(&change)?,
+            Self::Abandon { change, reason } => workspace.abandon(change.as_deref(), &reason)?,
+            Self::Converge { change } => workspace.converge(&change)?,
+            Self::Log { target, limit } => workspace.log(target, limit)?,
+            Self::Evolog { change } => workspace.evolog(&change)?,
+            Self::Index(IndexCommand::Rebuild) => workspace.rebuild_index()?,
+        }
+        Ok(())
+    }
+}
