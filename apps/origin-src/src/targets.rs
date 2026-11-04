@@ -525,7 +525,9 @@ mod tests {
         assert_eq!(
             store.platform.0.into_inner().unwrap(),
             [
-                Synced::Batch(1),
+                // The acceptance and the index log, which costs no sync of
+                // its own.
+                Synced::Batch(2),
                 Synced::Dir(dir.path().join(".origin/objects/loose")),
                 Synced::Dir(dir.path().join(".origin/objects/loose").join(&hex[..2])),
                 Synced::File,
