@@ -1,5 +1,5 @@
-//! Statements: issuing them, reading them, and promoting them by input
-//! digest.
+//! Statements: issuing them, reading them, promoting them by input digest,
+//! and dropping their payloads once retention ends.
 //!
 //! Core interprets only the reserved kinds: [`Kind::ABANDON`],
 //! [`Kind::CONFLICT`] and [`Kind::DIVERGENT`], and only from the issuers
@@ -9,6 +9,7 @@
 //! names still stands.
 
 mod promotion;
+mod retention;
 
 use std::collections::HashSet;
 
@@ -21,6 +22,7 @@ use crate::index::Index;
 use crate::store::{Store, StoreError};
 
 pub use promotion::{Claim, InvalidPromotion};
+pub use retention::Dropped;
 
 /// The statements of a store, through its index.
 #[derive(Debug)]
