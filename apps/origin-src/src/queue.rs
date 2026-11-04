@@ -592,9 +592,12 @@ impl<P: Platform> Session<'_, '_, P> {
     /// Checks the policy for `candidate`, and lands it if its evidence is
     /// there, or keeps it waiting. Writes the records in layers, each
     /// durable before the next refers to it: the trees, then the rebased
-    /// revision, then the promoted statements and the acceptance.
+    /// revision, then the promoted statements and the acceptance. The
+    /// promotions refer to their originals' payloads without writing them,
+    /// so it [holds the objects](Store::hold_objects) throughout.
     fn submit(&mut self, candidate: Candidate) -> Result<Landing, LandError> {
         let store = self.queue.store;
+        let _held = store.hold_objects()?;
         if !candidate.trees.is_empty() {
             store.write_all(&candidate.trees)?;
         }
