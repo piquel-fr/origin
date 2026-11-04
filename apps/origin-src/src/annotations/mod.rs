@@ -98,12 +98,13 @@ impl<'a, P: Platform> Annotations<'a, P> {
     }
 
     /// Writes a statement after its payload, which is durable before
-    /// anything refers to it.
+    /// anything refers to it, and stays until then.
     fn write(
         &self,
         statement: &Statement,
         payload: Option<EncodedObject>,
     ) -> Result<StatementId, StoreError> {
+        let _held = self.store.hold_objects()?;
         if let Some(payload) = payload {
             self.store.write_all(&[payload])?;
         }
