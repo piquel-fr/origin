@@ -8,8 +8,10 @@
 //!   file. A pack can be read on its own, start to end.
 //! - `<id>.idx`: [`Pack::INDEX_MAGIC`], the ids of the pack's objects in
 //!   ascending order, then where each one's compressed encoding is in the
-//!   pack: a `u64` offset and a `u32` length. The pack's id is the hash of
-//!   its object ids, which opening the pack verifies.
+//!   pack and when this node stored the object: a `u64` offset, a `u32`
+//!   length and a `u64` time in seconds since the Unix epoch, the
+//!   modification time of the object's loose file. The pack's id is the
+//!   hash of its object ids, which opening the pack verifies.
 //! - `manifest`: the ids of the packs in use, one per line in hex, largest
 //!   pack first. Replacing it publishes and retires packs at once.
 //! - `lock`: held by the compactor, so only one ever runs.
@@ -36,12 +38,13 @@
 //! readers also reload the manifest every few seconds, to let go of the
 //! packs it no longer names.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use origin_platform::{LockMode, LockedFile, Platform, ReadAt};
 use origin_shared::{Digest, ObjectId};
@@ -107,28 +110,39 @@ pub(super) struct Pack {
     index: Vec<u8>,
 }
 
-/// Where a compressed encoding is in a pack.
+/// Where a compressed encoding is in a pack, and when this node stored the
+/// object, which packing keeps so retention counts from the first write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Location {
     offset: u64,
     len: u32,
+    /// Seconds since the Unix epoch.
+    stored: u64,
 }
 
 impl Location {
     /// The length of an encoded location.
-    const LEN: usize = 8 + 4;
+    const LEN: usize = 8 + 4 + 8;
 
     fn encode(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.offset.to_le_bytes());
         out.extend_from_slice(&self.len.to_le_bytes());
+        out.extend_from_slice(&self.stored.to_le_bytes());
     }
 
     fn decode(bytes: &[u8; Self::LEN]) -> Self {
-        let (offset, len) = bytes.split_at(8);
+        let (offset, rest) = bytes.split_at(8);
+        let (len, stored) = rest.split_at(4);
         Self {
             offset: u64::from_le_bytes(offset.try_into().expect("8 bytes")),
             len: u32::from_le_bytes(len.try_into().expect("4 bytes")),
+            stored: u64::from_le_bytes(stored.try_into().expect("8 bytes")),
         }
+    }
+
+    /// When this node stored the object.
+    pub(super) fn stored(self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.stored)
     }
 }
 
@@ -324,7 +338,7 @@ impl<P: Platform> Store<P> {
     }
 
     /// Loads the manifest's packs, unless they're already loaded.
-    fn reload_packs(&self) -> Result<(), StoreError> {
+    pub(super) fn reload_packs(&self) -> Result<(), StoreError> {
         let dir = self.packs_dir();
         let path = dir.join(Self::MANIFEST);
         let mut missing_from = None;
@@ -489,32 +503,86 @@ impl<P: Platform> Store<P> {
         }
         sources.sort_unstable_by_key(|&(id, _)| id);
         sources.dedup_by_key(|&mut (id, _)| id);
-        let id = self.write_pack(&dir, &sources, merged)?;
-
-        let mut manifest: Vec<_> = kept.iter().map(|pack| (pack.len(), pack.id)).collect();
-        manifest.push((sources.len(), id));
-        manifest.sort_by_key(|&(len, _)| std::cmp::Reverse(len));
-        let manifest: String = manifest.iter().map(|(_, id)| id.to_hex() + "\n").collect();
-        let write = self.durable_write();
-        write.stage(dir.join(Self::MANIFEST), manifest.as_bytes())?;
-        write.commit()?;
-        self.reload_packs()?;
+        self.replace_packs(&dir, kept, merged, &sources)?;
 
         // Everything below is published in the new pack. A crash before
         // these files are gone leaves duplicates for the next compaction.
-        for pack in merged {
-            for extension in ["idx", "pack"] {
-                Self::remove(&Pack::file_path(&dir, pack.id, extension))?;
-            }
-        }
         Self::on_every_core(&loose, |ids| {
-            ids.iter().try_for_each(|&id| Self::remove(&self.path(id)))
+            ids.iter()
+                .try_for_each(|&id| Self::remove_file(&self.path(id)))
         })
         .into_iter()
         .collect::<Result<(), _>>()?;
         compaction.packed = loose.len();
         compaction.merged = merged.len();
         Ok(Some(compaction))
+    }
+
+    /// Removes `ids` from the packs, rewriting each pack that holds one
+    /// into a single new pack without them, and returns the bytes of
+    /// compressed encodings that freed. Waits for a compaction running.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::compact`].
+    pub(super) fn remove_packed(&self, ids: &HashSet<ObjectId>) -> Result<u64, StoreError> {
+        let dir = self.packs_dir();
+        let _lock = LockedFile::open(&self.platform, &dir.join(Self::LOCK), LockMode::Exclusive)?;
+        self.reload_packs()?;
+        let (rewritten, kept): (Vec<_>, Vec<_>) = self
+            .packs
+            .loaded()
+            .into_iter()
+            .partition(|pack| pack.entries().any(|(id, _)| ids.contains(&id)));
+        if rewritten.is_empty() {
+            return Ok(0);
+        }
+        let mut freed = 0;
+        let mut sources = Vec::new();
+        for (position, pack) in rewritten.iter().enumerate() {
+            for (id, location) in pack.entries() {
+                if ids.contains(&id) {
+                    freed += u64::from(location.len);
+                } else {
+                    sources.push((id, Source::Packed(position, location)));
+                }
+            }
+        }
+        sources.sort_unstable_by_key(|&(id, _)| id);
+        sources.dedup_by_key(|&mut (id, _)| id);
+        self.replace_packs(&dir, &kept, &rewritten, &sources)?;
+        Ok(freed)
+    }
+
+    /// Publishes a manifest naming `kept` and a new pack of `sources`,
+    /// sorted by id, unless there are none, then removes the files of
+    /// `retired`. Only the compactor writes packs, so it must hold the
+    /// lock.
+    fn replace_packs(
+        &self,
+        dir: &Path,
+        kept: &[Arc<Pack>],
+        retired: &[Arc<Pack>],
+        sources: &[(ObjectId, Source)],
+    ) -> Result<(), StoreError> {
+        let mut manifest: Vec<_> = kept.iter().map(|pack| (pack.len(), pack.id)).collect();
+        if !sources.is_empty() {
+            manifest.push((sources.len(), self.write_pack(dir, sources, retired)?));
+        }
+        manifest.sort_by_key(|&(len, _)| std::cmp::Reverse(len));
+        let manifest: String = manifest.iter().map(|(_, id)| id.to_hex() + "\n").collect();
+        let write = self.durable_write();
+        write.stage(dir.join(Self::MANIFEST), manifest.as_bytes())?;
+        write.commit()?;
+        self.reload_packs()?;
+        // A crash before these files are gone leaves them for the next
+        // compaction.
+        for pack in retired {
+            for extension in ["idx", "pack"] {
+                Self::remove_file(&Pack::file_path(dir, pack.id, extension))?;
+            }
+        }
+        Ok(())
     }
 
     /// Writes a pack of `sources`, sorted by id, and its index, durably,
@@ -544,11 +612,16 @@ impl<P: Platform> Store<P> {
                         .collect::<Result<Vec<_>, _>>()
                 });
                 for read in read {
-                    for (len, bytes) in read? {
+                    for (len, stored, bytes) in read? {
                         file.write_all(&len.to_le_bytes())?;
                         file.write_all(&bytes)?;
                         offset += 4;
-                        Location { offset, len }.encode(&mut index);
+                        Location {
+                            offset,
+                            len,
+                            stored,
+                        }
+                        .encode(&mut index);
                         offset += u64::from(len);
                     }
                 }
@@ -560,24 +633,36 @@ impl<P: Platform> Store<P> {
         Ok(id)
     }
 
-    /// Reads the compressed encoding of `id` from `source`, and its length.
+    /// Reads the compressed encoding of `id` from `source`, with its length
+    /// and when this node stored it, in seconds since the Unix epoch.
     fn read_source(
         &self,
         id: ObjectId,
         source: Source,
         merged: &[Arc<Pack>],
-    ) -> Result<(u32, Vec<u8>), StoreError> {
+    ) -> Result<(u32, u64, Vec<u8>), StoreError> {
         match source {
             Source::Loose => {
                 let path = self.path(id);
-                let bytes = fs::read(&path).map_err(|source| StoreError::io(&path, source))?;
+                let io_error = |source| StoreError::io(&path, source);
+                let mut file = File::open(&path).map_err(io_error)?;
+                let modified = file.metadata().and_then(|metadata| metadata.modified());
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(io_error)?;
                 let len = u32::try_from(bytes.len())
-                    .map_err(|_| StoreError::io(&path, io::ErrorKind::FileTooLarge.into()))?;
-                Ok((len, bytes))
+                    .map_err(|_| io_error(io::ErrorKind::FileTooLarge.into()))?;
+                // A time before the epoch counts as the epoch.
+                let stored = modified
+                    .map_err(io_error)?
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs());
+                Ok((len, stored, bytes))
             }
-            Source::Packed(pack, location) => {
-                Ok((location.len, merged[pack].read(&self.platform, location)?))
-            }
+            Source::Packed(pack, location) => Ok((
+                location.len,
+                location.stored,
+                merged[pack].read(&self.platform, location)?,
+            )),
         }
     }
 
@@ -593,7 +678,7 @@ impl<P: Platform> Store<P> {
         for entry in fs::read_dir(dir).map_err(|source| StoreError::io(dir, source))? {
             let entry = entry.map_err(|source| StoreError::io(dir, source))?;
             if !keep.iter().any(|name| entry.file_name() == name.as_str()) {
-                Self::remove(&entry.path())?;
+                Self::remove_file(&entry.path())?;
             }
         }
         Ok(())
@@ -623,7 +708,7 @@ impl<P: Platform> Store<P> {
                         continue;
                     };
                     if packs.iter().any(|pack| pack.find(id).is_some()) {
-                        Self::remove(&entry.path())?;
+                        Self::remove_file(&entry.path())?;
                         duplicates += 1;
                     } else if entry.metadata().map_err(io_error)?.len() <= Self::PACKED_MAX {
                         small.push(id);
@@ -642,7 +727,7 @@ impl<P: Platform> Store<P> {
     }
 
     /// Removes a file, unless it's already gone.
-    fn remove(path: &Path) -> Result<(), StoreError> {
+    fn remove_file(path: &Path) -> Result<(), StoreError> {
         match fs::remove_file(path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 Err(StoreError::io(path, error))
@@ -824,6 +909,39 @@ mod tests {
             store.platform.0.into_inner().unwrap(),
             [Synced::Batch(0), Synced::Dir(packs)]
         );
+    }
+
+    #[test]
+    fn removes_packed_objects_and_keeps_when_each_was_stored() {
+        let (_dir, store) = store();
+        let first = objects(0, 10);
+        store.write_all(&first).unwrap();
+        let secs = |id| {
+            store
+                .stored_at(id)
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let stored = secs(first[0].id());
+        store.compact().unwrap();
+        store.write_all(&objects(10, 10)).unwrap();
+        assert_eq!(store.compact().unwrap().unwrap().merged, 1);
+        assert_eq!(secs(first[0].id()), stored, "packing keeps it, merging too");
+
+        let loose = EncodedObject::blob(b"loose");
+        store.write_all(slice::from_ref(&loose)).unwrap();
+        let doomed = [first[0].id(), first[1].id(), loose.id()];
+        assert!(store.remove(&doomed).unwrap() > 0);
+        let fresh = Store::new(&store.root, Native::default());
+        for id in doomed {
+            assert!(!fresh.contains(id).unwrap(), "{id}");
+        }
+        assert_readable(&fresh, &first[2..]);
+        assert_readable(&fresh, &objects(10, 10));
+        assert_eq!(pack_files(&store).len(), 4, "the old pack is removed");
+        assert_eq!(store.remove(&doomed).unwrap(), 0, "already gone");
     }
 
     #[test]
