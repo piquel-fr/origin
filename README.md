@@ -29,6 +29,7 @@ origin index rebuild                # rebuild the record index from the store
 origin annotate @ ci.test --pass --inputs src Cargo.toml   # a statement about a revision
 origin statements [<rev>]           # the statements about a revision
 origin promote [<rev>]              # carry results over from revisions with the same inputs
+origin gc                           # drop expired payloads (policy.toml) and pack objects
 
 origin land [<change>] [--onto <target>]   # land a change and the ones below it
 origin land --from <target> --onto <target> # land a target's tip on another

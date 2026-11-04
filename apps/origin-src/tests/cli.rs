@@ -708,6 +708,10 @@ fn statements_are_promoted_where_their_inputs_are_unchanged() {
             .contains("is a reserved kind")
     );
     assert!(repo.fails(&["annotate", "@", "ci.lint"]).contains("--pass"));
+    assert!(
+        repo.ok(&["gc"])
+            .starts_with("Dropped 0 payloads past their retention")
+    );
 }
 
 #[test]
