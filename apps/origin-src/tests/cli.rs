@@ -1,144 +1,21 @@
 //! End-to-end tests of the change workflow and workspaces, driving the real
 //! `origin` binary.
 
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader};
+mod common;
+
+use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
 use std::slice;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use common::Repo;
 use origin_platform::Native;
 use origin_shared::{
     ChangeId, EncodedObject, Kind, Record, Revision, RevisionId, Statement, StatementId, Verdict,
 };
 use origin_src::store::Store;
-
-/// A temporary working copy, and a user configuration of its own.
-struct Repo {
-    dir: tempfile::TempDir,
-    config: tempfile::TempDir,
-}
-
-impl Repo {
-    fn new() -> Self {
-        let config = tempfile::tempdir().unwrap();
-        fs::write(config.path().join("config.toml"), "user = \"ada\"\n").unwrap();
-        let repo = Self {
-            dir: tempfile::tempdir().unwrap(),
-            config,
-        };
-        repo.ok(&["init"]);
-        repo
-    }
-
-    /// `origin` in `cwd` as the configured user.
-    fn command(&self, cwd: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_origin"));
-        command
-            .args(args)
-            .current_dir(cwd)
-            .env("ORIGIN_CONFIG_DIR", self.config.path());
-        command
-    }
-
-    /// Runs `origin` in `cwd` as the configured user.
-    fn run(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.command(cwd, args).output().unwrap()
-    }
-
-    /// Starts a long-running command, such as `watch`, returning it and its
-    /// output lines as they come.
-    fn spawn(&self, args: &[&str]) -> (Child, mpsc::Receiver<String>) {
-        let mut child = self
-            .command(self.dir.path(), args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let (send, receive) = mpsc::channel();
-        thread::spawn(move || {
-            for line in stdout.lines() {
-                if send.send(line.unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        (child, receive)
-    }
-
-    /// The revision the working copy is, in full.
-    fn revision(&self) -> String {
-        self.read(".origin/workspace").trim_end().to_owned()
-    }
-
-    /// Runs a command that must succeed, returning its output.
-    fn ok(&self, args: &[&str]) -> String {
-        self.ok_in(self.dir.path(), args)
-    }
-
-    /// Runs a command in `cwd` that must succeed, returning its output.
-    fn ok_in(&self, cwd: &Path, args: &[&str]) -> String {
-        let output = self.run(cwd, args);
-        assert!(
-            output.status.success(),
-            "`origin {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    /// Runs a command that must fail, returning its error.
-    fn fails(&self, args: &[&str]) -> String {
-        self.fails_in(self.dir.path(), args)
-    }
-
-    /// Runs `origin` in `cwd`, which must fail, returning its errors.
-    fn fails_in(&self, cwd: &Path, args: &[&str]) -> String {
-        let output = self.run(cwd, args);
-        assert!(
-            !output.status.success(),
-            "`origin {}` succeeded",
-            args.join(" ")
-        );
-        String::from_utf8(output.stderr).unwrap()
-    }
-
-    fn path(&self, path: &str) -> std::path::PathBuf {
-        self.dir.path().join(path)
-    }
-
-    fn write(&self, path: &str, content: &str) {
-        let path = self.path(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
-    }
-
-    fn read(&self, path: &str) -> String {
-        fs::read_to_string(self.path(path)).unwrap()
-    }
-
-    /// The short id of the working copy's change.
-    fn change(&self) -> String {
-        let status = self.ok(&["status"]);
-        let line = status.lines().next().unwrap();
-        let headline = line.strip_prefix("Working copy: ").unwrap();
-        headline.split(' ').next().unwrap().to_owned()
-    }
-
-    /// Creates a workspace at `path`, returning its change.
-    fn workspace(&self, path: &Path, args: &[&str]) -> String {
-        let path = path.to_str().unwrap();
-        let output = self.ok(&[&["workspace", "new", path], args].concat());
-        let line = output.lines().nth(1).unwrap();
-        let headline = line.strip_prefix("Working copy: ").unwrap();
-        headline.split(' ').next().unwrap().to_owned()
-    }
-}
 
 #[test]
 fn the_working_copy_is_a_revision_of_the_current_change() {
@@ -588,7 +465,7 @@ fn edits_recorded_on_a_stale_revision_flag_divergence() {
 #[test]
 fn init_with_a_malformed_key_leaves_no_repository() {
     let repo = Repo::new();
-    fs::write(repo.config.path().join("node.key"), b"short").unwrap();
+    fs::write(repo.config().join("node.key"), b"short").unwrap();
     let other = tempfile::tempdir().unwrap();
     assert!(!repo.run(other.path(), &["init"]).status.success());
     assert!(!other.path().join(".origin").exists());
@@ -601,7 +478,7 @@ fn only_the_creator_of_a_change_abandons_it() {
     repo.ok(&["describe", "Ada's change"]);
     let change = repo.change();
     // Eve takes the change over, then tries to give it up.
-    let config = repo.config.path().join("config.toml");
+    let config = repo.config().join("config.toml");
     fs::write(&config, "user = \"eve\"\n").unwrap();
     repo.write("file", "eve's\n");
     repo.ok(&["describe", "Eve's now"]);
@@ -632,7 +509,7 @@ fn init_creates_policy_and_main_with_one_node_key() {
     );
     assert!(repo.fails(&["init"]).contains("already has a repository"));
 
-    let key = repo.config.path().join("node.key");
+    let key = repo.config().join("node.key");
     let mode = fs::metadata(&key).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
     let before = fs::read(&key).unwrap();
@@ -682,10 +559,10 @@ fn a_closed_output_pipe_ends_quietly() {
     let repo = Repo::new();
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    let output = Command::new(env!("CARGO_BIN_EXE_origin"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_origin"))
         .arg("status")
-        .current_dir(repo.dir.path())
-        .env("ORIGIN_CONFIG_DIR", repo.config.path())
+        .current_dir(repo.root())
+        .env("ORIGIN_CONFIG_DIR", repo.config())
         .stdout(writer)
         .output()
         .unwrap();
@@ -1484,63 +1361,13 @@ fn undo_moves_only_its_own_workspace() {
         "{log}"
     );
     assert!(headers[1].starts_with("@ #") && headers[1].ends_with(": origin new Main work"));
-    assert!(headers[1].contains(&repo.dir.path().display().to_string()));
+    assert!(headers[1].contains(&repo.root().display().to_string()));
     assert!(log.contains("    undid #"), "{log}");
     assert_eq!(
         repo.ok(&["op", "log", "-n", "1"]).lines().count(),
         2,
         "the undo, and its move"
     );
-}
-
-impl Repo {
-    /// The file the store keeps the object holding `content` in.
-    fn stored_object(&self, content: &[u8]) -> PathBuf {
-        let hex = origin_shared::EncodedObject::blob(content).id().to_hex();
-        self.path(&format!(
-            ".origin/objects/loose/{}/{}",
-            &hex[..2],
-            &hex[2..]
-        ))
-    }
-
-    /// Runs `origin <args>` in `cwd` until it reads the stored object
-    /// holding `content`, then once `ready`, kills it, as a crash would,
-    /// and stores the object again.
-    fn crash_reading(&self, cwd: &Path, content: &[u8], args: &[&str], ready: impl Fn() -> bool) {
-        let stored = self.stored_object(content);
-        let object = fs::read(&stored).unwrap();
-        fs::remove_file(&stored).unwrap();
-        let fifo = Command::new("mkfifo").arg(&stored).status().unwrap();
-        assert!(fifo.success());
-        let mut child = self
-            .command(cwd, args)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        // Opening the pipe to write waits for the command to open it to
-        // read, which it then waits on, for as long as the pipe is open.
-        let (opened, open) = mpsc::channel();
-        let pipe = stored.clone();
-        thread::spawn(move || opened.send(OpenOptions::new().write(true).open(pipe)));
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let _pipe = loop {
-            if let Ok(pipe) = open.recv_timeout(Duration::from_millis(20)) {
-                break pipe.unwrap();
-            }
-            assert!(child.try_wait().unwrap().is_none(), "it never read it");
-            assert!(Instant::now() < deadline, "it never read it in time");
-        };
-        while !ready() {
-            assert!(Instant::now() < deadline, "never ready");
-            thread::sleep(Duration::from_millis(20));
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
-        fs::remove_file(&stored).unwrap();
-        fs::write(&stored, object).unwrap();
-        fs::set_permissions(&stored, fs::Permissions::from_mode(0o444)).unwrap();
-    }
 }
 
 #[test]
@@ -1557,7 +1384,7 @@ fn a_move_cut_short_is_finished_without_losing_edits() {
     fs::remove_file(repo.path("ro/b")).unwrap();
 
     // `edit` back to the first change crashes after writing `a`.
-    repo.crash_reading(repo.dir.path(), b"b\n", &["edit", &first], || {
+    repo.crash_reading(repo.root(), b"b\n", &["edit", &first], || {
         fs::read_to_string(repo.path("a")).is_ok_and(|a| a == "a\n")
     });
     assert!(repo.path(".origin/moving").exists());
@@ -1697,7 +1524,7 @@ fn a_move_that_cannot_be_finished_leaves_the_files() {
 
     // `edit` crashes after writing `a`, and the content finishing it
     // needs can't be read.
-    repo.crash_reading(repo.dir.path(), b"b\n", &["edit", &first], || {
+    repo.crash_reading(repo.root(), b"b\n", &["edit", &first], || {
         fs::read_to_string(repo.path("a")).is_ok_and(|a| a == "a\n")
     });
     assert!(repo.path(".origin/moving").exists());

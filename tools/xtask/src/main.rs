@@ -1,16 +1,17 @@
 //! Development tasks, run with `cargo xtask <task>`:
 //!
 //! - `bench-git [--files N] [--tree PATH]`: times origin against git on the
-//!   same working tree with hyperfine, and writes `docs/benchmarks.md`. The
-//!   tree is a synthetic fixture of N files, or a copy of PATH.
+//!   same working tree with hyperfine, locally and syncing with a server,
+//!   and writes `docs/benchmarks.md`. The tree is a synthetic fixture of N
+//!   files, or a copy of PATH.
 //! - `edit DIR COUNT`: appends a line to COUNT files spread across DIR. The
 //!   benchmarks use it to change files between runs.
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, iter};
 
@@ -73,12 +74,6 @@ struct BenchGit {
 }
 
 impl BenchGit {
-    /// `path` as one `sh` word, whatever it holds: single-quoted, with each
-    /// `'` closing the quote, escaped, and reopening it.
-    fn quote(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-    }
-
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
         let mut task = Self {
             files: FixtureTree::LARGE.files,
@@ -113,8 +108,6 @@ impl BenchGit {
             .current_dir(&workspace))?;
         // Cargo resolves a relative target directory from where it runs.
         let target = workspace.join(env::var_os("CARGO_TARGET_DIR").unwrap_or("target".into()));
-        let origin = target.join("release/origin").canonicalize()?;
-        let xtask = env::current_exe()?;
 
         let base = target.join("bench-git");
         if base.exists() {
@@ -123,86 +116,24 @@ impl BenchGit {
         let config = base.join("config");
         fs::create_dir_all(&config)?;
         fs::write(config.join("config.toml"), "user = \"bench\"\n")?;
-        let (origin_dir, git_dir) = (base.join("origin"), base.join("git"));
-        for dir in [&origin_dir, &git_dir] {
-            self.populate(dir)?;
+        for dir in ["origin", "git"] {
+            self.populate(&base.join(dir))?;
         }
-        let (origin_dir, git_dir) = (origin_dir.canonicalize()?, git_dir.canonicalize()?);
-        let shell = |dir: &Path, command: &str| format!("cd {} && {command}", Self::quote(dir));
-        let origin_cmd =
-            |command: &str| shell(&origin_dir, &format!("{} {command}", Self::quote(&origin)));
-        let git_cmd = |command: &str| shell(&git_dir, command);
-        let edit_cmd =
-            |dir: &Path| format!("{} edit {} 100", Self::quote(&xtask), Self::quote(dir));
-
-        let mut report = self.report_header()?;
-        let mut scenario = |title: &str,
-                            runs: &[&str],
-                            origin: (Option<String>, String),
-                            git: (Option<String>, String)| {
-            let markdown = base.join("scenario.md");
-            let mut hyperfine = Command::new("hyperfine");
-            // The commands are shell syntax, which hyperfine 2 makes explicit.
-            hyperfine
-                .args(runs)
-                .arg("--shell=sh")
-                .arg("--export-markdown")
-                .arg(&markdown);
-            for (name, (prepare, command)) in [("origin", origin), ("git", git)] {
-                if let Some(prepare) = prepare {
-                    hyperfine.arg("--prepare").arg(prepare);
-                }
-                hyperfine.arg("--command-name").arg(name).arg(command);
-            }
-            run(hyperfine
-                .envs(Self::environment())
-                .env("ORIGIN_CONFIG_DIR", &config))?;
-            writeln!(report, "\n## {title}\n\n{}", fs::read_to_string(&markdown)?)?;
-            anyhow::Ok(())
+        let mut bench = Bench {
+            origin: target.join("release/origin").canonicalize()?,
+            xtask: env::current_exe()?,
+            origin_dir: base.join("origin").canonicalize()?,
+            git_dir: base.join("git").canonicalize()?,
+            config,
+            base,
+            report: self.report_header()?,
         };
-
-        // Origin has no commit: `new` records the working copy into the
-        // current change and starts the next one, the closest operation.
-        scenario(
-            "First commit of the whole tree (`origin new`)",
-            &["--runs", "5"],
-            (
-                Some(shell(
-                    &origin_dir,
-                    &format!("rm -rf .origin && {} init", Self::quote(&origin)),
-                )),
-                origin_cmd("new bench"),
-            ),
-            (
-                Some(git_cmd("rm -rf .git && git init -q")),
-                git_cmd("git add -A && git commit -qm bench"),
-            ),
-        )?;
-        scenario(
-            "Status, nothing changed",
-            &["--warmup", "3"],
-            (None, origin_cmd("status")),
-            (None, git_cmd("git status --porcelain")),
-        )?;
-        scenario(
-            "Status, 100 files edited",
-            &["--warmup", "1"],
-            (Some(edit_cmd(&origin_dir)), origin_cmd("status")),
-            (Some(edit_cmd(&git_dir)), git_cmd("git status --porcelain")),
-        )?;
-        scenario(
-            "Commit, 100 files edited (`origin new`)",
-            &["--warmup", "1"],
-            (Some(edit_cmd(&origin_dir)), origin_cmd("new bench")),
-            (
-                Some(edit_cmd(&git_dir)),
-                git_cmd("git add -A && git commit -qm bench"),
-            ),
-        )?;
+        bench.local()?;
+        bench.sync(self)?;
 
         let path = workspace.join("docs/benchmarks.md");
         fs::create_dir_all(path.parent().context("docs has a parent")?)?;
-        fs::write(&path, report)?;
+        fs::write(&path, bench.report)?;
         println!("Wrote {}", path.canonicalize()?.display());
         Ok(())
     }
@@ -212,12 +143,17 @@ impl BenchGit {
         fs::create_dir_all(dir)?;
         match &self.tree {
             Some(tree) => {
-                run(Command::new("cp").arg("-a").arg(tree.join(".")).arg(dir))?;
-                for metadata in [".git", ".origin"] {
-                    let path = dir.join(metadata);
-                    if path.exists() {
-                        fs::remove_dir_all(path)?;
+                // All but the tree's own metadata: `dir` may be a clone,
+                // whose own must stay.
+                let mut entries = Vec::new();
+                for entry in fs::read_dir(tree)? {
+                    let path = entry?.path();
+                    if !path.ends_with(".git") && !path.ends_with(".origin") {
+                        entries.push(path);
                     }
+                }
+                if !entries.is_empty() {
+                    run(Command::new("cp").arg("-a").args(entries).arg(dir))?;
                 }
             }
             None => FixtureTree {
@@ -267,6 +203,283 @@ impl BenchGit {
              - CPU: {cpu}\n- {}\n",
             git.trim()
         ))
+    }
+}
+
+/// One side of a scenario: a command preparing each run, if any, and the
+/// timed command.
+type Side = (Option<String>, String);
+
+/// A benchmark run: the two working copies under test, and the report.
+struct Bench {
+    origin: PathBuf,
+    xtask: PathBuf,
+    base: PathBuf,
+    config: PathBuf,
+    origin_dir: PathBuf,
+    git_dir: PathBuf,
+    report: String,
+}
+
+impl Bench {
+    /// `path` as one `sh` word, whatever it holds: single-quoted, with each
+    /// `'` closing the quote, escaped, and reopening it.
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    fn shell(dir: &Path, command: &str) -> String {
+        format!("cd {} && {command}", Self::quote(dir))
+    }
+
+    /// An origin command in `dir`.
+    fn origin_in(&self, dir: &Path, command: &str) -> String {
+        Self::shell(dir, &format!("{} {command}", Self::quote(&self.origin)))
+    }
+
+    /// An origin command in origin's working copy.
+    fn origin(&self, command: &str) -> String {
+        self.origin_in(&self.origin_dir, command)
+    }
+
+    /// A git command in git's working copy.
+    fn git(&self, command: &str) -> String {
+        Self::shell(&self.git_dir, command)
+    }
+
+    /// Edits 100 files of a working copy.
+    fn edit(&self, dir: &Path) -> String {
+        format!("{} edit {} 100", Self::quote(&self.xtask), Self::quote(dir))
+    }
+
+    /// Runs origin with `args` in `dir`, outside of hyperfine.
+    fn run_origin(&self, dir: &Path, args: &[&str]) -> Result<()> {
+        run(Command::new(&self.origin)
+            .args(args)
+            .current_dir(dir)
+            .env("ORIGIN_CONFIG_DIR", &self.config)
+            .stdout(Stdio::null()))
+    }
+
+    /// Runs git with `args` in `dir`, outside of hyperfine.
+    fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
+        run(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .envs(BenchGit::environment())
+            .stdout(Stdio::null()))
+    }
+
+    /// Times both sides with hyperfine and appends the results to the report.
+    fn scenario(&mut self, title: &str, runs: &[&str], origin: Side, git: Side) -> Result<()> {
+        let markdown = self.base.join("scenario.md");
+        let mut hyperfine = Command::new("hyperfine");
+        // The commands are shell syntax, which hyperfine 2 makes explicit.
+        hyperfine
+            .args(runs)
+            .arg("--shell=sh")
+            .arg("--export-markdown")
+            .arg(&markdown);
+        for (name, (prepare, command)) in [("origin", origin), ("git", git)] {
+            if let Some(prepare) = prepare {
+                hyperfine.arg("--prepare").arg(prepare);
+            }
+            hyperfine.arg("--command-name").arg(name).arg(command);
+        }
+        run(hyperfine
+            .envs(BenchGit::environment())
+            .env("ORIGIN_CONFIG_DIR", &self.config))?;
+        writeln!(
+            self.report,
+            "\n## {title}\n\n{}",
+            fs::read_to_string(&markdown)?
+        )?;
+        Ok(())
+    }
+
+    /// Recording and inspecting the working copy. Origin has no commit:
+    /// `new` records the working copy into the current change and starts the
+    /// next one, the closest operation.
+    fn local(&mut self) -> Result<()> {
+        let init = Self::shell(
+            &self.origin_dir,
+            &format!("rm -rf .origin && {} init", Self::quote(&self.origin)),
+        );
+        self.scenario(
+            "First commit of the whole tree (`origin new`)",
+            &["--runs", "5"],
+            (Some(init), self.origin("new bench")),
+            (
+                Some(self.git("rm -rf .git && git init -q -b main")),
+                self.git("git add -A && git commit -qm bench"),
+            ),
+        )?;
+        self.scenario(
+            "Status, nothing changed",
+            &["--warmup", "3"],
+            (None, self.origin("status")),
+            (None, self.git("git status --porcelain")),
+        )?;
+        self.scenario(
+            "Status, 100 files edited",
+            &["--warmup", "1"],
+            (Some(self.edit(&self.origin_dir)), self.origin("status")),
+            (
+                Some(self.edit(&self.git_dir)),
+                self.git("git status --porcelain"),
+            ),
+        )?;
+        self.scenario(
+            "Commit, 100 files edited (`origin new`)",
+            &["--warmup", "1"],
+            (Some(self.edit(&self.origin_dir)), self.origin("new bench")),
+            (
+                Some(self.edit(&self.git_dir)),
+                self.git("git add -A && git commit -qm bench"),
+            ),
+        )
+    }
+
+    /// Cloning, pushing and pulling. Origin serves over HTTP on localhost;
+    /// git uses its pack protocol on a local bare repository, which spares
+    /// it the network stack. Origin's side starts from a clone with the
+    /// tree landed, and git's from its working copy, pushed.
+    fn sync(&mut self, task: &BenchGit) -> Result<()> {
+        let server = Server::start(&self.origin, &self.base, &self.config)?;
+        let (seed, clone) = (
+            self.base.join("origin-seed"),
+            self.base.join("origin-clone"),
+        );
+        self.run_origin(&self.base, &["clone", &server.url, &seed.to_string_lossy()])?;
+        task.populate(&seed)?;
+        self.run_origin(&seed, &["land"])?;
+        let (remote, git_clone) = (self.base.join("remote.git"), self.base.join("git-clone"));
+        let remote_path = remote.to_string_lossy();
+        Self::run_git(
+            &self.base,
+            &["init", "-q", "--bare", "-b", "main", &remote_path],
+        )?;
+        Self::run_git(&self.git_dir, &["push", "-q", &remote_path, "HEAD:main"])?;
+        let push = format!("git push -q {} HEAD:main", Self::quote(&remote));
+
+        self.scenario(
+            "Clone",
+            &["--runs", "5"],
+            (
+                Some(format!("rm -rf {}", Self::quote(&clone))),
+                format!(
+                    "{} clone {} {}",
+                    Self::quote(&self.origin),
+                    server.url,
+                    Self::quote(&clone)
+                ),
+            ),
+            (
+                Some(format!("rm -rf {}", Self::quote(&git_clone))),
+                format!(
+                    "git clone -q --no-local {} {}",
+                    Self::quote(&remote),
+                    Self::quote(&git_clone)
+                ),
+            ),
+        )?;
+        // `describe` records the edits, as `commit` does for git. The push
+        // still snapshots the working copy, as every origin command does.
+        self.scenario(
+            "Push, 100 files edited",
+            &["--warmup", "1"],
+            (
+                Some(format!(
+                    "{} && {}",
+                    self.edit(&seed),
+                    self.origin_in(&seed, "describe bench")
+                )),
+                self.origin_in(&seed, "push"),
+            ),
+            (
+                Some(format!(
+                    "{} && {}",
+                    self.edit(&self.git_dir),
+                    self.git("git add -A && git commit -qm bench")
+                )),
+                self.git(&push),
+            ),
+        )?;
+        self.scenario(
+            "Pull, 100 files landed",
+            &["--warmup", "1"],
+            (
+                Some(format!(
+                    "{} && {}",
+                    self.edit(&seed),
+                    self.origin_in(&seed, "land")
+                )),
+                self.origin_in(&clone, "pull"),
+            ),
+            (
+                Some(format!(
+                    "{} && {}",
+                    self.edit(&self.git_dir),
+                    self.git(&format!("git add -A && git commit -qm bench && {push}"))
+                )),
+                Self::shell(&git_clone, "git pull -q"),
+            ),
+        )
+    }
+}
+
+/// An `origin serve` hosting one empty repository, stopped when dropped.
+struct Server {
+    child: Child,
+    url: String,
+}
+
+impl Server {
+    fn start(origin: &Path, base: &Path, config: &Path) -> Result<Self> {
+        let dir = base.join("server");
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("origin-server.toml"),
+            "listen = \"127.0.0.1:0\"\nnode = \"hosted\"\n[repos]\ndemo = \"demo\"\n",
+        )?;
+        run(Command::new(origin)
+            .args(["repo", "create", "demo"])
+            .current_dir(&dir)
+            .stdout(Stdio::null()))?;
+        // Guarded from the start, so a server that fails to start is killed.
+        let mut server = Self {
+            child: Command::new(origin)
+                .arg("serve")
+                .current_dir(&dir)
+                .env("ORIGIN_CONFIG_DIR", config)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+            url: String::new(),
+        };
+        let mut line = String::new();
+        BufReader::new(
+            server
+                .child
+                .stdout
+                .take()
+                .context("the server has no stdout")?,
+        )
+        .read_line(&mut line)?;
+        let base = line
+            .trim()
+            .strip_prefix("Listening on ")
+            .with_context(|| format!("unexpected server output: {line}"))?;
+        server.url = format!("{base}/demo");
+        Ok(server)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Best effort: the benchmark is over either way.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

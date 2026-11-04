@@ -7,16 +7,16 @@ use std::time::{Duration, Instant};
 
 use origin_client::{Client, Error, Repo};
 use origin_shared::api::{
-    ErrorCode, EventsQuery, FetchRecords, LandRequest, List, LogQuery, NewTarget, RepoName,
-    StatementsQuery,
+    ErrorCode, EventsQuery, Expected, FetchRecords, FetchSnapshot, InventoryRequest, LandRequest,
+    List, LogQuery, NewTarget, PutQuery, RepoName, StatementsQuery,
 };
 use origin_shared::event::EventKind;
 use origin_shared::landing::{Blocked, Landing, Proposal};
 use origin_shared::pack::Pack;
 use origin_shared::{
     Base, BlobId, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind, NodeKey,
-    Period, Record, RecordId, Revision, RevisionId, Source, Statement, TargetName, Tree, TreeEntry,
-    Verdict,
+    Period, Record, RecordId, RepoPath, Revision, RevisionId, Source, Statement, TargetName, Tree,
+    TreeEntry, TreeId, Verdict,
 };
 use origin_src::http::Api;
 use origin_src::policy::Policy;
@@ -201,14 +201,29 @@ async fn puts_and_fetches_records() {
         "records are immutable, so putting them again does nothing"
     );
 
-    let wanted = [made.objects[4].clone(), made.objects[0].clone()];
+    let [a, _, tree, description, revision] = &made.objects[..] else {
+        unreachable!()
+    };
     let fetched = repo
         .fetch_records(&FetchRecords {
-            ids: wanted.iter().map(EncodedObject::id).collect(),
+            ids: vec![revision.id()],
         })
         .await
         .unwrap();
-    assert_eq!(fetched.objects, wanted, "verified, in the order asked");
+    assert_eq!(
+        fetched.pack.objects,
+        [revision.clone(), description.clone()],
+        "verified, with the description"
+    );
+    for content in [a, tree] {
+        let error = repo
+            .fetch_records(&FetchRecords {
+                ids: vec![content.id()],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(error), ErrorCode::BadRequest, "content leaves by path");
+    }
 
     // A record is refused unless the repository can use it.
     let orphan = Made::revision(change(2), main_tip(repo).await, vec![], &[("c.txt", "c")]);
@@ -221,6 +236,7 @@ async fn puts_and_fetches_records() {
         .log(&LogQuery {
             target: TargetName::MAIN,
             since: 0,
+            limit: None,
         })
         .await
         .unwrap();
@@ -308,6 +324,43 @@ async fn puts_refuse_objects_named_as_another_kind() {
 }
 
 #[tokio::test]
+async fn pushes_compare_and_swap_the_heads_they_saw() {
+    let server = Server::start().await;
+    let repo = &server.demo;
+    let base = main_tip(repo).await;
+    let expect = |heads: &[RevisionId]| PutQuery {
+        expect: List(vec![Expected {
+            change: change(1),
+            heads: heads.to_vec(),
+        }]),
+    };
+    let first = Made::revision(change(1), base, Vec::new(), &[("a", "first")]);
+    repo.push_records(&first.pack(), &expect(&[]))
+        .await
+        .unwrap();
+
+    // Two pushes made from the same view of the change: the second is
+    // refused, and publishes no record.
+    let left = Made::revision(change(1), base, vec![first.id], &[("a", "left")]);
+    let right = Made::revision(change(1), base, vec![first.id], &[("a", "right")]);
+    repo.push_records(&left.pack(), &expect(&[first.id]))
+        .await
+        .unwrap();
+    let error = repo
+        .push_records(&right.pack(), &expect(&[first.id]))
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), ErrorCode::Conflict);
+    let request = InventoryRequest {
+        changes: vec![change(1)],
+    };
+    assert_eq!(repo.inventory(&request).await.unwrap()[0].heads, [left.id]);
+    repo.push_records(&right.pack(), &expect(&[left.id]))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn promotions_must_match_their_original() {
     let server = Server::start().await;
     let repo = &server.demo;
@@ -358,6 +411,68 @@ async fn promotions_must_match_their_original() {
 }
 
 #[tokio::test]
+async fn fetches_snapshots_by_walking_them() {
+    let server = Server::start().await;
+    let repo = &server.demo;
+    let made = Made::revision(
+        change(1),
+        main_tip(repo).await,
+        vec![],
+        &[("a.txt", "a"), ("b.txt", "b")],
+    );
+    repo.put_records(&made.pack()).await.unwrap();
+    let [a, b, tree, description, _] = &made.objects[..] else {
+        unreachable!()
+    };
+
+    let snapshot = |have: Vec<TreeId>, paths: &[&str]| FetchSnapshot {
+        snapshot: tree.id().into(),
+        have,
+        paths: paths
+            .iter()
+            .map(|path| RepoPath::new(path).unwrap())
+            .collect(),
+        skip: 0,
+    };
+    let whole = repo.fetch_snapshot(&snapshot(vec![], &[])).await.unwrap();
+    assert_eq!(whole.pack.objects, [tree.clone(), a.clone(), b.clone()]);
+    let only_b = repo
+        .fetch_snapshot(&snapshot(vec![], &["b.txt"]))
+        .await
+        .unwrap();
+    assert_eq!(only_b.pack.objects, [tree.clone(), b.clone()]);
+    let edited = Made::revision(
+        change(3),
+        main_tip(repo).await,
+        vec![],
+        &[("a.txt", "a"), ("b.txt", "c")],
+    );
+    repo.put_records(&edited.pack()).await.unwrap();
+    let changed = repo
+        .fetch_snapshot(&FetchSnapshot {
+            snapshot: edited.objects[2].id().into(),
+            have: vec![tree.id().into()],
+            paths: Vec::new(),
+            skip: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.pack.objects,
+        [edited.objects[2].clone(), edited.objects[1].clone()],
+        "the new tree and the edited file"
+    );
+    let missing = FetchSnapshot {
+        snapshot: description.id().into(),
+        have: Vec::new(),
+        paths: Vec::new(),
+        skip: 0,
+    };
+    let error = repo.fetch_snapshot(&missing).await.unwrap_err();
+    assert_eq!(code(error), ErrorCode::NotFound, "a blob is no snapshot");
+}
+
+#[tokio::test]
 async fn reads_statements_and_revisions() {
     let server = Server::start().await;
     let repo = &server.demo;
@@ -401,6 +516,24 @@ async fn reads_statements_and_revisions() {
 
     let error = repo.revisions(change(9)).await.unwrap_err();
     assert_eq!(code(error), ErrorCode::NotFound);
+
+    let inventories = repo
+        .inventory(&InventoryRequest {
+            changes: vec![change(1), change(9)],
+        })
+        .await
+        .unwrap();
+    let [known, unknown] = &inventories[..] else {
+        panic!("{inventories:?}")
+    };
+    assert_eq!(known.revisions, ids);
+    assert_eq!(known.heads, [left.id, right.id]);
+    let mut statements = known.statements.clone();
+    statements.sort();
+    let mut expected = vec![statement.id().into(), flagged[0].id];
+    expected.sort();
+    assert_eq!(statements, expected);
+    assert!(unknown.revisions.is_empty() && unknown.statements.is_empty());
 }
 
 #[tokio::test]
@@ -435,6 +568,7 @@ async fn lands_changes_and_targets() {
         .log(&LogQuery {
             target: TargetName::MAIN,
             since: 1,
+            limit: Some(1),
         })
         .await
         .unwrap();
