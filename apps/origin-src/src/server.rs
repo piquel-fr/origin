@@ -100,23 +100,27 @@ impl ServerConfig {
         })
     }
 
-    /// `origin repo create`: creates an empty repository for this server
-    /// to host in `root`, with the server's node the authority of `policy`
-    /// and `main`.
+    /// `origin repo create [--admin <principal>]`: creates an empty
+    /// repository for this server to host in `root`, with the server's node
+    /// the authority of `policy` and `main`, and `admin`, if given, the one
+    /// who changes its policy over the API.
     ///
     /// # Errors
     ///
     /// Fails if `root` isn't empty, or the key or repository cannot be
     /// written.
-    pub fn create_repo(&self, root: &Path) -> anyhow::Result<()> {
+    pub fn create_repo(&self, root: &Path, admin: Option<&Principal>) -> anyhow::Result<()> {
         let node = self.node()?;
-        let policy = Policy::initial(&node.name, &node.key.public());
+        let policy = Policy::initial(&node.name, &node.key.public(), admin);
         OriginService::create(root.to_owned(), node, &policy)?;
         println!(
             "Created a repository in {}: node:{} is the authority of `policy` and `main`",
             root.display(),
             self.node
         );
+        if let Some(admin) = admin {
+            println!("{admin} changes its policy");
+        }
         println!("Name it in the [repos] of the configuration to serve it");
         Ok(())
     }
@@ -202,11 +206,14 @@ impl Repositories {
         }
     }
 
-    /// Opens the repositories at the given paths, served by `node`.
+    /// Opens the repositories at the given paths, served by `node`, and
+    /// retries the landings waiting for evidence in each (see
+    /// [`OriginService::resume_waiting`]).
     ///
     /// # Errors
     ///
-    /// Fails if one has no repository.
+    /// Fails if one has no repository, or its waiting landings cannot be
+    /// read.
     pub fn open(
         repos: BTreeMap<RepoName, PathBuf>,
         node: &Node,
@@ -216,6 +223,9 @@ impl Repositories {
         for (name, path) in repos {
             let service = OriginService::open(path, node.clone())
                 .with_context(|| format!("cannot serve repository `{name}`"))?;
+            service
+                .resume_waiting()
+                .with_context(|| format!("cannot read the landings waiting in `{name}`"))?;
             repositories.insert(name, service);
         }
         Ok(repositories)

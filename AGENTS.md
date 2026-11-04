@@ -10,7 +10,8 @@ review bots read and write at the same time, written in Rust.
   shared by every component.
 - `crates/origin-platform`: everything that differs between platforms
   (durable writes, file locks, copy-on-write clones, positioned reads,
-  refusing network file systems), behind traits. It is the only place whose
+  refusing network file systems, killing process groups), behind traits.
+  It is the only place whose
   code differs by target OS. `std::os::unix`, which every supported platform
   has, may be used anywhere.
 - `crates/origin-client`: the SDK, a typed client for origin servers. Each
@@ -24,7 +25,15 @@ review bots read and write at the same time, written in Rust.
   same calls over the SDK or, for a local path, in-process. Every call
   takes a `Caller`, authenticated by `auth.rs`; `permissions.rs` filters
   what it reads and checks what it writes, by the rights `policy.rs`
-  resolves from `policy.toml`.
+  resolves from `policy.toml`. `plugin.rs` runs `origin <name>` as
+  `origin-<name>` from `PATH`, passing the repository in the environment.
+- `apps/origin-ci`: the CI plugin, `origin-ci`. It reads `checks.toml`
+  from the revision it checks as a tool (`origin ci run`), or as a worker
+  answering `check.requested` (`origin ci worker`), from the tip of the
+  target landed on, never the candidate. It runs each check in a checkout
+  of the revision of its own, and issues the results. Like every plugin, it
+  uses only the public API: `Remote`, which is the SDK over HTTP or the
+  service in-process, never origin-src's internals.
 - `tools/xtask`: development tasks, run with `cargo xtask`, such as timing
   origin against git (`just bench-git`).
 
@@ -43,8 +52,8 @@ benchmark, and its numbers in the pull request.
 - `just bench`: the divan micro-benchmarks (encoding, store writes,
   snapshots, input digests and promotion, landing, permission checks,
   reading events, the server's request latency and long-poll wakeups,
-  syncing a 20,000-file tree over HTTP, and a fetch that brings nothing
-  from a long history).
+  syncing a 20,000-file tree over HTTP, a fetch that brings nothing from a
+  long history, and the CI worker's overhead per check).
 - `just bench-git`: times origin against git on a 20,000-file tree with
   hyperfine, and rewrites `docs/benchmarks.md`.
 
@@ -53,7 +62,9 @@ temporary directory, which holds the user's `config.toml` and node key.
 The HTTP tests drive every SDK method against a real server. One fails
 while `docs/openapi.json` is stale: `just openapi` rewrites it. The sync
 tests clone, push and land through `origin serve` and through local paths;
-`tests/common` holds the helpers every end-to-end test shares.
+`apps/origin-src/tests/common` holds the helpers every end-to-end test
+shares, plugins' included, which run `origin` from the target directory
+their own binary is built in.
 
 ## Commits & Pull Requests
 

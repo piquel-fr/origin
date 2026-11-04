@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "apps/origin-ci",
   "apps/origin-src",
   "crates/origin-client",
   "crates/origin-platform",
@@ -36,7 +37,7 @@ reflink-copy = "0.1.30"
 # No TLS yet: remotes are plain HTTP in the prototype.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query"] }
 # Only in origin-platform. The version and features reflink-copy uses on Linux.
-rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "process", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 similar = "3.2.0"
