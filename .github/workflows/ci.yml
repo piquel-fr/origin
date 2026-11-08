@@ -7,7 +7,8 @@
 #   rust   -> lint, test, doc-test, on Linux and macOS
 #   msrv   -> the workspace builds with its minimum supported Rust version
 #
-# `ci` is the single status to require: it fails if any job failed.
+# `ci` is the single status to require: it fails if any job failed. A run
+# cancelled by a newer push skips it, so it never reports that as a failure.
 # Caches are saved from main only, so branches never evict them.
 
 name: CI
@@ -94,7 +95,7 @@ jobs:
 
   ci:
     name: ci
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [checks, rust, msrv]
     runs-on: ubuntu-latest
     timeout-minutes: 5
