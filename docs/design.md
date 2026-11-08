@@ -207,7 +207,9 @@ Rules:
   claim to supersede someone else's is ignored. Statements from different
   issuers never overwrite each other, so a review from Alice and one from Bob
   both stand. `origin annotate` supersedes the user's latest statement of the
-  same kind about that revision.
+  same kind about that revision. A statement is taken back by superseding
+  it with one that has no verdict (`--withdraw`), which claims nothing: it
+  never counts as evidence, and nothing promotes it.
 - **Statements are permanent.** Reviews, check results and conflicts are
   history, and history is never deleted. Only bulky payloads, such as CI
   logs, can have a retention period, set per kind in the policy
@@ -254,7 +256,9 @@ It copies the latest matching result from each issuer, and only results the
 caller can see.
 
 A promotion counts as its original: the original's kind, verdict and issuer
-are what policy checks. It is only valid if:
+are what policy checks. A result that ran there wins: once the record has a
+statement of that kind from that issuer, a result or a withdrawal, the
+promotion no longer counts, whichever came first. It is only valid if:
 - its kind, verdict, inputs and payload equal the original's;
 - its subject is on the original subject's target: a revision is on the
   target of the acceptance it's based on, directly or through the revisions
@@ -711,7 +715,8 @@ origin status | diff | show [<change>] | log [<target>] | evolog [<change>]
 origin converge <change>            # merge divergent heads
 origin resolve <path>...            # accept conflicted files as they are
 origin abandon [<change>] --reason "..."
-origin annotate <rev> <kind> --pass|--fail|--neutral [--inputs ...] [--external] [--payload f]
+origin annotate <rev> <kind> --pass|--fail|--neutral|--withdraw [--inputs ...] [--external] [-m <text> | --payload <file|->]
+origin annotate --on <statement> <kind> --pass|--fail|--neutral|--withdraw [-m <text> | --payload <file|->]
 origin statements [<rev>] | promote [<rev>]
 origin target new <name> --from <target> | targets
 origin land [<change>] [--onto <target>] | land --from <target> --onto <target> | land --status
