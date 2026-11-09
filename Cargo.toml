@@ -15,7 +15,7 @@ edition = "2024"
 # rust-toolchain.toml until they need to differ.
 rust-version = "1.99"
 license = "Apache-2.0"
-repository = "https://github.com/piquel-fr/origin"
+repository = "https://github.com/sourceorigin-dev/origin"
 
 [workspace.dependencies]
 # Internal
