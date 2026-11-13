@@ -6,7 +6,9 @@
 //! [`Store::authorizes`] names. Every other kind belongs to whoever issues
 //! it. Supersession counts only within one issuer: a statement claiming to
 //! supersede another issuer's is issued like any other, and the one it
-//! names still stands.
+//! names still stands. [`Annotations::supersede`] supersedes an issuer's
+//! current statement atomically, so the statements of one kind about one
+//! record it issues in one store form a single chain.
 
 mod promotion;
 
@@ -95,6 +97,47 @@ impl<'a, P: Platform> Annotations<'a, P> {
             }
         }
         Ok(self.write(statement, payload)?)
+    }
+
+    /// Issues `statement` as its issuer's latest of its kind about its
+    /// subject, superseding the [current](Self::current) one, and returns
+    /// it with its id. One without a verdict, of a kind that isn't
+    /// reserved, withdraws the current one. It reads the current one and
+    /// issues under a lock, from the index read again, so two statements
+    /// issued at once in this store never supersede the same one: the
+    /// second supersedes the first. Statements issued in other stores and
+    /// put here chose what they supersede there, so two of one issuer's can
+    /// still both supersede the same one.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Annotations::issue`], or with
+    /// [`AnnotateError::NothingToWithdraw`] if a withdrawal finds no
+    /// current statement with a verdict.
+    pub fn supersede(
+        &mut self,
+        mut statement: Statement,
+        payload: Option<EncodedObject>,
+    ) -> Result<(StatementId, Statement), AnnotateError> {
+        let _lock = self.store.lock_supersession()?;
+        self.index = Index::open(self.store)?;
+        statement.supersedes =
+            self.current(statement.subject, &statement.kind, &statement.issuer)?;
+        if statement.verdict.is_none() && !statement.kind.is_reserved() {
+            // A withdrawal takes back a statement with a verdict.
+            let withdrawable = match statement.supersedes {
+                Some(current) => !self.store.get(current)?.withdraws(),
+                None => false,
+            };
+            if !withdrawable {
+                return Err(AnnotateError::NothingToWithdraw {
+                    kind: statement.kind,
+                    subject: statement.subject,
+                });
+            }
+        }
+        let id = self.issue(&statement, payload)?;
+        Ok((id, statement))
     }
 
     /// Writes a statement after its payload, which is durable before
@@ -293,6 +336,17 @@ pub enum AnnotateError {
         /// Who issued it.
         issuer: Principal,
     },
+    /// A withdrawal found no statement of its issuer's to take back.
+    #[error(
+        "you have no `{kind}` statement about {} to withdraw",
+        subject.describe()
+    )]
+    NothingToWithdraw {
+        /// The kind.
+        kind: Kind,
+        /// What it would be about: a revision or a statement.
+        subject: RecordId,
+    },
     /// Records cannot be read or written.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -300,6 +354,9 @@ pub enum AnnotateError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
     use origin_shared::{Base, BlobId, Digest, Inputs, ObjectId, RepoPath, Revision, Verdict};
 
     use super::*;
@@ -394,6 +451,36 @@ mod tests {
     }
 
     pub(super) const FILES: &[(&str, &str)] = &[("src/lib.rs", "v1"), ("docs/guide.md", "v1")];
+
+    #[test]
+    fn statements_issued_at_once_supersede_one_another() {
+        let (_dir, store) = store();
+        let revision = revision(&store, 1, &[], FILES);
+        let rounds = 50;
+        for _ in 0..rounds {
+            let barrier = Barrier::new(2);
+            thread::scope(|scope| {
+                // Different verdicts, so the two never make one statement.
+                for verdict in [Verdict::Pass, Verdict::Fail] {
+                    let (store, barrier) = (&store, &barrier);
+                    scope.spawn(move || {
+                        let mut annotations = Annotations::open(store).unwrap();
+                        let statement = check(revision, "review", verdict, "user:alice", None);
+                        barrier.wait();
+                        annotations.supersede(statement, None).unwrap();
+                    });
+                }
+            });
+        }
+        let about = Annotations::open(&store)
+            .unwrap()
+            .about(RecordId::Revision(revision))
+            .unwrap();
+        assert_eq!(about.len(), 2 * rounds);
+        for pair in about.windows(2) {
+            assert_eq!(pair[1].statement.supersedes, Some(pair[0].id));
+        }
+    }
 
     #[test]
     fn only_the_issuer_supersedes_its_results() {

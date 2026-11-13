@@ -914,17 +914,6 @@ pub enum WorkspaceError {
         /// The revision it names.
         revision: RevisionId,
     },
-    /// `annotate --withdraw` found no statement of the user's to take back.
-    #[error(
-        "you have no `{kind}` statement about {} to withdraw",
-        subject.describe()
-    )]
-    NothingToWithdraw {
-        /// The kind.
-        kind: Kind,
-        /// What it would be about: a revision or a statement.
-        subject: RecordId,
-    },
     /// `annotate --withdraw` found only a promotion of the user's
     /// statement, which they withdraw about the revision it's about.
     #[error(

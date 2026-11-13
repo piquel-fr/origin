@@ -207,7 +207,12 @@ Rules:
   claim to supersede someone else's is ignored. Statements from different
   issuers never overwrite each other, so a review from Alice and one from Bob
   both stand. `origin annotate` supersedes the user's latest statement of the
-  same kind about that revision. A statement is taken back by superseding
+  same kind about that revision, reading it and issuing the new one under a
+  lock, so two run at once in one store never supersede the same one: the
+  second supersedes the first. A statement issued elsewhere, in a clone or by
+  a CI runner over the API, supersedes what that issuer saw, so two of one
+  issuer's statements from different stores can still both supersede the
+  same one. A statement is taken back by superseding
   it with one that has no verdict (`--withdraw`), which claims nothing: it
   never counts as evidence, and nothing promotes it.
 - **Statements are permanent.** Reviews, check results and conflicts are

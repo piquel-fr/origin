@@ -12,7 +12,7 @@ use origin_shared::{
 };
 
 use super::{WorkingCopy, Workspace, WorkspaceError};
-use crate::annotations::Annotations;
+use crate::annotations::{AnnotateError, Annotations};
 use crate::index::{FindError, Index};
 use crate::store::StoreError;
 use crate::tree::Snapshots;
@@ -112,8 +112,9 @@ impl Workspace {
 
     /// `origin annotate <rev> <kind> --pass|--fail|--neutral|--withdraw`:
     /// issues a statement about a revision as the user, superseding the
-    /// user's latest one of the same kind about it. Without a `verdict`, it
-    /// withdraws that one: see [`Statement::withdraws`].
+    /// user's latest one of the same kind about it, as
+    /// [`Annotations::supersede`] does. Without a `verdict`, it withdraws
+    /// that one: see [`Statement::withdraws`].
     ///
     /// # Errors
     ///
@@ -132,47 +133,45 @@ impl Workspace {
             return Err(WorkspaceError::ReservedKind(kind));
         }
         let working_copy = self.refresh()?;
-        let annotations = Annotations::open(&self.store)?;
+        let mut annotations = Annotations::open(&self.store)?;
         let subject = working_copy.find_record(annotations.index(), annotated)?;
-        let issuer = self.config.user();
-        let supersedes = annotations.current(subject, &kind, &issuer)?;
-        // What a withdrawal takes back: a statement with a verdict.
-        let withdrawn = match (verdict, supersedes) {
-            (Some(_), _) => None,
-            (None, Some(id)) if !self.store.get(id)?.withdraws() => Some(id),
-            (None, _) => return Err(self.nothing_to_withdraw(&annotations, kind, subject)?),
-        };
         let payload = payload.map(Payload::blob).transpose()?;
         let statement = Statement {
             subject,
-            supersedes,
+            supersedes: None,
             kind,
             verdict,
-            issuer,
+            issuer: self.config.user(),
             inputs,
             payload: payload.as_ref().map(|payload| payload.id().into()),
             promoted_from: None,
         };
-        let id = annotations.issue(&statement, payload)?;
-        if let Some(verdict) = verdict {
-            println!(
-                "Issued statement {}: {} {verdict} about {}",
-                id.short(),
-                statement.kind,
-                subject.describe()
-            );
-            if let Some(superseded) = statement.supersedes {
-                println!("Supersedes statement {}", superseded.short());
+        let (id, statement) = match annotations.supersede(statement, payload) {
+            Err(AnnotateError::NothingToWithdraw { kind, subject }) => {
+                return Err(self.nothing_to_withdraw(&annotations, kind, subject)?);
             }
-        }
-        if let Some(withdrawn) = withdrawn {
-            println!(
+            issued => issued?,
+        };
+        match (statement.verdict, statement.supersedes) {
+            (Some(verdict), superseded) => {
+                println!(
+                    "Issued statement {}: {} {verdict} about {}",
+                    id.short(),
+                    statement.kind,
+                    subject.describe()
+                );
+                if let Some(superseded) = superseded {
+                    println!("Supersedes statement {}", superseded.short());
+                }
+            }
+            (None, Some(withdrawn)) => println!(
                 "Withdrew statement {} with statement {}: {} about {}",
                 withdrawn.short(),
                 id.short(),
                 statement.kind,
                 subject.describe()
-            );
+            ),
+            (None, None) => {}
         }
         if let (Some(inputs), RecordId::Revision(revision)) = (&statement.inputs, subject) {
             let snapshot = self.store.get(revision)?.snapshot;
@@ -196,7 +195,7 @@ impl Workspace {
         subject: RecordId,
     ) -> Result<WorkspaceError, WorkspaceError> {
         let RecordId::Revision(revision) = subject else {
-            return Ok(WorkspaceError::NothingToWithdraw { kind, subject });
+            return Ok(AnnotateError::NothingToWithdraw { kind, subject }.into());
         };
         let user = self.config.user();
         let claims = annotations.claims(RecordId::Revision(revision))?;
@@ -218,7 +217,7 @@ impl Workspace {
                 original,
                 from,
             },
-            None => WorkspaceError::NothingToWithdraw { kind, subject },
+            None => AnnotateError::NothingToWithdraw { kind, subject }.into(),
         })
     }
 
