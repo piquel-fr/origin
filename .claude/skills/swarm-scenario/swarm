@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# The swarm scenario's helpers, which SKILL.md and scripted.sh share.
+# Everything lives in $RUN, /tmp/origin-swarm by default; the server
+# listens on $PORT, 7979 by default.
+#
+#   swarm user <name> <token>     $RUN/bin/<name> runs origin as the user <name>,
+#                                 with a configuration of their own holding <token>
+#   swarm serve                   runs `origin serve` until killed
+#   swarm worker                  runs `origin ci worker` as the user `ci`
+#   swarm policy                  adds the scenario's rules to ./policy.toml
+#   swarm checks                  writes the fixture's checks.toml in .
+#   swarm fixture                 writes the fixture project in .
+#   swarm kill-checkout <agent>   creates the agent's workspace from ./, killing
+#                                 it mid-checkout, then removes and recreates it
+#   swarm kill-worker-on-check    kills the worker once it runs ci.test, then
+#                                 becomes the new worker
+#   swarm kill-serve-after-push   kills the server once $RUN/c-pushed exists,
+#                                 then becomes the new server, and touches
+#                                 $RUN/serve-restarted once it listens
+#   swarm mark <step>             records that a step starts
+#   swarm times                   prints how long each step took
+#
+# `serve` and `worker` keep their PID in $RUN/<name>.pid and append their
+# output to $RUN/<name>.log.
+set -euo pipefail
+
+BIN=$(cd "$(dirname "$0")/../../.." && pwd)/target/release
+RUN=${RUN:-/tmp/origin-swarm}
+PORT=${PORT:-7979}
+URL=http://127.0.0.1:$PORT/demo
+
+serve() {
+  echo $$ >"$RUN/serve.pid"
+  exec "$BIN/origin" serve --config "$RUN/server/origin-server.toml" >>"$RUN/serve.log" 2>&1
+}
+
+worker() {
+  echo $$ >"$RUN/worker.pid"
+  exec "$RUN/bin/ci" ci worker --remote "$URL" >>"$RUN/worker.log" 2>&1
+}
+
+# `took <step> <microseconds>` prints how long a step took.
+took() {
+  local ms=$(($2 / 1000))
+  printf '%-40s %4d.%03ds\n' "$1" $((ms / 1000)) $((ms % 1000))
+}
+
+case ${1:-} in
+user)
+  mkdir -p "$RUN/users/$2" "$RUN/bin"
+  printf 'user = "%s"\n[tokens]\n"http://127.0.0.1:%s" = "%s"\n' "$2" "$PORT" "$3" \
+    >"$RUN/users/$2/config.toml"
+  cat >"$RUN/bin/$2" <<EOF
+#!/bin/sh
+PATH="$BIN:\$PATH" ORIGIN_CONFIG_DIR="$RUN/users/$2" XDG_STATE_HOME="$RUN/users/$2/state" \\
+  exec "$BIN/origin" "\$@"
+EOF
+  chmod +x "$RUN/bin/$2"
+  ;;
+serve) serve ;;
+worker) worker ;;
+policy)
+  rules='[targets.main]
+authority = "node:hosted"
+require = [{ kind = "ci.test", verdict = "pass", issuer = "group:runners" }]
+
+[targets.swarm]
+authority = "node:hosted"
+require = [
+  { kind = "ci.test", verdict = "pass", issuer = "group:runners" },
+  { kind = "ci.docs", verdict = "pass", issuer = "group:runners" },
+]'
+  toml=$(<policy.toml)
+  old=$'[targets.main]\nauthority = "node:hosted"'
+  [[ $toml == *"$old"* ]] || { echo "policy.toml has no [targets.main] to replace" >&2; exit 1; }
+  printf '%s\n\n[groups]\nrunners = ["user:ci"]\n' "${toml/"$old"/$rules}" >policy.toml
+  ;;
+checks)
+  # `sleep 2` leaves time to kill the worker mid-check, and tells its
+  # checks from an agent's own test runs.
+  cat >checks.toml <<'EOF'
+[checks.test]
+command   = "sleep 2 && python3 -m unittest discover -s src"
+inputs    = ["src"]
+toolchain = "python3 --version"
+
+[checks.docs]
+command = "test -s docs/guide.md && ! grep -rn TODO docs"
+inputs  = ["docs"]
+EOF
+  ;;
+fixture)
+  mkdir -p src docs assets
+  cat >src/greet.py <<'EOF'
+def greet(name):
+    return f"Hello, {name}!"
+EOF
+  cat >src/app.py <<'EOF'
+from greet import greet
+
+
+def welcome():
+    return greet("world")
+EOF
+  cat >src/test_app.py <<'EOF'
+import unittest
+
+import app
+
+
+class AppTest(unittest.TestCase):
+    def test_welcome(self):
+        self.assertTrue(app.welcome().startswith("Hello, world"))
+
+    def test_farewell(self):
+        if hasattr(app, "farewell"):
+            self.assertTrue(app.farewell().endswith("Goodbye."))
+
+
+if __name__ == "__main__":
+    unittest.main()
+EOF
+  cat >docs/guide.md <<'EOF'
+# Guide
+
+`greet(name)` greets someone.
+EOF
+  # Bulk, so a checkout takes long enough to be killed midway.
+  for i in $(seq 5000); do echo "asset $i" >"assets/$i.txt"; done
+  ;;
+kill-checkout)
+  ws=$RUN/ws-$2
+  "$RUN/bin/agent-$2" workspace new "$ws" >/dev/null &
+  pid=$!
+  until compgen -G "$ws/assets/*" >/dev/null; do :; done
+  kill -9 $pid
+  wait $pid || true
+  echo "Killed \`workspace new\` after $(find "$ws/assets" -type f | wc -l) of 5000 files"
+  "$RUN/bin/agent-$2" workspace list
+  "$RUN/bin/agent-$2" workspace rm "$ws"
+  "$RUN/bin/agent-$2" workspace new "$ws"
+  ;;
+kill-worker-on-check)
+  until pgrep -f "sleep 2 && python3" >/dev/null; do sleep 0.01; done
+  kill -9 "$(<"$RUN/worker.pid")"
+  echo "$(date +%T) killed the worker mid-check" >>"$RUN/worker.log"
+  sleep 1
+  worker
+  ;;
+kill-serve-after-push)
+  until [[ -e $RUN/c-pushed ]]; do sleep 0.05; done
+  kill -9 "$(<"$RUN/serve.pid")"
+  echo "$(date +%T) killed the server after c's push" >>"$RUN/serve.log"
+  listening=$(grep -c "Listening on" "$RUN/serve.log")
+  (
+    until (($(grep -c "Listening on" "$RUN/serve.log") > listening)); do sleep 0.05; done
+    touch "$RUN/serve-restarted"
+  ) &
+  serve
+  ;;
+mark) echo "${EPOCHREALTIME//[.,]/} $2" >>"$RUN/times" ;;
+times)
+  # Each step lasts until the next starts, and the last until now.
+  previous="" step=""
+  while read -r at name; do
+    [[ -n $previous ]] && took "$step" $((at - previous))
+    previous=$at step=$name
+  done <"$RUN/times"
+  took "$step" $((${EPOCHREALTIME//[.,]/} - previous))
+  ;;
+*)
+  sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
+  exit 2
+  ;;
+esac
