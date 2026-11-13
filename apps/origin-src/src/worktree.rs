@@ -557,7 +557,8 @@ impl<'a, P: Platform> Worktree<'a, P> {
     ///
     /// # Errors
     ///
-    /// Fails like [`Worktree::checkout`].
+    /// Fails like [`Worktree::checkout`], and before changing any file if
+    /// the content of one it writes cannot be read.
     pub fn restore(&self, changes: &[FileChange]) -> Result<(), SnapshotError> {
         let cache = StatCache::default();
         let seen = Self::par_map(changes, |change| {
@@ -575,6 +576,13 @@ impl<'a, P: Platform> Worktree<'a, P> {
         if changes.is_empty() {
             return Ok(());
         }
+        // Every content it writes can be read before anything changes, so
+        // a store that fails it leaves the files as they are.
+        Self::par_map(&changes, |change| {
+            change
+                .new
+                .map_or(Ok(()), |entry| Ok(self.store.read(entry.id).map(drop)?))
+        })?;
         self.apply(&changes, Some(&seen), &[])
     }
 
@@ -1345,6 +1353,26 @@ mod tests {
         let forth = fixture.store.diff(file, dir).unwrap();
         worktree.checkout(&forth, &[], Some(&cache)).unwrap();
         assert_eq!(fixture.snapshot(&StatCache::default()).0, dir);
+    }
+
+    #[test]
+    fn restoring_reads_every_content_before_changing_a_file() {
+        let fixture = Fixture::new();
+        fixture.write("removed", "old");
+        let (old, _) = fixture.snapshot(&StatCache::default());
+        fs::remove_file(fixture.dir.path().join("removed")).unwrap();
+        fixture.write("lost", "content the store no longer has");
+        let (new, _) = fixture.snapshot(&StatCache::default());
+        let changes = fixture.store.diff(old, new).unwrap();
+        let lost = EncodedObject::blob(b"content the store no longer has");
+        fs::remove_file(fixture.store.path(lost.id())).unwrap();
+
+        // The files as the move found them: it fails before removing one.
+        fs::remove_file(fixture.dir.path().join("lost")).unwrap();
+        fixture.write("removed", "old");
+        assert!(fixture.worktree().restore(&changes).is_err());
+        let removed = fs::read_to_string(fixture.dir.path().join("removed"));
+        assert_eq!(removed.unwrap(), "old", "untouched");
     }
 
     #[test]

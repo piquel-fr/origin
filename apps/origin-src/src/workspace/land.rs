@@ -23,6 +23,7 @@ use origin_shared::{
 use super::{Behind, WorkingCopy, Workspace, WorkspaceError};
 use crate::conflict::Conflicts;
 use crate::index::Index;
+use crate::oplog::Why;
 use crate::policy::Policy;
 use crate::queue::{Blocked, Landing, Pending, Proposal, Queue};
 use crate::tree::Merge;
@@ -393,7 +394,7 @@ impl Workspace {
         unwritten: &[Vec<EncodedObject>],
         conflicts: &Conflicts,
     ) -> Result<(), WorkspaceError> {
-        self.switch_to(working_copy, id, revision, unwritten)?;
+        self.switch_to(working_copy, id, revision, unwritten, Why::Command)?;
         println!("Working copy: {}", self.headline(revision)?);
         println!("On top of: {}", self.describe_base(revision.base)?);
         if !conflicts.is_empty() {
