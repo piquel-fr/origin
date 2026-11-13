@@ -3,11 +3,14 @@
 //! `~/.config`:
 //!
 //! - `config.toml`: `user = "alice"`, who authors revisions (by default
-//!   `$USER`), and `node = "laptop"`, this node's name (by default the
-//!   user's).
+//!   `$USER`), `node = "laptop"`, this node's name (by default the
+//!   user's), and `[tokens]`, the token to send each server, by its URL:
+//!   `"http://127.0.0.1:7878" = "a long random secret"`. `$ORIGIN_TOKEN`
+//!   overrides them.
 //! - `node.key`: this node's secret ed25519 key, created by the first
 //!   `origin init`, readable only by its owner.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -25,6 +28,17 @@ pub struct UserConfig {
     dir: PathBuf,
     user: PrincipalName,
     node: PrincipalName,
+    tokens: Tokens,
+}
+
+/// The tokens to send servers, by URL, which never show in debug output.
+#[derive(Clone, Default, Deserialize)]
+struct Tokens(BTreeMap<String, String>);
+
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.keys()).finish()
+    }
 }
 
 /// `config.toml`.
@@ -33,6 +47,8 @@ pub struct UserConfig {
 struct ConfigFile {
     user: Option<String>,
     node: Option<String>,
+    #[serde(default)]
+    tokens: Tokens,
 }
 
 impl UserConfig {
@@ -73,7 +89,27 @@ impl UserConfig {
             .map(name)
             .transpose()?
             .unwrap_or_else(|| user.clone());
-        Ok(Self { dir, user, node })
+        let tokens = file
+            .tokens
+            .0
+            .into_iter()
+            .map(|(server, token)| (server.trim_end_matches('/').to_owned(), token))
+            .collect();
+        Ok(Self {
+            dir,
+            user,
+            node,
+            tokens: Tokens(tokens),
+        })
+    }
+
+    /// The token to send the server at `base`, such as
+    /// `http://127.0.0.1:7878`: `$ORIGIN_TOKEN`, or the one configured.
+    #[must_use]
+    pub fn token(&self, base: &str) -> Option<String> {
+        env::var("ORIGIN_TOKEN")
+            .ok()
+            .or_else(|| self.tokens.0.get(base.trim_end_matches('/')).cloned())
     }
 
     /// The user, who authors revisions and issues statements.

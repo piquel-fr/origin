@@ -14,10 +14,12 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
-use origin_shared::PrincipalName;
+use origin_shared::access::{Capability, Token};
 use origin_shared::api::{RepoName, RepoSummary};
+use origin_shared::{Principal, PrincipalName};
 use serde::Deserialize;
 
+use crate::auth::{Credentials, StaticTokens};
 use crate::config::KeyFile;
 use crate::http::Api;
 use crate::policy::Policy;
@@ -33,9 +35,14 @@ use crate::store::Store;
 ///
 /// [repos]
 /// origin = "repos/origin"   # name = path
+///
+/// [tokens]                  # static tokens, by principal
+/// "user:alice" = "a long random secret"
 /// ```
 ///
-/// Paths are relative to the file.
+/// Paths are relative to the file. Callers without a token are anonymous,
+/// and only read; the server also takes the scoped tokens it signed (see
+/// [`ServerConfig::issue_token`]).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -49,6 +56,9 @@ pub struct ServerConfig {
     /// The repositories to serve, by name.
     #[serde(default)]
     pub repos: BTreeMap<RepoName, PathBuf>,
+    /// Static tokens.
+    #[serde(default)]
+    pub tokens: StaticTokens,
 }
 
 impl ServerConfig {
@@ -111,6 +121,26 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// `origin token issue --config <file> --as <principal>`: signs a
+    /// token acting for `principal` with `scope`, valid for `ttl`, at most
+    /// [`OriginService::MAX_TOKEN_TTL`] as any token, with the server's key,
+    /// and returns it. The token acts with the principal's rights in each
+    /// repository, narrowed to the scope, so an operator can hand agents
+    /// identities of their own.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the key cannot be read or generated.
+    pub fn issue_token(
+        &self,
+        principal: Principal,
+        scope: Vec<Capability>,
+        ttl: Duration,
+    ) -> anyhow::Result<String> {
+        let ttl = ttl.min(OriginService::MAX_TOKEN_TTL);
+        Ok(Token::new(principal, scope, ttl).sign(&self.node()?.key))
+    }
+
     /// `origin serve`: serves the repositories until interrupted, logging
     /// requests to stderr. Prints the address it listens on, which tells
     /// callers that chose port 0 where to connect.
@@ -127,7 +157,8 @@ impl ServerConfig {
             .with_writer(std::io::stderr)
             .init();
         let node = self.node()?;
-        let repositories = Repositories::open(self.repos, &node)?;
+        let credentials = Credentials::new(node.clone(), Box::new(self.tokens));
+        let repositories = Repositories::open(self.repos, &node, credentials)?;
         repositories.compact_in_background();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -151,31 +182,49 @@ impl ServerConfig {
 }
 
 /// The repositories a server hosts, each served by the server's node and
-/// kept open while it runs.
-#[derive(Debug, Default)]
+/// kept open while it runs, and how it tells its callers apart.
+#[derive(Debug)]
 pub struct Repositories {
     repos: BTreeMap<RepoName, OriginService>,
+    credentials: Credentials,
 }
 
 impl Repositories {
     /// How often [`Repositories::compact_in_background`] checks.
     const COMPACT_EVERY: Duration = Duration::from_mins(1);
 
+    /// No repositories yet, for callers `credentials` tells apart.
+    #[must_use]
+    pub fn new(credentials: Credentials) -> Self {
+        Self {
+            repos: BTreeMap::new(),
+            credentials,
+        }
+    }
+
     /// Opens the repositories at the given paths, served by `node`.
     ///
     /// # Errors
     ///
     /// Fails if one has no repository.
-    pub fn open(repos: BTreeMap<RepoName, PathBuf>, node: &Node) -> anyhow::Result<Self> {
-        let repos = repos
-            .into_iter()
-            .map(|(name, path)| {
-                let service = OriginService::open(path, node.clone())
-                    .with_context(|| format!("cannot serve repository `{name}`"))?;
-                Ok((name, service))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Self { repos })
+    pub fn open(
+        repos: BTreeMap<RepoName, PathBuf>,
+        node: &Node,
+        credentials: Credentials,
+    ) -> anyhow::Result<Self> {
+        let mut repositories = Self::new(credentials);
+        for (name, path) in repos {
+            let service = OriginService::open(path, node.clone())
+                .with_context(|| format!("cannot serve repository `{name}`"))?;
+            repositories.insert(name, service);
+        }
+        Ok(repositories)
+    }
+
+    /// How the server tells its callers apart.
+    #[must_use]
+    pub fn credentials(&self) -> &Credentials {
+        &self.credentials
     }
 
     /// Compacts each repository once enough loose objects pile up in it
@@ -217,23 +266,55 @@ impl Repositories {
         self.repos.insert(name, service);
     }
 
-    /// Lists the repositories, by name.
-    #[must_use]
-    pub fn list(&self, _caller: &Caller) -> Vec<RepoSummary> {
-        self.repos
-            .keys()
-            .map(|name| RepoSummary { name: name.clone() })
-            .collect()
-    }
-
-    /// The repository `name`.
+    /// Lists the repositories the caller sees, by name.
     ///
     /// # Errors
     ///
-    /// Fails if the server hosts none by that name.
-    pub fn get(&self, _caller: &Caller, name: &RepoName) -> Result<&OriginService, ServiceError> {
-        self.repos
-            .get(name)
-            .ok_or_else(|| ServiceError::UnknownRepository(name.clone()))
+    /// Fails if a repository's policy cannot be read.
+    pub fn list(&self, caller: &Caller) -> Result<Vec<RepoSummary>, ServiceError> {
+        let mut seen = Vec::new();
+        for (name, service) in &self.repos {
+            if service.sees_repository(caller)? {
+                seen.push(RepoSummary { name: name.clone() });
+            }
+        }
+        Ok(seen)
+    }
+
+    /// The repository `name`, if the caller sees it: invisible repositories
+    /// don't exist.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server hosts none by that name the caller sees, or its
+    /// policy cannot be read.
+    pub fn get(&self, caller: &Caller, name: &RepoName) -> Result<&OriginService, ServiceError> {
+        match self.repos.get(name) {
+            Some(service) if service.sees_repository(caller)? => Ok(service),
+            _ => Err(ServiceError::UnknownRepository(name.clone())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn tokens_signed_with_the_key_last_at_most_a_week() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("origin-server.toml");
+        fs::write(&path, "listen = \"127.0.0.1:0\"\nnode = \"hosted\"\n").unwrap();
+        let config = ServerConfig::load(&path).unwrap();
+        let month = Duration::from_hours(30 * 24);
+        let text = config
+            .issue_token("user:agent".parse().unwrap(), Vec::new(), month)
+            .unwrap();
+        let token = Token::verify(&text, &config.node().unwrap().key.public()).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let cap = (now + OriginService::MAX_TOKEN_TTL).as_secs();
+        assert!(token.expires <= cap && token.expires + 60 > cap);
     }
 }

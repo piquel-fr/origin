@@ -21,9 +21,18 @@ review bots read and write at the same time, written in Rust.
   the HTTP routes (`http.rs`) and the command line's commands that the API
   offers only translate into its calls, so neither duplicates the other.
   `sync.rs` shares records with a remote (`remote.rs`), which answers the
-  same calls over the SDK or, for a local path, in-process.
+  same calls over the SDK or, for a local path, in-process. Every call
+  takes a `Caller`, authenticated by `auth.rs`; `permissions.rs` filters
+  what it reads and checks what it writes, by the rights `policy.rs`
+  resolves from `policy.toml`.
 - `tools/xtask`: development tasks, run with `cargo xtask`, such as timing
   origin against git (`just bench-git`).
+
+## API changes
+
+Every server feature lives in `OriginService`; transports like HTTP only
+translate requests. A new HTTP endpoint also takes a line in the SDK's
+`endpoints!` macro, and `just openapi` to update `docs/openapi.json`.
 
 ## Testing & Benchmarks
 
@@ -32,9 +41,10 @@ to a hot path (hashing, storage, snapshots, transfer) should come with a
 benchmark, and its numbers in the pull request.
 
 - `just bench`: the divan micro-benchmarks (encoding, store writes,
-  snapshots, input digests and promotion, landing, reading events, the
-  server's request latency and long-poll wakeups, syncing a 20,000-file
-  tree over HTTP, and a fetch that brings nothing from a long history).
+  snapshots, input digests and promotion, landing, permission checks,
+  reading events, the server's request latency and long-poll wakeups,
+  syncing a 20,000-file tree over HTTP, and a fetch that brings nothing
+  from a long history).
 - `just bench-git`: times origin against git on a 20,000-file tree with
   hyperfine, and rewrites `docs/benchmarks.md`.
 

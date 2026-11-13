@@ -603,7 +603,7 @@ impl Entry {
     pub(crate) fn of(object: &EncodedObject) -> Result<Option<Self>, DecodeError> {
         let id = object.id();
         Ok(match object.kind()? {
-            ObjectKind::Blob | ObjectKind::Tree => None,
+            ObjectKind::Blob | ObjectKind::Tree | ObjectKind::Attachment => None,
             ObjectKind::Revision => {
                 let revision: Revision = object.decode_as()?;
                 Some(Self::Revision {
@@ -915,7 +915,7 @@ mod tests {
     use std::thread;
 
     use origin_platform::Native;
-    use origin_shared::{Base, BlobId, Inputs, Kind, Record, Tree, Verdict};
+    use origin_shared::{AttachmentId, Base, Inputs, Kind, Record, Tree, Verdict};
 
     use super::*;
     use crate::oplog::FramePart;
@@ -939,7 +939,7 @@ mod tests {
             base: Base::Acceptance(ObjectId::from_bytes([0; 32]).into()),
             deps: Vec::new(),
             snapshot: Tree::default().encode().id().into(),
-            description: BlobId::from(EncodedObject::blob(seed.as_bytes()).id()),
+            description: AttachmentId::from(EncodedObject::attachment(seed.as_bytes()).id()),
             author: "user:alice".parse().unwrap(),
         }
         .encode()

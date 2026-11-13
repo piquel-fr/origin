@@ -8,12 +8,16 @@
 //!   workspace                  the revision the working copy is
 //!   state                      the stat cache of the last snapshot
 //!   moving                     the move in progress, if a checkout is
+//!   lock                       held by the command working in the working copy
+//!   remote, access             the remote, and what it lets the user do
 //! ```
 //!
 //! A repository can have several working copies, its workspaces, which
-//! share its store and op log. The others have only `workspace`, `state`
-//! and `moving` in their `.origin`, and a `repository` file naming the main
-//! one's.
+//! share its store and op log. The others have only `workspace`, `state`,
+//! `moving` and `lock` in their `.origin`, and a `repository` file naming
+//! the main one's. Commands in different workspaces run at once; in one,
+//! each waits for the one before, except `watch`, which never touches the
+//! working copy, and `workspace rm`, which opens the workspace it removes.
 //!
 //! The working copy is always on a revision of the current change. Every
 //! command that reads it snapshots it first. The files the snapshot finds
@@ -63,6 +67,7 @@
 //! which publishes `moving` again first: a crash then finishes taking the
 //! files back, not the move that failed.
 
+mod access;
 mod annotate;
 mod land;
 mod ops;
@@ -78,10 +83,10 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use origin_platform::{LockedFile, Native};
+use origin_platform::{LockMode, LockedFile, Native};
 use origin_shared::api::{LogQuery, RevisionEntry, Revisions};
 use origin_shared::{
-    AcceptanceId, Base, BlobId, ChangeId, EncodedObject, Kind, Principal, Record, RecordId,
+    AcceptanceId, AttachmentId, Base, ChangeId, EncodedObject, Kind, Principal, Record, RecordId,
     RepoPath, Revision, RevisionId, Source, Statement, StatementId, TargetId, TargetName, Tree,
     TreeId,
 };
@@ -118,6 +123,9 @@ pub struct Workspace {
     unreadable_move: Option<PathBuf>,
     /// The repository's remote, once opened: see [`Workspace::remote`].
     remote: OnceLock<Option<Remote>>,
+    /// Held while the command that opened the working copy works in it,
+    /// so only one at a time does: see [`Workspace::open`].
+    lock: Option<LockedFile>,
 }
 
 /// The working copy as of a snapshot.
@@ -235,6 +243,10 @@ impl Workspace {
     /// in progress: see [`Moving`].
     const MOVING: &str = "moving";
 
+    /// The file in [`Workspace::META_DIR`] held locked by the command
+    /// working in the working copy.
+    const LOCK: &str = "lock";
+
     /// `origin init`: creates a repository in `root`, with the `policy`
     /// target naming this node the authority of `policy` and `main`, an
     /// empty `main`, and a first change on top of it.
@@ -259,7 +271,7 @@ impl Workspace {
         let policy = Policy::initial(config.node(), &key.public());
         let main = Queue::new(&store, &key, config.node().clone()).init(&policy)?;
         let empty_tree = Tree::default().encode();
-        let empty_description = EncodedObject::blob(b"");
+        let empty_description = EncodedObject::attachment(b"");
 
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
@@ -303,10 +315,19 @@ impl Workspace {
 
     /// Opens the working copy at `root`: the main one, whose `.origin` holds
     /// the store, or another workspace, whose `.origin/repository` names
-    /// the main one's. Finishes a move a crash cut short first.
+    /// the main one's. Waits for the command working in it, if any, then
+    /// finishes a move a crash cut short.
     fn open(root: &Path, config: UserConfig, actor: &Actor) -> Result<Self, WorkspaceError> {
         let root = &Self::canonical(root)?;
         let meta = root.join(Self::META_DIR);
+        // Held until the command is done, so `moving` is only ever found
+        // once the move it records was cut short.
+        let lock = LockedFile::open(
+            &Native::default(),
+            &meta.join(Self::LOCK),
+            LockMode::Exclusive,
+        )
+        .map_err(StoreError::from)?;
         let repository = meta.join(Self::REPOSITORY);
         let store = match Self::read_path(&repository) {
             Ok(store) if store.is_dir() => store,
@@ -319,8 +340,11 @@ impl Workspace {
         let revision =
             Self::read_pointer(root)?.ok_or_else(|| WorkspaceError::Incomplete(root.to_owned()))?;
         let store = Store::open_writable(store, Native::default())?;
-        let store = store.with_actor(actor.in_workspace(root));
-        let mut workspace = Self::at(root.to_owned(), store, config, revision);
+        let store = Self::withholding(store.with_actor(actor.in_workspace(root)), &config)?;
+        let mut workspace = Self {
+            lock: Some(lock),
+            ..Self::at(root.to_owned(), store, config, revision)
+        };
         workspace.finish_move()?;
         Ok(workspace)
     }
@@ -336,6 +360,7 @@ impl Workspace {
             unlogged: None,
             unreadable_move: None,
             remote: OnceLock::new(),
+            lock: None,
         }
     }
 
@@ -457,7 +482,7 @@ impl Workspace {
         let revision: Revision = self.store.get(self.revision)?;
         let path = self.meta(Self::STATE);
         let loaded = StatCache::load(&path);
-        let (files, cache) = Worktree::new(&self.root, &self.store).snapshot(&loaded)?;
+        let (found, cache) = Worktree::new(&self.root, &self.store).snapshot(&loaded)?;
         let cache = match cache {
             Some(cache) => {
                 cache
@@ -467,6 +492,11 @@ impl Workspace {
             }
             None => loaded,
         };
+        // What the user cannot read stays as the revision has it.
+        let (files, trees) = self.store.keep_withheld(found, revision.snapshot)?;
+        if !trees.is_empty() {
+            self.store.write_all(&trees)?;
+        }
         let mut index = Index::open(&self.store)?;
         let behind = self.behind(&index, self.revision, &revision)?;
         let mut conflicts = self.conflicts(&mut index, self.revision, &revision)?;
@@ -760,11 +790,14 @@ impl Workspace {
     ) -> Result<(), WorkspaceError> {
         // Before changing any file.
         self.may_move()?;
-        // Fetched first, so a fetch that fails moves nothing.
+        // Fetched first, so a fetch that fails moves nothing. A new
+        // revision is made of what's here.
         let changes = if revision.snapshot == working_copy.files {
             Vec::new()
+        } else if unwritten.is_empty() {
+            self.changes(working_copy.files, RecordId::Revision(to))?
         } else {
-            self.changes(working_copy.files, revision.snapshot)?
+            self.store.diff(working_copy.files, revision.snapshot)?
         };
         // The files stay as they are: there's nothing to finish.
         if changes.is_empty() {
@@ -825,23 +858,45 @@ impl Workspace {
         Ok(Worktree::new(&self.root, &self.store).restore(&changes)?)
     }
 
-    /// The changes that make the files of `from` those of `to`, after
-    /// fetching what the repository lacks of `to`. A move asks for them
-    /// before it publishes `moving`, so a fetch that fails moves nothing.
-    fn changes(&self, from: TreeId, to: TreeId) -> Result<Vec<FileChange>, WorkspaceError> {
+    /// The changes that make the files of `from` those of the snapshot of
+    /// `to`, a revision or an acceptance, after fetching what the
+    /// repository lacks of it. The paths the remote withholds stay as they
+    /// are. A move asks for them before it publishes `moving`, so a fetch
+    /// that fails moves nothing.
+    fn changes(&self, from: TreeId, to: RecordId) -> Result<Vec<FileChange>, WorkspaceError> {
         self.need(&[to])?;
-        Ok(match self.store.diff(from, to) {
+        let tree = self
+            .store
+            .snapshot_of(to)?
+            .ok_or(SyncError::NoSnapshot(to))?;
+        let changes = match self.store.diff(from, tree) {
             // A snapshot can lack trees its root names, if its fetch was
             // cut short before fetches were marked: fetch it whole again.
             Err(StoreError::NotFound(missing)) => match self.remote()? {
                 Some(remote) => {
                     self.sync(remote).repair(to)?;
-                    self.store.diff(from, to)?
+                    self.store.diff(from, tree)?
                 }
                 None => return Err(StoreError::NotFound(missing).into()),
             },
             changes => changes?,
-        })
+        };
+        // A clone may lack files its snapshots name: those it could not
+        // read when it fetched them.
+        if Self::remote_url(&self.store)?.is_some() {
+            let mut missing = Vec::new();
+            for change in &changes {
+                if let Some(new) = change.new
+                    && !self.store.contains(new.id)?
+                {
+                    missing.push(change.path.clone());
+                }
+            }
+            if !missing.is_empty() {
+                self.sync(self.require_remote()?).need_paths(to, missing)?;
+            }
+        }
+        Ok(changes)
     }
 
     /// Makes the files match a snapshot, given `changes`, how they differ
@@ -915,7 +970,11 @@ impl Workspace {
     /// cannot be read.
     pub fn diff(&mut self) -> Result<(), WorkspaceError> {
         let working_copy = self.snapshot()?;
-        self.print_diff(working_copy.revision.base, working_copy.files)
+        self.print_diff(
+            working_copy.id,
+            working_copy.revision.base,
+            working_copy.files,
+        )
     }
 
     /// `origin show [<change>]`: prints a change's head, or each of them if
@@ -966,15 +1025,21 @@ impl Workspace {
                 println!("    {line}");
             }
             println!();
-            self.print_diff(revision.base, files)?;
+            self.print_diff(id, revision.base, files)?;
         }
         Ok(())
     }
 
-    /// Prints the changes `snapshot` makes to `base`, line by line.
-    fn print_diff(&self, base: Base, snapshot: TreeId) -> Result<(), WorkspaceError> {
+    /// Prints the changes `snapshot`, of revision `id`, makes to `base`,
+    /// line by line.
+    fn print_diff(
+        &self,
+        id: RevisionId,
+        base: Base,
+        snapshot: TreeId,
+    ) -> Result<(), WorkspaceError> {
         let base = self.base_tree(base)?;
-        self.need(&[snapshot])?;
+        self.need(&[RecordId::Revision(id)])?;
         for change in self.store.diff(base, snapshot)? {
             print!("{}", FileDiff::new(&self.store, &change)?);
         }
@@ -992,7 +1057,7 @@ impl Workspace {
         let working_copy = self.record()?;
         let mut working_copy = self.following(working_copy)?;
         self.log_draft(&working_copy);
-        let description = EncodedObject::blob(description.as_bytes());
+        let description = EncodedObject::attachment(description.as_bytes());
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
@@ -1030,7 +1095,7 @@ impl Workspace {
         let working_copy = self.record()?;
         let mut working_copy = self.following(working_copy)?;
         self.log_draft(&working_copy);
-        let description = EncodedObject::blob(description.as_bytes());
+        let description = EncodedObject::attachment(description.as_bytes());
         let revision = Revision {
             predecessors: vec![working_copy.id],
             description: description.id().into(),
@@ -1104,10 +1169,10 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Fails if the change cannot be found or diverged, the user didn't
-    /// create it, so readers would ignore the statement, or the records
-    /// cannot be written. Then no abandonment is written and nothing is
-    /// checked out.
+    /// Fails if the change cannot be found or diverged, the user neither
+    /// created it nor is an `admin`, so readers would ignore the statement,
+    /// or the records cannot be written. Then no abandonment is written and
+    /// nothing is checked out.
     pub fn abandon(&mut self, change: Option<&str>, reason: &str) -> Result<(), WorkspaceError> {
         let mut working_copy = self.refresh()?;
         let index = &working_copy.index;
@@ -1116,7 +1181,7 @@ impl Workspace {
             None => working_copy.revision.change,
         };
         let head = Self::single_head(index, change)?;
-        let reason = EncodedObject::blob(reason.as_bytes());
+        let reason = EncodedObject::attachment(reason.as_bytes());
         let statement = Statement {
             subject: RecordId::Revision(head),
             kind: Kind::ABANDON,
@@ -1127,7 +1192,8 @@ impl Workspace {
             supersedes: None,
             promoted_from: None,
         };
-        if !self.store.authorizes(&statement)? {
+        // As readers count it.
+        if !Policy::load(&self.store)?.authorizes(&self.store, &statement)? {
             return Err(AnnotateError::Reserved {
                 kind: statement.kind,
                 issuer: statement.issuer,
@@ -1142,7 +1208,7 @@ impl Workspace {
         }
 
         let abandoned: Revision = self.store.get(head)?;
-        let empty = EncodedObject::blob(b"");
+        let empty = EncodedObject::attachment(b"");
         let revision = Revision {
             change: ChangeId::random().map_err(WorkspaceError::Random)?,
             predecessors: Vec::new(),
@@ -1192,11 +1258,8 @@ impl Workspace {
             heads[heads.len() - 1]
         };
         let kept_revision: Revision = self.store.get(kept)?;
-        let snapshots = heads
-            .iter()
-            .map(|&head| Ok(self.store.get(head)?.snapshot))
-            .collect::<Result<Vec<_>, WorkspaceError>>()?;
-        self.need(&snapshots)?;
+        let records: Vec<_> = heads.iter().copied().map(RecordId::Revision).collect();
+        self.need(&records)?;
         let base = self.merge_base(&heads)?;
         let mut snapshot = kept_revision.snapshot;
         let mut merged = Conflicts::default();
@@ -1407,14 +1470,13 @@ impl Workspace {
         self.text(revision.description)
     }
 
-    /// A blob's content, as text.
-    fn text(&self, blob: BlobId) -> Result<String, WorkspaceError> {
-        let id = blob.into();
-        let blob = self.store.read(id)?;
-        let content = blob
-            .blob_content()
-            .map_err(|source| StoreError::Decode { id, source })?;
-        Ok(String::from_utf8_lossy(content).into_owned())
+    /// An attachment's content, as text.
+    fn text(&self, attachment: AttachmentId) -> Result<String, WorkspaceError> {
+        let content = self
+            .store
+            .try_attachment(attachment)?
+            .ok_or(StoreError::NotFound(attachment.into()))?;
+        Ok(String::from_utf8_lossy(&content).into_owned())
     }
 
     /// The first line of a revision's description.
@@ -1452,16 +1514,24 @@ impl Workspace {
     }
 
     /// Who abandoned a revision, and why: only those who may, as
-    /// [`Store::authorizes`] says.
+    /// [`Policy::authorizes`] says, as the landing queue counts them.
     fn abandonments(
         &self,
         index: &Index,
         revision: RevisionId,
     ) -> Result<Vec<(Principal, String)>, WorkspaceError> {
         let mut abandonments = Vec::new();
+        let mut policy = None;
         for &id in index.statements(RecordId::Revision(revision)) {
             let statement = self.store.get(id)?;
-            if statement.kind == Kind::ABANDON && self.store.authorizes(&statement)? {
+            if statement.kind != Kind::ABANDON {
+                continue;
+            }
+            let policy = match &policy {
+                Some(policy) => policy,
+                None => policy.insert(Policy::load(&self.store)?),
+            };
+            if policy.authorizes(&self.store, &statement)? {
                 let reason = match statement.payload {
                     Some(payload) => self.text(payload)?,
                     None => String::new(),
@@ -1494,12 +1564,8 @@ impl Workspace {
     /// The snapshot a revision was made on top of, fetched if the
     /// repository lacks it.
     fn base_tree(&self, base: Base) -> Result<TreeId, WorkspaceError> {
-        let tree = match base {
-            Base::Acceptance(id) => self.store.get(id)?.body().state,
-            Base::Revision(id) => self.store.get(id)?.snapshot,
-        };
-        self.need(&[tree])?;
-        Ok(tree)
+        self.need(&[base.into()])?;
+        Ok(self.store.base_snapshot(base)?)
     }
 
     fn describe_base(&self, base: Base) -> Result<String, WorkspaceError> {

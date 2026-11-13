@@ -218,12 +218,14 @@ impl Workspace {
     /// Fails if the cursor expired, the remote fails, or the op log or a
     /// record cannot be read.
     pub fn watch(
-        &self,
+        &mut self,
         kinds: Vec<KindPattern>,
         subjects: Vec<String>,
         since: Option<u64>,
         local: bool,
     ) -> Result<(), WorkspaceError> {
+        // It never touches the working copy, so others may meanwhile.
+        self.lock = None;
         let remote = if local { None } else { self.remote()? };
         let service = self.service(None)?;
         let mut query = EventsQuery {
