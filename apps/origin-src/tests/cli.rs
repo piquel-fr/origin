@@ -760,6 +760,24 @@ fn statements_about_statements_show_under_them() {
 }
 
 #[test]
+fn a_payload_the_repository_lacks_is_unavailable() {
+    let repo = Repo::new();
+    repo.ok(&["annotate", "@", "review", "--pass", "-m", "Looks good"]);
+    let hex = EncodedObject::blob(b"Looks good").id().to_hex();
+    fs::remove_file(repo.path(&format!(
+        ".origin/objects/loose/{}/{}",
+        &hex[..2],
+        &hex[2..]
+    )))
+    .unwrap();
+    let listed = repo.ok(&["statements"]);
+    assert!(
+        listed.contains("    payload: unavailable here\n"),
+        "{listed}"
+    );
+}
+
+#[test]
 fn annotating_a_statement_needs_one_and_no_inputs() {
     let repo = Repo::new();
     let mut ids = Vec::new();
@@ -921,6 +939,10 @@ fn statements_are_promoted_where_their_inputs_are_unchanged() {
             .contains("is a reserved kind")
     );
     assert!(repo.fails(&["annotate", "@", "ci.lint"]).contains("--pass"));
+    assert!(
+        repo.ok(&["gc"])
+            .starts_with("Dropped 0 payloads past their retention")
+    );
 }
 
 #[test]

@@ -1,10 +1,11 @@
-//! The statement commands: `annotate`, `statements` and `promote`,
+//! The statement commands: `annotate`, `statements`, `promote` and `gc`,
 //! and flagging divergence when a revision is saved.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use origin_shared::{
     BlobId, EncodedObject, Inputs, Kind, Principal, RecordId, Revision, RevisionId, Statement,
@@ -14,6 +15,7 @@ use origin_shared::{
 use super::{WorkingCopy, Workspace, WorkspaceError};
 use crate::annotations::Annotations;
 use crate::index::{FindError, Index};
+use crate::policy::Policy;
 use crate::store::StoreError;
 use crate::tree::Snapshots;
 
@@ -300,11 +302,12 @@ impl Workspace {
         Ok(())
     }
 
-    /// A payload's first line if it's text, its size otherwise, or that
-    /// this repository doesn't have it.
+    /// A payload's first line if it's text, its size otherwise, or that this
+    /// repository doesn't have it: retention may have dropped it, or it
+    /// never came here.
     fn payload_summary(&self, payload: BlobId) -> Result<String, WorkspaceError> {
         let Some(content) = self.store.try_blob(payload.into())? else {
-            return Ok("not in this repository".to_owned());
+            return Ok("unavailable here".to_owned());
         };
         Ok(
             match str::from_utf8(&content).map(|text| text.lines().next()) {
@@ -344,6 +347,33 @@ impl Workspace {
                 id.short(),
                 original.short()
             );
+        }
+        Ok(())
+    }
+
+    /// `origin gc`: drops the payloads past the retention `policy.toml`
+    /// sets, packs the small loose objects, and removes the temporary files
+    /// crashed writes left behind. Statements are never dropped.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the policy is invalid, or the store cannot be read,
+    /// compacted or cleaned.
+    pub fn gc(&self) -> Result<(), WorkspaceError> {
+        // The policy in force once collection may start, not before.
+        let retention = || Ok::<_, WorkspaceError>(Policy::load(&self.store)?.retention);
+        let dropped =
+            Annotations::open(&self.store)?.drop_expired_payloads(retention, SystemTime::now())?;
+        println!(
+            "Dropped {} payloads past their retention, freeing {} bytes",
+            dropped.payloads, dropped.bytes
+        );
+        match self.store.gc()? {
+            Some(compaction) => println!(
+                "Packed {} loose objects, merging {} packs",
+                compaction.packed, compaction.merged
+            ),
+            None => println!("Another process is compacting the store"),
         }
         Ok(())
     }

@@ -255,6 +255,11 @@ impl<P: Platform> Store<P> {
         if body.target != target.id() {
             return Err(StoreError::WrongTarget(target.clone()));
         }
+        // A new policy changes which payloads collection keeps, so it never
+        // lands while collection, which reads the policy first, runs.
+        let _held = (*target == TargetName::POLICY)
+            .then(|| self.hold_objects())
+            .transpose()?;
         let encoded = acceptance.encode();
         // The acceptance is durable before the log refers to it.
         self.write_all(slice::from_ref(&encoded))?;
@@ -398,6 +403,22 @@ mod tests {
         assert_eq!(last.body().prev, Some(ids[1]));
         last.verify(&key().public()).unwrap();
         assert_eq!(store.targets().unwrap(), [main]);
+    }
+
+    #[test]
+    fn policy_heads_wait_for_collection() {
+        let (_dir, store) = store();
+        let collecting = store.lock_for_collection().unwrap();
+        // Other targets don't.
+        land(&store, &TargetName::MAIN, 1);
+        let (done, landed) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| done.send(land(&store, &TargetName::POLICY, 1)).unwrap());
+            thread::sleep(std::time::Duration::from_millis(100));
+            assert!(landed.try_recv().is_err(), "the policy waits");
+            drop(collecting);
+            assert_eq!(landed.recv().unwrap().len(), 1);
+        });
     }
 
     #[test]
