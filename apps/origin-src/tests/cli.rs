@@ -854,6 +854,54 @@ fn a_repository_is_one_working_copy_however_init_spells_it() {
 }
 
 #[test]
+fn other_commands_run_plugins_from_the_path() {
+    let repo = Repo::new();
+    repo.write("file", "edited\n");
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("origin-hello");
+    fs::write(
+        &plugin,
+        "#!/bin/sh\necho \"$@\"\necho \"$ORIGIN_REPOSITORY $ORIGIN_REVISION $ORIGIN_REMOTE\"\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&plugin, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |cwd: &std::path::Path, args: &[&str]| {
+        let mut path = std::ffi::OsString::from(plugins.path());
+        path.push(":");
+        path.push(common::path_with_plugins());
+        repo.user()
+            .command(cwd, args)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    };
+
+    let output = run(repo.root(), &["hello", "--loud", "world"]);
+    assert_eq!(output.status.code(), Some(7), "the plugin's exit code");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let revision = repo.revision();
+    assert_eq!(
+        stdout,
+        format!(
+            "--loud world\n{} {revision} \n",
+            // As the command finds it: macOS's temporary directory is a link.
+            fs::canonicalize(repo.path(".origin")).unwrap().display()
+        ),
+        "the working copy, snapshotted first, and no remote"
+    );
+    assert!(repo.ok(&["status"]).ends_with("A file\n"));
+
+    let outside = tempfile::tempdir().unwrap();
+    let output = run(outside.path(), &["hello"]);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "\n  \n");
+    let error = repo.fails(&["nosuch"]);
+    assert!(
+        error.contains("`nosuch` is not an origin command, and no `origin-nosuch` is on PATH"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_move_marker_that_cannot_be_read_is_kept_and_stops_moves() {
     let repo = Repo::new();
     repo.write("a", "a\n");
@@ -1223,26 +1271,10 @@ fn targets_fork_and_land_on_each_other() {
     assert!(repo.ok(&["log", "main"]).contains("\n    overhaul #1\n"));
 }
 
-/// Lands a policy that makes `main` require `ci.test` to pass, from the
-/// runners, ada among them.
-fn require_tests(repo: &Repo) {
-    repo.ok(&["new", "--on", "policy", "Require tests"]);
-    let policy = repo
-        .read("policy.toml")
-        .replace("# [groups]", "[groups]")
-        .replace(
-            "# runners = [\"node:ci-1\"]",
-            "runners = [\"node:ci-1\", \"user:ada\"]",
-        )
-        .replace("# require", "require");
-    repo.write("policy.toml", &policy);
-    assert!(repo.ok(&["land"]).contains(" on policy #1\n"));
-}
-
 #[test]
 fn results_there_count_over_promoted_ones() {
     let repo = Repo::new();
-    require_tests(&repo);
+    repo.require_tests();
     repo.ok(&["new", "--on", "main", "Library"]);
     repo.write("src/lib.rs", "fn a() {}\n");
     repo.ok(&["annotate", "@", "ci.test", "--pass", "--inputs", "src"]);
@@ -1271,7 +1303,7 @@ fn results_there_count_over_promoted_ones() {
 #[test]
 fn landings_wait_for_the_evidence_policy_requires() {
     let repo = Repo::new();
-    require_tests(&repo);
+    repo.require_tests();
     assert!(
         repo.ok(&["targets"])
             .contains("    requires ci.test pass from group:runners\n")
@@ -1288,13 +1320,16 @@ fn landings_wait_for_the_evidence_policy_requires() {
         "{waiting}"
     );
     assert_eq!(repo.ok(&["land", "--status"]), waiting);
-    // A result withdrawn is no evidence.
-    repo.ok(&["annotate", "@", "ci.test", "--pass", "--inputs", "src"]);
+    // A failure, then its withdrawal, are no evidence: each retries the
+    // landing, which waits.
+    repo.ok(&["annotate", "@", "ci.test", "--fail", "--inputs", "src"]);
     repo.ok(&["annotate", "@", "ci.test", "--withdraw"]);
-    assert_eq!(repo.ok(&["land"]), waiting);
+    assert_eq!(repo.ok(&["land", "--status"]), waiting);
+    // The statement lets the landing go on.
     repo.ok(&["annotate", "@", "ci.test", "--pass", "--inputs", "src"]);
-    assert!(repo.ok(&["land"]).contains(" on main #1\n"));
     assert_eq!(repo.ok(&["land", "--status"]), "No landing waits.\n");
+    assert!(repo.ok(&["log", "main"]).contains("main #1 "));
+    repo.ok(&["pull"]);
 
     // Only the authority lands: here, after a policy edit hands `main` to
     // another node.

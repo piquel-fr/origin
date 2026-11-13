@@ -74,7 +74,7 @@ impl Workspace {
             .take_while(|dir| dir.symlink_metadata().is_err())
             .last()
             .map(Path::to_owned);
-        let remote = Self::open_remote(&url, &config)?;
+        let remote = Remote::open_for(&url, &config)?;
         let cloned = Self::clone_into(root.clone(), &url, remote, target, config, actor);
         if cloned.is_err() {
             // Best effort: the error says what went wrong.
@@ -208,16 +208,6 @@ impl Workspace {
         }
     }
 
-    /// Opens the remote at `url` for the user of `config`, with their
-    /// token for it, if they have one.
-    fn open_remote(url: &RemoteUrl, config: &UserConfig) -> Result<Remote, WorkspaceError> {
-        Ok(Remote::open(
-            url,
-            Self::node_of(config)?,
-            url.token(config),
-        )?)
-    }
-
     /// The repository's remote, opened the first time it's needed, if it
     /// has one.
     pub(super) fn remote(&self) -> Result<Option<&Remote>, WorkspaceError> {
@@ -225,7 +215,7 @@ impl Workspace {
             return Ok(remote.as_ref());
         }
         let remote = match Self::remote_url(&self.store)? {
-            Some(url) => Some(Self::open_remote(&url, &self.config)?),
+            Some(url) => Some(Remote::open_for(&url, &self.config)?),
             None => None,
         };
         Ok(self.remote.get_or_init(|| remote).as_ref())

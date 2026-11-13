@@ -245,6 +245,14 @@ pub struct StatementsQuery {
     pub subject: RecordId,
 }
 
+/// Asks for the results of other records to be promoted to one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PromoteRequest {
+    /// The record: a revision or an acceptance.
+    #[schema(value_type = String)]
+    pub subject: RecordId,
+}
+
 /// A statement, whether its issuer superseded it, and whether its claim
 /// holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

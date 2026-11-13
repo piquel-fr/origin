@@ -526,6 +526,68 @@
         }
       }
     },
+    "/api/v1/repos/{repo}/promote": {
+      "post": {
+        "summary": "Promotes results to a record from the records on the same target with\nthe same input digest, as statements this server issues, and retries the\nlandings waiting for them.",
+        "operationId": "promote",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "The repository",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromoteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The statements promoted: none if nothing matched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Annotation"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller isn't signed in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The repository or the record does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/repos/{repo}/records": {
       "put": {
         "summary": "Puts a batch of objects, as a pack: snapshots, revisions and\nstatements, each needing only objects the batch or the repository has,\nof the kinds it names. With `expect`, only if the changes it names have\nthe heads it says when the records are published.",
@@ -1579,7 +1641,7 @@
       },
       "Inputs": {
         "type": "object",
-        "description": "What a statement depended on.\n\nThe input digest of a snapshot hashes the ids it stores at `paths`, with\n`definition` and `toolchain`. A statement that declares inputs and isn't\n`external` is promoted to every revision with the same input digest.",
+        "description": "What a statement depended on.\n\nThe input digest of a record hashes the ids its snapshot stores at\n`paths`, those the state of the target it's on stores at\n`target_paths`, with `definition` and `toolchain`. A statement that\ndeclares inputs and isn't `external` is promoted to every revision on\nthe same target with the same input digest.",
         "required": [
           "paths",
           "definition",
@@ -1601,6 +1663,13 @@
               "$ref": "#/components/schemas/RepoPath"
             },
             "description": "The files and directories read, each covering everything under it."
+          },
+          "target_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoPath"
+            },
+            "description": "The files and directories read from the state of the target the\nrecord is on rather than from its snapshot, such as the definition\nof the checks in force there: a revision is on the target of the\nacceptance it's based on, directly or through the revisions below\nit, and an acceptance on its own."
           },
           "toolchain": {
             "$ref": "#/components/schemas/Digest",
@@ -1962,6 +2031,15 @@
             "$ref": "#/components/schemas/Blocked",
             "description": "Why it waits."
           },
+          "expires": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the token of its submitter, whom it's retried for, expires, in\nseconds since the Unix epoch, if it's a scoped one. Once it has, the\nlanding is no longer retried: it waits until it's landed again.",
+            "minimum": 0
+          },
           "onto": {
             "$ref": "#/components/schemas/TargetName",
             "description": "The target it lands on."
@@ -1972,7 +2050,7 @@
           },
           "subject": {
             "$ref": "#/components/schemas/RecordId",
-            "description": "What the evidence must be about: the revision that would land, or\nthe merged snapshot of a target. A conflict is about the revision,\nor the acceptance, that didn't merge."
+            "description": "What the evidence must be about: the revision that would land, or\nfor a target, the revision of the merge on the tip it lands on. A\nconflict is about the revision, or the acceptance, that didn't merge."
           }
         }
       },
@@ -1993,6 +2071,19 @@
         "examples": [
           "group:runners"
         ]
+      },
+      "PromoteRequest": {
+        "type": "object",
+        "description": "Asks for the results of other records to be promoted to one.",
+        "required": [
+          "subject"
+        ],
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "The record: a revision or an acceptance."
+          }
+        }
       },
       "Proposal": {
         "oneOf": [
@@ -2270,7 +2361,7 @@
       },
       "Statement": {
         "type": "object",
-        "description": "An attributable claim about another record: a check result, a review, a\nconflict, an abandonment.\n\nStatements are permanent. An issuer revises one by issuing another that\nsupersedes it. A promoted statement carries another one over to a record\nwith the same input digest, pointing at it instead of copying its issuer.",
+        "description": "An attributable claim about another record: a check result, a review, a\nconflict, an abandonment.\n\nStatements are permanent. An issuer revises one by issuing another that\nsupersedes it. A promoted statement carries another one over to a record\non the same target with the same input digest, pointing at it instead of\ncopying its issuer.",
         "required": [
           "subject",
           "kind",

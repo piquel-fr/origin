@@ -1046,6 +1046,7 @@ mod tests {
             .unwrap();
         result.inputs = Some(Inputs {
             paths: Vec::new(),
+            target_paths: Vec::new(),
             definition: Digest::of(b"cargo test"),
             toolchain: Digest::of(b"rustc"),
             external: false,

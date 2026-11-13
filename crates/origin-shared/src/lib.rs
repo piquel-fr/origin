@@ -21,9 +21,9 @@ pub use id::{
 };
 pub use name::InvalidName;
 pub use object::{
-    Acceptance, AcceptanceBody, Base, EncodedObject, EntryKind, EntryName, Inputs, Kind, NodeKey,
-    NodePublicKey, Object, ObjectKind, Record, RecordId, Revision, Signature, Source, Statement,
-    Tree, TreeEntry, Verdict,
+    Acceptance, AcceptanceBody, Base, EncodedObject, EntryKind, EntryName, InputSource, Inputs,
+    Kind, NodeKey, NodePublicKey, Object, ObjectKind, Record, RecordId, Revision, Signature,
+    Source, Statement, Tree, TreeEntry, Verdict,
 };
 pub use path::RepoPath;
 pub use principal::{Principal, PrincipalName};

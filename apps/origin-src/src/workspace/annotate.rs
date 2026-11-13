@@ -7,8 +7,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use origin_shared::api::Annotation;
+use origin_shared::pack::Pack;
 use origin_shared::{
-    AttachmentId, EncodedObject, Inputs, Kind, Principal, RecordId, Revision, RevisionId,
+    AttachmentId, EncodedObject, Inputs, Kind, Principal, Record, RecordId, Revision, RevisionId,
     Statement, StatementId, Verdict,
 };
 
@@ -117,7 +119,8 @@ impl Workspace {
 
     /// `origin annotate <rev> <kind> --pass|--fail|--neutral|--withdraw`:
     /// issues a statement about a revision as the user, superseding the
-    /// user's latest one of the same kind about it. Without a `verdict`, it
+    /// user's latest one of the same kind about it, and resumes the
+    /// landings waiting for evidence about it. Without a `verdict`, it
     /// withdraws that one: see [`Statement::withdraws`].
     ///
     /// # Errors
@@ -158,7 +161,12 @@ impl Workspace {
             payload: payload.as_ref().map(|payload| payload.id().into()),
             promoted_from: None,
         };
-        let id = annotations.issue(&statement, payload)?;
+        // Through the service, which resumes the landings waiting for it.
+        let encoded = statement.encode();
+        let id: StatementId = encoded.id().into();
+        let objects = payload.into_iter().chain([encoded]).collect();
+        self.service(Some(annotations.into_index()))?
+            .put_records(&Caller::Owner, Pack { objects })?;
         if let Some(verdict) = verdict {
             println!(
                 "Issued statement {}: {} {verdict} about {}",
@@ -179,9 +187,10 @@ impl Workspace {
                 subject.describe()
             );
         }
-        if let (Some(inputs), RecordId::Revision(revision)) = (&statement.inputs, subject) {
-            let snapshot = self.store.get(revision)?.snapshot;
-            let digest = Snapshots::new(&self.store).input_digest(snapshot, inputs)?;
+        if let (Some(inputs), Some(mut trees)) =
+            (&statement.inputs, self.store.input_trees(subject)?)
+            && let Some(digest) = Snapshots::new(&self.store).input_digest(&mut trees, inputs)?
+        {
             println!("Input digest: {}", digest.short());
         }
         Ok(())
@@ -290,7 +299,16 @@ impl Workspace {
                 );
             }
             if let Some(inputs) = &statement.inputs {
-                let paths: Vec<_> = inputs.paths.iter().map(ToString::to_string).collect();
+                let on_target = inputs
+                    .target_paths
+                    .iter()
+                    .map(|path| format!("{path} on the target"));
+                let paths: Vec<_> = inputs
+                    .paths
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(on_target)
+                    .collect();
                 let external = if inputs.external {
                     ", and external"
                 } else {
@@ -324,8 +342,9 @@ impl Workspace {
     }
 
     /// `origin promote [<rev>]`: carries promotable results over to a
-    /// revision, the working copy by default, from the records with the
-    /// same input digest, as statements this node issues.
+    /// revision, the working copy by default, from the records on the same
+    /// target with the same input digest, as statements this node issues.
+    /// Landings waiting for them continue.
     ///
     /// # Errors
     ///
@@ -334,15 +353,13 @@ impl Workspace {
     pub fn promote(&mut self, rev: &str) -> Result<(), WorkspaceError> {
         let working_copy = self.refresh()?;
         let revision = working_copy.find_revision(rev)?;
-        let mut annotations = Annotations::new(&self.store, working_copy.index);
-        let promoted =
-            annotations.promote(RecordId::Revision(revision), &self.node_principal(), |_| {
-                Ok(true)
-            })?;
+        let promoted = self
+            .service(Some(working_copy.index))?
+            .promote(&Caller::Owner, RecordId::Revision(revision))?;
         if promoted.is_empty() {
             println!("Nothing to promote to revision {}", revision.short());
         }
-        for (id, statement) in promoted {
+        for Annotation { id, statement, .. } in promoted {
             let Some(original) = statement.promoted_from else {
                 continue;
             };

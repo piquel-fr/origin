@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use origin_platform::Platform;
 use origin_shared::access::{Level, PathAccess};
 use origin_shared::{
-    Base, Digest, EncodedObject, EntryKind, EntryName, Inputs, ObjectId, Record, RecordId,
-    RepoPath, Tree, TreeEntry, TreeId,
+    Base, Digest, EncodedObject, EntryKind, EntryName, InputSource, Inputs, ObjectId, Record,
+    RecordId, RepoPath, Tree, TreeEntry, TreeId,
 };
 
 use crate::conflict::{Conflicted, Conflicts};
@@ -522,17 +522,66 @@ impl<'a, P: Platform> Snapshots<'a, P> {
         Ok(Some(entry))
     }
 
-    /// The input digest of `snapshot`: one lookup per path of `inputs`.
+    /// The input digest of the record whose trees are `trees`: one lookup
+    /// per path of `inputs`. `None` if `inputs` read the target, and the
+    /// record is on none, or the store lacks its base.
     ///
     /// # Errors
     ///
-    /// Fails if a tree on the way to a path cannot be read.
+    /// Fails if a record, or a tree on the way to a path, cannot be read.
     pub fn input_digest(
         &mut self,
-        snapshot: TreeId,
+        trees: &mut InputTrees,
         inputs: &Inputs,
-    ) -> Result<Digest, StoreError> {
-        inputs.digest(|path| self.entry_at(snapshot, path))
+    ) -> Result<Option<Digest>, StoreError> {
+        let target = if inputs.target_paths.is_empty() {
+            None
+        } else {
+            let Some(state) = trees.target(self.store)? else {
+                return Ok(None);
+            };
+            Some(state)
+        };
+        let snapshot = trees.snapshot;
+        inputs
+            .digest(|source, path| match (source, target) {
+                (InputSource::Snapshot, _) => self.entry_at(snapshot, path),
+                (InputSource::Target, Some(state)) => self.entry_at(state, path),
+                // There's a state whenever there are target paths.
+                (InputSource::Target, None) => Ok(None),
+            })
+            .map(Some)
+    }
+}
+
+/// The trees the input digest of a record reads: its snapshot, and the
+/// state of the target it's on, read when first needed, once.
+#[derive(Clone, Copy, Debug)]
+pub struct InputTrees {
+    snapshot: TreeId,
+    target: TargetState,
+}
+
+/// The state of the target a record is on.
+#[derive(Clone, Copy, Debug)]
+enum TargetState {
+    /// Not read yet: that of the acceptance a revision's base leads to.
+    Unread(Base),
+    /// Read: `None` if the record is on no target, or the store lacks its
+    /// base.
+    Read(Option<TreeId>),
+}
+
+impl InputTrees {
+    /// The state of the target the record is on, reading it from `store`
+    /// the first time.
+    fn target<P: Platform>(&mut self, store: &Store<P>) -> Result<Option<TreeId>, StoreError> {
+        let state = match self.target {
+            TargetState::Read(state) => state,
+            TargetState::Unread(base) => store.base_state(base)?,
+        };
+        self.target = TargetState::Read(state);
+        Ok(state)
     }
 }
 
@@ -548,6 +597,28 @@ impl<P: Platform> Store<P> {
             Base::Acceptance(id) => self.get(id)?.body().state,
             Base::Revision(id) => self.get(id)?.snapshot,
         })
+    }
+
+    /// The trees the input digest of `record` reads: see [`InputTrees`].
+    /// A statement has none, and a snapshot is on no target.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the record cannot be read.
+    pub fn input_trees(&self, record: RecordId) -> Result<Option<InputTrees>, StoreError> {
+        let (snapshot, target) = match record {
+            RecordId::Snapshot(id) => (id, TargetState::Read(None)),
+            RecordId::Revision(id) => {
+                let revision = self.get(id)?;
+                (revision.snapshot, TargetState::Unread(revision.base))
+            }
+            RecordId::Acceptance(id) => {
+                let state = self.get(id)?.body().state;
+                (state, TargetState::Read(Some(state)))
+            }
+            RecordId::Statement(_) => return Ok(None),
+        };
+        Ok(Some(InputTrees { snapshot, target }))
     }
 
     /// The snapshot of a record: a revision's, an acceptance's state, or a
