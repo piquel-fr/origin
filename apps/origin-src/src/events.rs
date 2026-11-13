@@ -121,6 +121,7 @@ impl<'a, P: Platform> Events<'a, P> {
         let mut page = Page {
             events: Vec::new(),
             next: cursor,
+            ..Page::default()
         };
         let oplog = self.store.oplog();
         let read = oplog.after(cursor)?;
@@ -457,7 +458,8 @@ mod tests {
             held,
             Page {
                 events: Vec::new(),
-                next: crashed - 1
+                next: crashed - 1,
+                ..Page::default()
             },
             "it may be in progress"
         );
@@ -520,7 +522,8 @@ mod tests {
             empty,
             Page {
                 events: Vec::new(),
-                next: end
+                next: end,
+                ..Page::default()
             }
         );
         thread::scope(|scope| {
