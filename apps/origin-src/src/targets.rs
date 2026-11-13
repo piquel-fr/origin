@@ -20,6 +20,7 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::slice;
 
@@ -175,6 +176,32 @@ impl<P: Platform> Store<P> {
         }
         log.truncate(published);
         Ok(log)
+    }
+
+    /// The acceptance at position `seq` of `target`'s log, or `None` if
+    /// none is published there yet. Reads one line of the log.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the target's files cannot be read or are malformed.
+    pub fn acceptance_at(
+        &self,
+        target: &TargetName,
+        seq: u64,
+    ) -> Result<Option<AcceptanceId>, StoreError> {
+        let files = self.target_files(target.id());
+        let Some(head) = files.read_head()? else {
+            return Ok(None);
+        };
+        if seq >= head.seq {
+            return Ok((seq == head.seq).then_some(head.acceptance));
+        }
+        let path = files.log();
+        let mut line = [0; TargetFiles::LINE];
+        File::open(&path)
+            .and_then(|log| log.read_exact_at(&mut line, seq * TargetFiles::LINE as u64))
+            .map_err(|source| StoreError::io(&path, source))?;
+        Ok(files.parse_log(&line)?.first().copied())
     }
 
     /// The names of every target, in no particular order.
@@ -363,6 +390,10 @@ mod tests {
             })
         );
         assert_eq!(store.log(&main).unwrap(), ids);
+        for (seq, &id) in (0..).zip(&ids) {
+            assert_eq!(store.acceptance_at(&main, seq).unwrap(), Some(id));
+        }
+        assert_eq!(store.acceptance_at(&main, 3).unwrap(), None);
         let last = store.get(ids[2]).unwrap();
         assert_eq!(last.body().prev, Some(ids[1]));
         last.verify(&key().public()).unwrap();
