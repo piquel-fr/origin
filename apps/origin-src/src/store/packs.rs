@@ -843,16 +843,28 @@ mod tests {
         let (_dir, store) = store();
         let objects = objects(0, 10);
         store.write_all(&objects).unwrap();
-        store.compact().unwrap();
 
-        // A writer that hasn't loaded the packs writes them again.
+        // A batch that read the manifest before a compaction packed them
+        // writes them again.
         let unaware = Store::new(&store.root, Native::default());
-        assert_eq!(unaware.write_all(&objects[..3]).unwrap(), 3);
+        let batch = unaware.batch();
+        assert!(batch.write(&EncodedObject::blob(b"first")).unwrap());
+        store.compact().unwrap();
+        for object in &objects[..3] {
+            assert!(batch.write(object).unwrap());
+        }
+        batch.commit().unwrap();
         let compaction = store.compact().unwrap().unwrap();
         assert_eq!(compaction.duplicates, 3);
-        assert_eq!(compaction.packed, 0);
+        assert_eq!(compaction.packed, 1);
         assert!(!store.path(objects[0].id()).exists());
         assert_readable(&store, &objects);
+
+        // A later batch reads the manifest, even in a process that never
+        // loaded the packs.
+        let fresh = Store::new(&store.root, Native::default());
+        assert_eq!(fresh.write_all(&objects).unwrap(), 0);
+        assert!(!store.path(objects[0].id()).exists());
     }
 
     #[test]

@@ -36,9 +36,6 @@ struct ConfigFile {
 }
 
 impl UserConfig {
-    /// The length of `node.key`: the raw secret key.
-    const KEY_LEN: usize = 32;
-
     /// Loads the configuration from its directory.
     ///
     /// # Errors
@@ -91,48 +88,65 @@ impl UserConfig {
         &self.node
     }
 
-    fn key_path(&self) -> PathBuf {
-        self.dir.join("node.key")
-    }
-
     /// This node's key, generated and saved durably the first time.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`KeyFile::load`].
+    pub fn node_key(&self) -> Result<NodeKey, ConfigError> {
+        KeyFile(self.dir.join("node.key")).load()
+    }
+}
+
+/// A file holding a node's secret ed25519 key, readable only by its owner:
+/// the user's `node.key`, or a server's.
+#[derive(Clone, Debug)]
+pub struct KeyFile(pub PathBuf);
+
+impl KeyFile {
+    /// The length of the file: the raw secret key.
+    const KEY_LEN: usize = 32;
+
+    /// The key, generated and saved durably the first time.
     ///
     /// # Errors
     ///
     /// Fails if the key cannot be read, is malformed, or cannot be
     /// generated and saved.
-    pub fn node_key(&self) -> Result<NodeKey, ConfigError> {
-        match self.read_key() {
+    pub fn load(&self) -> Result<NodeKey, ConfigError> {
+        match self.read() {
             Err(ConfigError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                self.create_key()
+                self.create()
             }
             result => result,
         }
     }
 
-    fn read_key(&self) -> Result<NodeKey, ConfigError> {
-        let path = self.key_path();
-        let bytes = fs::read(&path).map_err(|source| ConfigError::Io {
+    fn read(&self) -> Result<NodeKey, ConfigError> {
+        let path = &self.0;
+        let bytes = fs::read(path).map_err(|source| ConfigError::Io {
             path: path.clone(),
             source,
         })?;
         let secret: [u8; Self::KEY_LEN] = bytes
             .try_into()
-            .map_err(|_| ConfigError::MalformedKey(path))?;
+            .map_err(|_| ConfigError::MalformedKey(path.clone()))?;
         Ok(NodeKey::from_bytes(&secret))
     }
 
     /// Generates a key and saves it: written and synced under a temporary
     /// name, then linked into place, which fails if another process saved
     /// one first. That one is used instead.
-    fn create_key(&self) -> Result<NodeKey, ConfigError> {
+    fn create(&self) -> Result<NodeKey, ConfigError> {
         let io_error = |path: &Path| {
             let path = path.to_owned();
             move |source| ConfigError::Io { path, source }
         };
-        fs::create_dir_all(&self.dir).map_err(io_error(&self.dir))?;
+        let dir = self.0.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(dir).map_err(io_error(dir))?;
         let key = NodeKey::generate().map_err(ConfigError::Random)?;
-        let temp = self.dir.join(format!(".node.key-{}", process::id()));
+        let name = self.0.file_name().unwrap_or_default().to_string_lossy();
+        let temp = dir.join(format!(".{name}-{}", process::id()));
         // A crash can leave one behind, under a pid that a reboot hands out
         // again. Only this process uses the name.
         let _ = fs::remove_file(&temp);
@@ -145,17 +159,15 @@ impl UserConfig {
                 file.write_all(&key.to_bytes())?;
                 Native::default().sync_file(&file)
             })
-            .and_then(|()| fs::hard_link(&temp, self.key_path()));
+            .and_then(|()| fs::hard_link(&temp, &self.0));
         // Best effort: a leftover is never read.
         let _ = fs::remove_file(&temp);
         match written {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return self.read_key(),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return self.read(),
             Err(source) => return Err(io_error(&temp)(source)),
         }
-        Native::default()
-            .sync_dir(&self.dir)
-            .map_err(io_error(&self.dir))?;
+        Native::default().sync_dir(dir).map_err(io_error(dir))?;
         Ok(key)
     }
 }
@@ -167,16 +179,11 @@ mod tests {
     #[test]
     fn a_leftover_temporary_key_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let name = PrincipalName::new("ada".to_owned()).unwrap();
-        let config = UserConfig {
-            dir: dir.path().to_owned(),
-            user: name.clone(),
-            node: name,
-        };
+        let file = KeyFile(dir.path().join("node.key"));
         fs::write(dir.path().join(format!(".node.key-{}", process::id())), b"").unwrap();
 
-        let key = config.node_key().unwrap();
-        assert_eq!(config.read_key().unwrap().to_bytes(), key.to_bytes());
+        let key = file.load().unwrap();
+        assert_eq!(file.read().unwrap().to_bytes(), key.to_bytes());
     }
 }
 
@@ -213,7 +220,7 @@ pub enum ConfigError {
         /// What is wrong.
         source: InvalidName,
     },
-    /// `node.key` isn't a key.
+    /// A key file isn't a key.
     #[error("{} is not a node key", .0.display())]
     MalformedKey(PathBuf),
     /// The operating system has no randomness to generate a key with.
