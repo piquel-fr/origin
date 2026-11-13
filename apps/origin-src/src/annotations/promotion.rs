@@ -206,7 +206,9 @@ impl<P: Platform> Annotations<'_, P> {
     }
 
     /// Issues the [`promotions`](Self::promotions) to `subject` as
-    /// `issuer`, returning them.
+    /// `issuer`, returning them. A promotion refers to its original's
+    /// payload without writing it, so it [holds the objects](Store::hold_objects)
+    /// from finding the originals to writing the promotions.
     ///
     /// # Errors
     ///
@@ -217,6 +219,7 @@ impl<P: Platform> Annotations<'_, P> {
         subject: RecordId,
         issuer: &Principal,
     ) -> Result<Vec<(StatementId, Statement)>, StoreError> {
+        let _held = self.store.hold_objects()?;
         let promotions = self.promotions(subject, issuer)?;
         let encoded: Vec<_> = promotions.iter().map(Statement::encode).collect();
         self.store.write_all(&encoded)?;
