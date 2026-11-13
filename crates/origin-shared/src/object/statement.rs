@@ -15,7 +15,8 @@ use crate::{
 ///
 /// Statements are permanent. An issuer revises one by issuing another that
 /// supersedes it. A promoted statement carries another one over to a record
-/// with the same input digest, pointing at it instead of copying its issuer.
+/// on the same target with the same input digest, pointing at it instead of
+/// copying its issuer.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Statement {
     /// The record the claim is about.
@@ -306,13 +307,22 @@ impl Field for Verdict {
 
 /// What a statement depended on.
 ///
-/// The input digest of a snapshot hashes the ids it stores at `paths`, with
-/// `definition` and `toolchain`. A statement that declares inputs and isn't
-/// `external` is promoted to every revision with the same input digest.
+/// The input digest of a record hashes the ids its snapshot stores at
+/// `paths`, those the state of the target it's on stores at
+/// `target_paths`, with `definition` and `toolchain`. A statement that
+/// declares inputs and isn't `external` is promoted to every revision on
+/// the same target with the same input digest.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Inputs {
     /// The files and directories read, each covering everything under it.
     pub paths: Vec<RepoPath>,
+    /// The files and directories read from the state of the target the
+    /// record is on rather than from its snapshot, such as the definition
+    /// of the checks in force there: a revision is on the target of the
+    /// acceptance it's based on, directly or through the revisions below
+    /// it, and an acceptance on its own.
+    #[serde(default)]
+    pub target_paths: Vec<RepoPath>,
     /// The check's command and configuration.
     pub definition: Digest,
     /// The tools that ran it, such as the hash of `rustc -V`.
@@ -324,6 +334,7 @@ pub struct Inputs {
 
 fields!(Inputs {
     paths,
+    target_paths,
     definition,
     toolchain,
     external,
@@ -331,40 +342,54 @@ fields!(Inputs {
 
 impl Inputs {
     /// The BLAKE3 key derivation contexts, which keep these hashes apart
-    /// from every other.
-    const SPEC_CONTEXT: &str = "origin 2026-10 input spec";
-    const DIGEST_CONTEXT: &str = "origin 2026-10 input digest";
+    /// from every other. Their date versions what they hash: 2026-11 added
+    /// the target paths.
+    const SPEC_CONTEXT: &str = "origin 2026-11 input spec";
+    const DIGEST_CONTEXT: &str = "origin 2026-11 input digest";
 
-    /// The paths, sorted and without duplicates: the order they're declared
-    /// in doesn't matter.
-    fn sorted_paths(&self) -> Vec<&RepoPath> {
-        let mut paths: Vec<_> = self.paths.iter().collect();
+    /// The paths read from each source, in this order, each sorted and
+    /// without duplicates: the order they're declared in doesn't matter.
+    fn sorted_paths(&self) -> [(InputSource, Vec<&RepoPath>); 2] {
+        [
+            (InputSource::Snapshot, Self::sorted(&self.paths)),
+            (InputSource::Target, Self::sorted(&self.target_paths)),
+        ]
+    }
+
+    /// `paths`, sorted and without duplicates.
+    fn sorted(paths: &[RepoPath]) -> Vec<&RepoPath> {
+        let mut paths: Vec<_> = paths.iter().collect();
         paths.sort_unstable();
         paths.dedup();
         paths
     }
 
     /// Identifies what the inputs declare: equal for statements reading the
-    /// same paths with the same definition and toolchain, whatever their
-    /// order. It hashes the definition, the toolchain, and each path's
-    /// `u32` length and bytes.
+    /// same paths from the same sources with the same definition and
+    /// toolchain, whatever their order. It hashes the definition, the
+    /// toolchain, then the paths, then the target paths, each list as its
+    /// `u32` count and each path's `u32` length and bytes.
     #[must_use]
     pub fn spec(&self) -> Digest {
         let mut hasher = blake3::Hasher::new_derive_key(Self::SPEC_CONTEXT);
         hasher.update(self.definition.as_bytes());
         hasher.update(self.toolchain.as_bytes());
-        for path in self.sorted_paths() {
+        for (_, paths) in self.sorted_paths() {
             let mut encoded = Vec::new();
-            Reader::write_str(path.as_str(), &mut encoded);
+            Reader::write_len(paths.len(), &mut encoded);
+            for path in paths {
+                Reader::write_str(path.as_str(), &mut encoded);
+            }
             hasher.update(&encoded);
         }
         Digest::from_bytes(*hasher.finalize().as_bytes())
     }
 
-    /// The input digest of a snapshot: the [`Inputs::spec`], then for each
-    /// path, in its order, a 0 byte if the snapshot has nothing there, or a
-    /// 1 byte, the entry's kind and its id. `entry_at` looks up what the
-    /// snapshot stores at a path; at the root, that's the snapshot's tree.
+    /// The input digest of a record: the [`Inputs::spec`], then for each
+    /// path, then each target path, in their order, a 0 byte if nothing is
+    /// there, or a 1 byte, the entry's kind and its id. `entry_at` looks up
+    /// what the record's snapshot, or the state of its target, stores at a
+    /// path; at the root, that's the whole tree.
     ///
     /// Records with equal digests agree on everything the inputs cover, so
     /// a promotable statement about one holds for the other.
@@ -374,20 +399,31 @@ impl Inputs {
     /// Fails if `entry_at` does.
     pub fn digest<E>(
         &self,
-        mut entry_at: impl FnMut(&RepoPath) -> Result<Option<TreeEntry>, E>,
+        mut entry_at: impl FnMut(InputSource, &RepoPath) -> Result<Option<TreeEntry>, E>,
     ) -> Result<Digest, E> {
         let mut hasher = blake3::Hasher::new_derive_key(Self::DIGEST_CONTEXT);
         hasher.update(self.spec().as_bytes());
-        for path in self.sorted_paths() {
-            match entry_at(path)? {
-                None => hasher.update(&[0]),
-                Some(entry) => hasher
-                    .update(&[1, entry.kind as u8])
-                    .update(entry.id.as_bytes()),
-            };
+        for (source, paths) in self.sorted_paths() {
+            for path in paths {
+                match entry_at(source, path)? {
+                    None => hasher.update(&[0]),
+                    Some(entry) => hasher
+                        .update(&[1, entry.kind as u8])
+                        .update(entry.id.as_bytes()),
+                };
+            }
         }
         Ok(Digest::from_bytes(*hasher.finalize().as_bytes()))
     }
+}
+
+/// Where the input digest reads a path of [`Inputs`] from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    /// The record's snapshot: [`Inputs::paths`].
+    Snapshot,
+    /// The state of the target the record is on: [`Inputs::target_paths`].
+    Target,
 }
 
 #[cfg(test)]
@@ -404,15 +440,16 @@ mod tests {
                 .iter()
                 .map(|path| RepoPath::new(path).unwrap())
                 .collect(),
+            target_paths: Vec::new(),
             definition: Digest::of(definition.as_bytes()),
             toolchain: Digest::of(b"rustc 1.99.0"),
             external: false,
         }
     }
 
-    /// The digest of `inputs` over a snapshot holding `files`.
-    fn digest(inputs: &Inputs, files: &[(&str, &str)]) -> Digest {
-        let files: HashMap<_, _> = files
+    /// The entries of `files`, by path.
+    fn entries(files: &[(&str, &str)]) -> HashMap<RepoPath, TreeEntry> {
+        files
             .iter()
             .map(|&(path, content)| {
                 let entry = TreeEntry {
@@ -421,10 +458,27 @@ mod tests {
                 };
                 (RepoPath::new(path).unwrap(), entry)
             })
-            .collect();
+            .collect()
+    }
+
+    /// The digest of `inputs` over a snapshot holding `files`, on a target
+    /// holding `target`.
+    fn digest_on(inputs: &Inputs, files: &[(&str, &str)], target: &[(&str, &str)]) -> Digest {
+        let (files, target) = (entries(files), entries(target));
         inputs
-            .digest(|path| Ok::<_, Infallible>(files.get(path).copied()))
+            .digest(|source, path| {
+                let tree = match source {
+                    InputSource::Snapshot => &files,
+                    InputSource::Target => &target,
+                };
+                Ok::<_, Infallible>(tree.get(path).copied())
+            })
             .unwrap()
+    }
+
+    /// The digest of `inputs` over a snapshot holding `files`.
+    fn digest(inputs: &Inputs, files: &[(&str, &str)]) -> Digest {
+        digest_on(inputs, files, &[])
     }
 
     #[test]
@@ -460,6 +514,40 @@ mod tests {
         let test = inputs(&["src", "Cargo.toml"], "cargo test");
         assert_ne!(test.spec(), lint.spec());
         assert_ne!(digest(&test, &[("src", "v1"), ("Cargo.toml", "a")]), base);
+    }
+
+    #[test]
+    fn target_paths_are_read_from_the_target() {
+        let checks = Inputs {
+            target_paths: vec![RepoPath::new("checks.toml").unwrap()],
+            ..inputs(&["src"], "cargo test")
+        };
+        let files = [("src", "v1"), ("checks.toml", "old")];
+        let base = digest_on(&checks, &files, &[("checks.toml", "new")]);
+        assert_ne!(
+            digest_on(&checks, &files, &[("checks.toml", "newer")]),
+            base,
+            "the target's checks are an input"
+        );
+        assert_eq!(
+            digest_on(&checks, &[("src", "v1")], &[("checks.toml", "new")]),
+            base,
+            "the snapshot's aren't"
+        );
+        assert_eq!(
+            digest_on(&checks, &files, &[("checks.toml", "new"), ("src", "v2")]),
+            base,
+            "nor is the rest of the target"
+        );
+        let on_target = Inputs {
+            target_paths: vec![RepoPath::new("checks.toml").unwrap()],
+            ..inputs(&[], "cargo test")
+        };
+        assert_ne!(
+            inputs(&["checks.toml"], "cargo test").spec(),
+            on_target.spec(),
+            "a path read from the target isn't one read from the snapshot"
+        );
     }
 
     #[test]

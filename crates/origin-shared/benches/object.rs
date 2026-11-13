@@ -65,6 +65,7 @@ fn statement() -> Statement {
             paths: ["src", "Cargo.toml", "Cargo.lock"]
                 .map(|path| RepoPath::new(path).unwrap())
                 .into(),
+            target_paths: Vec::new(),
             definition: Digest::of(b"cargo test"),
             toolchain: Digest::of(b"rustc 1.99.0"),
             external: false,

@@ -1,14 +1,16 @@
 //! Linux: `fdatasync` and `fsync`, `syncfs` for large batches, `flock`,
-//! clones with the `FICLONE` ioctl (Btrfs, XFS, bcachefs), `pread`, and file
-//! systems told apart by their `statfs` magic number.
+//! clones with the `FICLONE` ioctl (Btrfs, XFS, bcachefs), `pread`, file
+//! systems told apart by their `statfs` magic number, and the files a
+//! process group holds read from `/proc`.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, ErrorKind};
+use std::os::unix::fs::MetadataExt;
 use std::panic;
 use std::path::Path;
 use std::thread;
 
-use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, ReadAt};
+use crate::{CloneFile, Durability, Error, FileLock, FileSystem, FsKind, Op, Processes, ReadAt};
 
 /// The Linux implementation of [`Platform`](crate::Platform).
 #[derive(Clone, Copy, Debug, Default)]
@@ -100,6 +102,46 @@ impl Durability for Linux {
 
 impl FileLock for Linux {}
 
+impl Processes for Linux {
+    /// Reads `/proc`: each process's group from its `stat`, then the files
+    /// it holds from its `fd`. Processes that end meanwhile, or whose files
+    /// may not be read, are skipped.
+    fn group_holds(&self, id: u32, path: &Path) -> io::Result<bool> {
+        let held = fs::metadata(path)?;
+        for process in fs::read_dir("/proc")? {
+            let process = process?.path();
+            let pid = process
+                .file_name()
+                .and_then(|name| name.to_str()?.parse().ok());
+            if pid.and_then(Self::group_of) != Some(id) {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(process.join("fd")) else {
+                continue;
+            };
+            let holds = |file: fs::DirEntry| {
+                fs::metadata(file.path())
+                    .is_ok_and(|open| (open.dev(), open.ino()) == (held.dev(), held.ino()))
+            };
+            if files.flatten().any(holds) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl Linux {
+    /// The process group of the process `pid`, unless it ended or may not
+    /// be read: the fifth field of `/proc/<pid>/stat`, the third after its
+    /// command's name, which is in parentheses and may hold any character.
+    fn group_of(pid: u32) -> Option<u32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, after) = stat.rsplit_once(')')?;
+        after.split_whitespace().nth(2)?.parse().ok()
+    }
+}
+
 impl ReadAt for Linux {}
 
 impl CloneFile for Linux {
@@ -126,6 +168,38 @@ impl FileSystem for Linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_hold_the_files_their_processes_hold() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held");
+        fs::write(&path, "").unwrap();
+        let mut holder = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .stdin(File::open(&path).unwrap())
+            .spawn()
+            .unwrap();
+        let mut other = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(Linux.group_holds(holder.id(), &path).unwrap());
+        assert!(
+            !Linux.group_holds(other.id(), &path).unwrap(),
+            "another group"
+        );
+        for child in [&mut holder, &mut other] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(!Linux.group_holds(holder.id(), &path).unwrap(), "it ended");
+    }
 
     #[test]
     fn classifies_file_systems_by_magic_number() {

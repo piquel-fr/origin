@@ -8,8 +8,9 @@ use divan::Bencher;
 use divan::counter::ItemsCount;
 use origin_platform::Native;
 use origin_shared::{
-    Base, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind, ObjectId, Principal,
-    Record, RecordId, RepoPath, Revision, RevisionId, Statement, Tree, TreeEntry, TreeId, Verdict,
+    AcceptanceBody, Base, ChangeId, Digest, EncodedObject, EntryKind, EntryName, Inputs, Kind,
+    NodeKey, Principal, Record, RecordId, RepoPath, Revision, RevisionId, Statement, TargetName,
+    Tree, TreeEntry, TreeId, Verdict,
 };
 use origin_src::annotations::Annotations;
 use origin_src::fixture::FixtureTree;
@@ -36,18 +37,24 @@ fn inputs(paths: &[&str], definition: &str) -> Inputs {
             .iter()
             .map(|path| RepoPath::new(path).unwrap())
             .collect(),
+        target_paths: Vec::new(),
         definition: Digest::of(definition.as_bytes()),
         toolchain: Digest::of(b"rustc 1.99.0"),
         external: false,
     }
 }
 
-/// The input digest of the 20k-file fixture, for inputs naming two
-/// directories, a file and a missing path. Each run reads the trees anew.
-#[divan::bench(sample_count = 50)]
-fn input_digest(bencher: Bencher<'_, '_>) {
+/// A store holding the snapshot of the 20k-file fixture, with a
+/// `checks.toml`, and the inputs the digest benches declare: two
+/// directories, a file and a missing path.
+fn digest_store() -> (tempfile::TempDir, Store, TreeId, Inputs) {
     let dir = tempfile::tempdir().unwrap();
     FixtureTree::LARGE.write(dir.path()).unwrap();
+    fs::write(
+        dir.path().join("checks.toml"),
+        "[checks.test]\ncommand = \"true\"\n",
+    )
+    .unwrap();
     let store = Store::new(dir.path().join(".origin"), Native::default());
     store.init().unwrap();
     let (snapshot, _) = Worktree::new(dir.path(), &store)
@@ -57,9 +64,68 @@ fn input_digest(bencher: Bencher<'_, '_>) {
         &["dir0", "dir5/sub3", "dir12/sub7/file7820.rs", "missing"],
         "cargo test",
     );
+    (dir, store, snapshot, inputs)
+}
+
+/// The input digest of the fixture's snapshot. Each run reads the trees
+/// anew.
+#[divan::bench(sample_count = 50)]
+fn input_digest(bencher: Bencher<'_, '_>) {
+    let (_dir, store, snapshot, inputs) = digest_store();
+    let trees = store.input_trees(RecordId::Snapshot(snapshot)).unwrap();
     bencher.bench(|| {
         Snapshots::new(&store)
-            .input_digest(snapshot, &inputs)
+            .input_digest(&mut trees.unwrap(), &inputs)
+            .unwrap()
+    });
+}
+
+/// The input digest of a revision three deep in a stack on an acceptance
+/// of the fixture, which also reads `checks.toml` from the target: each
+/// run reads the revision, the stack down to the acceptance, its state
+/// and the trees anew.
+#[divan::bench(sample_count = 50)]
+fn input_digest_on_target(bencher: Bencher<'_, '_>) {
+    let (_dir, store, snapshot, inputs) = digest_store();
+    let inputs = Inputs {
+        target_paths: vec![RepoPath::new("checks.toml").unwrap()],
+        ..inputs
+    };
+    let acceptance = AcceptanceBody {
+        target: TargetName::MAIN.id(),
+        seq: 0,
+        prev: None,
+        state: snapshot,
+        landed: Vec::new(),
+        evidence: Vec::new(),
+        policy: None,
+    }
+    .sign(&NodeKey::from_bytes(&[1; 32]))
+    .encode();
+    store.write_all(std::slice::from_ref(&acceptance)).unwrap();
+    let mut base = Base::Acceptance(acceptance.id().into());
+    let mut top = None;
+    for change in 0..3 {
+        let revision = Revision {
+            change: ChangeId::from_bytes([change; 16]),
+            predecessors: Vec::new(),
+            base,
+            deps: Vec::new(),
+            snapshot,
+            description: EncodedObject::blob(b"").id().into(),
+            author: "user:bench".parse().unwrap(),
+        }
+        .encode();
+        store.write_all(std::slice::from_ref(&revision)).unwrap();
+        let id = RevisionId::from(revision.id());
+        (base, top) = (Base::Revision(id), Some(id));
+    }
+    let subject = RecordId::Revision(top.unwrap());
+    bencher.bench(|| {
+        let mut trees = store.input_trees(subject).unwrap().unwrap();
+        Snapshots::new(&store)
+            .input_digest(&mut trees, &inputs)
+            .unwrap()
             .unwrap()
     });
 }
@@ -128,6 +194,19 @@ fn snapshot(version: usize, docs: usize) -> Vec<EncodedObject> {
 /// sources match one of them.
 fn promotion_store() -> (tempfile::TempDir, Store, RevisionId) {
     let (dir, store) = store();
+    // Every revision is on `main`, so results promote between them.
+    let main = AcceptanceBody {
+        target: TargetName::MAIN.id(),
+        seq: 0,
+        prev: None,
+        state: Tree::default().encode().id().into(),
+        landed: Vec::new(),
+        evidence: Vec::new(),
+        policy: None,
+    }
+    .sign(&NodeKey::from_bytes(&[1; 32]))
+    .encode();
+    store.write_all(std::slice::from_ref(&main)).unwrap();
     let revision = |store: &Store, change: usize, version: usize, docs: usize| {
         let objects = snapshot(version, docs);
         let root = TreeId::from(objects.last().unwrap().id());
@@ -137,7 +216,7 @@ fn promotion_store() -> (tempfile::TempDir, Store, RevisionId) {
         let encoded = Revision {
             change: ChangeId::from_bytes(id),
             predecessors: Vec::new(),
-            base: Base::Acceptance(ObjectId::from_bytes([0; 32]).into()),
+            base: Base::Acceptance(main.id().into()),
             deps: Vec::new(),
             snapshot: root,
             description: EncodedObject::blob(b"").id().into(),

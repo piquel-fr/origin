@@ -81,7 +81,7 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use origin_platform::{LockMode, LockedFile, Native};
 use origin_shared::api::{LogQuery, RevisionEntry, Revisions};
@@ -98,6 +98,7 @@ use crate::conflict::Conflicts;
 use crate::index::{FindChangeError, FindError, Index};
 use crate::oplog::{Actor, Effect, Move, Why};
 use crate::output::FileDiff;
+use crate::plugin::Context;
 use crate::policy::{Policy, PolicyError};
 use crate::queue::{LandError, Queue};
 use crate::remote::{Remote, RemoteError};
@@ -268,7 +269,7 @@ impl Workspace {
         let store = Store::new(meta, Native::default()).with_actor(actor.in_workspace(&root));
         store.init()?;
 
-        let policy = Policy::initial(config.node(), &key.public());
+        let policy = Policy::initial(config.node(), &key.public(), None);
         let main = Queue::new(&store, &key, config.node().clone()).init(&policy)?;
         let empty_tree = Tree::default().encode();
         let empty_description = EncodedObject::attachment(b"");
@@ -462,17 +463,24 @@ impl Workspace {
         })
     }
 
-    /// This node, with its key.
-    fn node(&self) -> Result<Node, WorkspaceError> {
-        Self::node_of(&self.config)
+    /// What a plugin run in this working copy learns of it, once its draft
+    /// is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the working copy cannot be snapshotted, or the remote's URL
+    /// cannot be read.
+    pub fn plugin_context(&mut self) -> Result<Context, WorkspaceError> {
+        Ok(Context {
+            repository: self.store.root().to_owned(),
+            revision: self.refresh()?.id,
+            remote: Self::remote_url(&self.store)?,
+        })
     }
 
-    /// The node `config` names, with its key.
-    fn node_of(config: &UserConfig) -> Result<Node, WorkspaceError> {
-        Ok(Node {
-            name: config.node().clone(),
-            key: Arc::new(config.node_key()?),
-        })
+    /// This node, with its key.
+    fn node(&self) -> Result<Node, WorkspaceError> {
+        Ok(Node::of(&self.config)?)
     }
 
     /// Snapshots the working copy into a draft, recording nothing, for the

@@ -231,18 +231,28 @@ A statement can declare what it depended on:
 
 ```rust
 struct Inputs {
-    paths: Vec<RepoPath>,  // e.g. ["src", "Cargo.toml", "Cargo.lock"]; "" is the whole snapshot
-    definition: Digest,    // the check's command and configuration
-    toolchain: Digest,     // e.g. the hash of `rustc -V` output
-    external: bool,        // also depended on things outside the snapshot
+    paths: Vec<RepoPath>,        // e.g. ["src", "Cargo.toml", "Cargo.lock"]; "" is the whole snapshot
+    target_paths: Vec<RepoPath>, // read from the target the record is on, e.g. ["checks.toml"]
+    definition: Digest,          // the check's command and configuration
+    toolchain: Digest,           // e.g. the hash of `rustc -V` output
+    external: bool,              // also depended on things outside the snapshot
 }
 ```
 
-Each path names a file or a directory and covers everything under it. The
-input digest hashes what the snapshot stores at each path (absent, or the
-entry's kind and id), plus `definition` and `toolchain`. Trees are already
-content-addressed, so the digest costs one lookup per path, however large the
-tree.
+Each path names a file or a directory and covers everything under it.
+`paths` are read from the record's snapshot, `target_paths` from the state
+of the target the record is on: a revision's is that of the acceptance it's
+based on, directly or through the revisions below it, and an acceptance's is
+its own. Target paths hold what's in force on the target rather than what the
+record changes, such as the checks a worker runs: a candidate that restores
+an older `checks.toml` doesn't match the results of the older checks.
+
+The input digest hashes the spec, then what each path holds (absent, or the
+entry's kind and id): the paths', then the target paths', each list sorted.
+The spec hashes `definition`, `toolchain`, then each list as its count and its
+paths, so a path read from the target never matches one read from the
+snapshot. Trees are already content-addressed, so the digest costs one lookup
+per path, however large the tree.
 
 A statement is **promotable** when it declares inputs, isn't `external`,
 isn't itself a promotion, isn't about another statement, and its kind isn't
@@ -458,6 +468,8 @@ plugin can do nothing the API can't, which keeps the API complete.
 
 Official plugins live in `apps/origin-<name>`. The first is `origin-ci`:
 - **Tool mode:** `origin ci run [<rev>]` checks a revision as the user.
+  `origin ci exec <name> [--rev <rev>] -- <command...>` runs a command as
+  the check `ci.<name>` the same way, even if a result covers it.
 - **Worker mode:** `origin ci worker --remote <url>` answers `check.requested`
   with a token that can read the repository and annotate `ci.*`. It
   reconciles the waiting landings at start, every minute and after an
@@ -494,8 +506,10 @@ external = true          # reads the network: never promoted
 ```
 
 - Each check's kind is `ci.<name>`.
-- `checks.toml` itself is always one of a check's inputs, so editing a check
-  runs it again.
+- `checks.toml` itself is always one of a check's inputs: of the revision, for
+  `origin ci run`, and for a worker, a target path, as the target holds it. So
+  a check runs again once an edit to it lands, and a candidate can't bring
+  back the results of checks the target no longer has by restoring them.
 - Protecting `checks.toml` with a `[[paths]]` rule, as in the example policy,
   keeps submitters from changing the checks at all.
 - A change in a toolchain's output only reaches the queue's promotions through

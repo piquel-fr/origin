@@ -3,8 +3,9 @@
 //!
 //! A promotion claims what its original does, so it counts only once
 //! checked against it: [`Store::claim`] checks it, and only that makes a
-//! [`Claim`]. Whatever reads results, such as the landing queue, reads
-//! claims, through [`Annotations::claims`].
+//! [`Claim`]. Results carry over within a target, never from one target
+//! to another, whose checks may differ. Whatever reads results, such as
+//! the landing queue, reads claims, through [`Annotations::claims`].
 //!
 //! Promotion runs on demand, never as a side effect of reading: `origin
 //! promote`, and the landing queue when it checks evidence, call
@@ -18,7 +19,9 @@ use std::collections::HashSet;
 
 use origin_platform::Platform;
 use origin_shared::api::Annotation;
-use origin_shared::{Principal, Record, RecordId, Statement, StatementId};
+use origin_shared::{
+    Acceptance, Base, Principal, Record, RecordId, Statement, StatementId, TargetId, TreeId,
+};
 
 use super::Annotations;
 use crate::store::{Store, StoreError};
@@ -134,14 +137,11 @@ impl<P: Platform> Annotations<'_, P> {
                 let Some(inputs) = &statement.inputs else {
                     continue;
                 };
-                let digest = self
-                    .store
-                    .snapshot_of(statement.subject)
-                    .and_then(|snapshot| {
-                        snapshot
-                            .map(|snapshot| snapshots.input_digest(snapshot, inputs))
-                            .transpose()
-                    });
+                let digest = match self.store.input_trees(statement.subject) {
+                    Ok(Some(mut trees)) => snapshots.input_digest(&mut trees, inputs),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                };
                 match digest {
                     Ok(Some(digest)) => digests.push((id, digest)),
                     Ok(None) | Err(StoreError::NotFound(_)) => {}
@@ -158,12 +158,13 @@ impl<P: Platform> Annotations<'_, P> {
     /// issue them for a caller who `sees` some records, without writing
     /// them, sorted by kind: for each
     /// [promotion group](Statement::promotion_group), the latest statement
-    /// about another record the caller sees with the same input digest as
-    /// the subject, unless its issuer superseded it. So a promotion never
-    /// copies a result, and its payload, that the caller can't read. Groups whose kind and issuer the
-    /// subject already has a result of, directly or promoted, are skipped:
-    /// a result that ran there wins. A statement has no snapshot, so
-    /// nothing is promoted to one.
+    /// about another record the caller sees, on the same target, with the
+    /// same input digest as the subject, unless its issuer superseded it.
+    /// So a promotion never copies a result, and its payload, that the
+    /// caller can't read. Groups whose kind and issuer the subject already
+    /// has a result of, directly or promoted, are skipped: a result that ran
+    /// there wins. A snapshot or a statement is on no target, so nothing is
+    /// promoted to one.
     ///
     /// # Errors
     ///
@@ -175,7 +176,10 @@ impl<P: Platform> Annotations<'_, P> {
         issuer: &Principal,
         mut sees: impl FnMut(RecordId) -> Result<bool, StoreError>,
     ) -> Result<Vec<Statement>, StoreError> {
-        let Some(snapshot) = self.store.snapshot_of(subject)? else {
+        let (Some(mut trees), Some(target)) = (
+            self.store.input_trees(subject)?,
+            self.store.target_of(subject)?,
+        ) else {
             return Ok(Vec::new());
         };
         self.compute_digests()?;
@@ -199,13 +203,18 @@ impl<P: Platform> Annotations<'_, P> {
             if held.contains(&(first.kind.clone(), first.issuer.clone())) {
                 continue;
             }
-            let digest = snapshots.input_digest(snapshot, inputs)?;
+            let Some(digest) = snapshots.input_digest(&mut trees, inputs)? else {
+                continue;
+            };
             for &id in statements.iter().rev() {
                 if self.index.digest(id) != Some(digest) {
                     continue;
                 }
                 let statement = self.store.get(id)?;
-                if self.superseded_by(id, &statement)?.is_none() && sees(statement.subject)? {
+                if self.superseded_by(id, &statement)?.is_none()
+                    && self.store.target_of(statement.subject)? == Some(target)
+                    && sees(statement.subject)?
+                {
                     promotions.push(Statement {
                         subject,
                         issuer: issuer.clone(),
@@ -254,11 +263,11 @@ impl<P: Platform> Store<P> {
     /// Checks the claim `statement`, `id`, makes. A statement that promotes
     /// none makes its own. A promotion must name an original the store has
     /// that is [promotable](Statement::is_promotable), match its kind,
-    /// verdict, inputs and payload, and be about a record whose input
-    /// digest equals the original's subject's: then it makes the
-    /// original's claim, or else the claim is invalid, which is the inner
-    /// error. Whether anyone superseded either is left to the reader, see
-    /// [`Annotations::claims`].
+    /// verdict, inputs and payload, and be about a record on the same
+    /// target (see [`Store::target_of`]) whose input digest equals the
+    /// original's subject's: then it makes the original's claim, or else the
+    /// claim is invalid, which is the inner error. Whether anyone superseded
+    /// either is left to the reader, see [`Annotations::claims`].
     ///
     /// # Errors
     ///
@@ -294,15 +303,20 @@ impl<P: Platform> Store<P> {
         if let Some(&(field, _)) = differs.iter().find(|(_, differs)| *differs) {
             return Ok(Err(InvalidPromotion::Differs(field)));
         }
-        let (Some(here), Some(there), Some(inputs)) = (
-            self.snapshot_of(statement.subject)?,
-            self.snapshot_of(original.subject)?,
+        let target = self.target_of(statement.subject)?;
+        if target.is_none() || target != self.target_of(original.subject)? {
+            return Ok(Err(InvalidPromotion::OtherTarget));
+        }
+        let (Some(mut here), Some(mut there), Some(inputs)) = (
+            self.input_trees(statement.subject)?,
+            self.input_trees(original.subject)?,
             &original.inputs,
         ) else {
             return Ok(Err(InvalidPromotion::NoSnapshot));
         };
         let mut snapshots = Snapshots::new(self);
-        if snapshots.input_digest(here, inputs)? != snapshots.input_digest(there, inputs)? {
+        let here = snapshots.input_digest(&mut here, inputs)?;
+        if here.is_none() || here != snapshots.input_digest(&mut there, inputs)? {
             return Ok(Err(InvalidPromotion::InputsDiffer));
         }
         Ok(Ok(Claim {
@@ -310,6 +324,57 @@ impl<P: Platform> Store<P> {
             statement,
             original: Some((original_id, original)),
         }))
+    }
+
+    /// The target `record` is on, for promotion: an acceptance's, or for a
+    /// revision, that of the acceptance it's based on, through the
+    /// revisions below it. A snapshot, a statement, or a record whose base
+    /// this store lacks, is on none.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a record cannot be read.
+    pub fn target_of(&self, record: RecordId) -> Result<Option<TargetId>, StoreError> {
+        let base = match record {
+            RecordId::Acceptance(id) => Base::Acceptance(id),
+            // The target a revision based on it would be on.
+            RecordId::Revision(id) => Base::Revision(id),
+            RecordId::Snapshot(_) | RecordId::Statement(_) => return Ok(None),
+        };
+        Ok(self
+            .base_acceptance(base)?
+            .map(|acceptance| acceptance.body().target))
+    }
+
+    /// The state of the target a revision based on `base` is on: that of
+    /// the acceptance it leads to, as [`Store::target_of`] finds it, or
+    /// `None` if the store lacks a record on the way.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a record cannot be read.
+    pub fn base_state(&self, base: Base) -> Result<Option<TreeId>, StoreError> {
+        Ok(self
+            .base_acceptance(base)?
+            .map(|acceptance| acceptance.body().state))
+    }
+
+    /// The acceptance `base` leads to, through the revisions below it, or
+    /// `None` if the store lacks a record on the way.
+    fn base_acceptance(&self, mut base: Base) -> Result<Option<Acceptance>, StoreError> {
+        let missing = |error| match error {
+            StoreError::NotFound(_) => Ok(None),
+            error => Err(error),
+        };
+        loop {
+            base = match base {
+                Base::Acceptance(id) => return self.get(id).map(Some).or_else(missing),
+                Base::Revision(below) => match self.get(below) {
+                    Ok(below) => below.base,
+                    Err(error) => return missing(error),
+                },
+            };
+        }
     }
 }
 
@@ -332,16 +397,114 @@ pub enum InvalidPromotion {
     /// Its subject's input digest differs from the original's subject's.
     #[error("its subject's inputs differ from its original's")]
     InputsDiffer,
+    /// Its subject isn't on the target its original's subject is on.
+    #[error("its subject isn't on the target its original's is on")]
+    OtherTarget,
 }
 
 #[cfg(test)]
 mod tests {
-    use origin_shared::{EncodedObject, Kind, Verdict};
+    use origin_shared::{
+        AcceptanceId, AttachmentId, ChangeId, Digest, EncodedObject, Inputs, Kind, ObjectId,
+        RepoPath, Revision, RevisionId, TargetName, Verdict,
+    };
 
     use super::*;
     use crate::annotations::AnnotateError;
-    use crate::annotations::tests::{FILES, check, issue, principal, promote, revision, store};
+    use crate::annotations::tests::{
+        FILES, check, issue, principal, promote, revision, revision_on, revision_on_state, store,
+    };
     use crate::index::Index;
+
+    #[test]
+    fn target_paths_are_read_from_the_base() {
+        let (_dir, store) = store();
+        let inputs = Inputs {
+            paths: vec![RepoPath::new("src").unwrap()],
+            target_paths: vec![RepoPath::new("checks.toml").unwrap()],
+            definition: Digest::of(b"cargo test"),
+            toolchain: Digest::of(b"rustc 1.99.0"),
+            external: false,
+        };
+        let digest = |revision: RevisionId| {
+            let mut trees = store.input_trees(RecordId::Revision(revision)).unwrap();
+            Snapshots::new(&store)
+                .input_digest(trees.as_mut().unwrap(), &inputs)
+                .unwrap()
+        };
+        let files = [("src/lib.rs", "v1"), ("checks.toml", "its own")];
+        let on = |state: &[(&str, &str)]| {
+            revision_on_state(&store, &TargetName::MAIN, state, 1, &[], &files)
+        };
+        let below = on(&[("checks.toml", "old"), ("src/lib.rs", "v0")]);
+        let old = digest(below);
+        assert!(old.is_some());
+        assert_ne!(
+            digest(on(&[("checks.toml", "new"), ("src/lib.rs", "v0")])),
+            old,
+            "the base's checks.toml is an input"
+        );
+        assert_eq!(
+            digest(on(&[
+                ("checks.toml", "old"),
+                ("src/lib.rs", "v2"),
+                ("docs", "x")
+            ])),
+            old,
+            "the rest of the base isn't"
+        );
+
+        // A stack is on its bottom's base, and a revision whose base the
+        // store lacks on none.
+        let based = |base, change| {
+            let revision = Revision {
+                change: ChangeId::from_bytes([change; 16]),
+                predecessors: Vec::new(),
+                base,
+                deps: Vec::new(),
+                snapshot: store.get(below).unwrap().snapshot,
+                description: AttachmentId::from(EncodedObject::attachment(b"").id()),
+                author: principal("user:alice"),
+            }
+            .encode();
+            store.write_all(std::slice::from_ref(&revision)).unwrap();
+            RevisionId::from(revision.id())
+        };
+        assert_eq!(digest(based(Base::Revision(below), 2)), old);
+        let missing = AcceptanceId::from(ObjectId::from_bytes([7; 32]));
+        assert_eq!(digest(based(Base::Acceptance(missing), 3)), None);
+    }
+
+    #[test]
+    fn results_promote_within_their_target_only() {
+        let (_dir, store) = store();
+        let feature = TargetName::new("feature").unwrap();
+        let result = check(
+            revision_on(&store, &feature, 1, &[], FILES),
+            "lint",
+            Verdict::Pass,
+            "node:ci",
+            Some((&["src"], false)),
+        );
+        let original = issue(&store, &result);
+
+        // The other target's checks may differ: nothing carries over.
+        let on_main = revision(&store, 2, &[], FILES);
+        assert_eq!(promote(&store, on_main).len(), 0);
+        let forged = Statement {
+            subject: RecordId::Revision(on_main),
+            issuer: principal("node:queue"),
+            promoted_from: Some(original),
+            ..result
+        };
+        let id = forged.encode().id().into();
+        assert!(matches!(
+            store.claim(id, forged).unwrap(),
+            Err(InvalidPromotion::OtherTarget)
+        ));
+        let on_feature = revision_on(&store, &feature, 3, &[], FILES);
+        assert_eq!(promote(&store, on_feature).len(), 1);
+    }
 
     #[test]
     fn promotes_results_whose_inputs_are_unchanged() {

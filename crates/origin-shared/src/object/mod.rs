@@ -29,7 +29,7 @@ pub use encoding::Reader;
 pub(crate) use encoding::{Field, fields, tagged};
 pub use errors::{DecodeError, IdMismatch};
 pub use revision::{Base, Revision};
-pub use statement::{Inputs, Kind, RecordId, Statement, Verdict};
+pub use statement::{InputSource, Inputs, Kind, RecordId, Statement, Verdict};
 pub use tree::{EntryKind, EntryName, Tree, TreeEntry};
 
 mod acceptance;
@@ -370,6 +370,7 @@ pub(crate) mod tests {
             issuer: "node:ci-1".parse().unwrap(),
             inputs: Some(Inputs {
                 paths: vec![RepoPath::new("src").unwrap(), RepoPath::root()],
+                target_paths: Vec::new(),
                 definition: Digest::of(b"cargo test"),
                 toolchain: Digest::of(b"rustc 1.99.0"),
                 external: false,
@@ -437,8 +438,8 @@ pub(crate) mod tests {
                 "ab13bedf42e8",
                 "d06087ffcfd2",
                 "8783b1fca530",
-                "b4f235b57ce9",
-                "f0442b2f9f6c",
+                "deec8210f35c",
+                "cfdeda35b53c",
             ]
         );
     }

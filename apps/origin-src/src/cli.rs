@@ -3,6 +3,7 @@
 
 use std::convert::Infallible;
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -17,8 +18,9 @@ use origin_shared::{
 
 use crate::config::UserConfig;
 use crate::oplog::Actor;
+use crate::plugin::Plugin;
 use crate::server::ServerConfig;
-use crate::workspace::{Annotated, Payload, Workspace};
+use crate::workspace::{Annotated, Payload, Workspace, WorkspaceError};
 
 /// A modern, git-compatible source control system.
 #[derive(Debug, Parser)]
@@ -62,6 +64,10 @@ enum Command {
     Token(TokenCommand),
     #[command(flatten)]
     Workspace(WorkspaceCommand),
+    /// Any other command runs the plugin `origin-<command>` from `PATH`,
+    /// such as `origin ci` for `origin-ci`.
+    #[command(external_subcommand)]
+    Plugin(Vec<OsString>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -74,6 +80,11 @@ enum RepoCommand {
         /// The server configuration file.
         #[arg(short, long, default_value = "origin-server.toml")]
         config: PathBuf,
+        /// Who may change the policy over the API, such as `user:alice`:
+        /// by default, only the server's operator, through the
+        /// repository's path.
+        #[arg(long)]
+        admin: Option<Principal>,
     },
 }
 
@@ -187,8 +198,8 @@ enum WorkspaceCommand {
         #[arg(default_value = "@")]
         rev: String,
     },
-    /// Carry results over to a revision from the records with the same
-    /// input digest.
+    /// Carry results over to a revision from the records on the same target
+    /// with the same input digest.
     Promote {
         /// The revision: `@`, a change for its head, or a revision.
         #[arg(default_value = "@")]
@@ -334,7 +345,7 @@ struct AnnotateArgs {
     )]
     withdraw: bool,
     /// The files and directories the claim depended on, which lets it be
-    /// promoted to revisions where they're the same.
+    /// promoted to revisions on the same target where they're the same.
     #[arg(long, num_args = 1..)]
     inputs: Vec<RepoPath>,
     /// The check's command and configuration: text, or the hex digest of
@@ -440,6 +451,7 @@ impl AnnotateArgs {
         let digest = |arg: &Option<DigestArg>| arg.map_or_else(|| Digest::of(b""), |arg| arg.0);
         (!self.inputs.is_empty()).then(|| Inputs {
             paths: self.inputs.clone(),
+            target_paths: Vec::new(),
             definition: digest(&self.definition),
             toolchain: digest(&self.toolchain),
             external: self.external,
@@ -518,8 +530,12 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Serve { config } => return ServerConfig::load(&config)?.serve(),
-            Command::Repo(RepoCommand::Create { path, config }) => {
-                return ServerConfig::load(&config)?.create_repo(&path);
+            Command::Repo(RepoCommand::Create {
+                path,
+                config,
+                admin,
+            }) => {
+                return ServerConfig::load(&config)?.create_repo(&path, admin.as_ref());
             }
             Command::Token(TokenCommand::Issue {
                 scope,
@@ -536,7 +552,8 @@ impl Cli {
             Command::Init { .. }
             | Command::Clone { .. }
             | Command::Token(_)
-            | Command::Workspace(_) => {}
+            | Command::Workspace(_)
+            | Command::Plugin(_) => {}
         }
         let config = UserConfig::load()?;
         // The op log records the command line, without the program's name,
@@ -555,6 +572,15 @@ impl Cli {
                 Workspace::clone(&url, path.as_deref(), &target, config, &actor)?;
             }
             Command::Workspace(command) => command.run(config, &actor)?,
+            Command::Plugin(args) => {
+                let cwd = env::current_dir().context("cannot read the current directory")?;
+                let context = match Workspace::discover(&cwd, config, &actor) {
+                    Ok(mut workspace) => Some(workspace.plugin_context()?),
+                    Err(WorkspaceError::NotFound(_)) => None,
+                    Err(error) => return Err(error.into()),
+                };
+                match Plugin(args).exec(context.as_ref())? {}
+            }
             Command::Token(TokenCommand::Issue { scope, ttl, .. }) => {
                 let cwd = env::current_dir().context("cannot read the current directory")?;
                 Workspace::discover(&cwd, config, &actor)?.issue_token(scope, ttl)?;

@@ -30,6 +30,9 @@ conformance!(
     temp_dirs_are_local,
     inspecting_a_missing_path_fails,
     positioned_reads_share_a_file,
+    process_groups_are_killed_whole,
+    inherited_locks_are_held_by_what_holds_them,
+    groups_never_hold_files_they_do_not_hold,
 );
 
 mod suite {
@@ -42,8 +45,11 @@ mod suite {
     use std::thread;
     use std::time::Duration;
 
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
     use origin_platform::{
-        CloneError, DurableWrite, Error, FsKind, LockMode, LockedFile, Op, Platform, WritableError,
+        CloneError, DurableWrite, Error, FileLock, FsKind, LockMode, LockedFile, Op, Platform,
+        Processes, WritableError,
     };
 
     /// Stages a batch from several threads, large enough to be renamed from
@@ -258,5 +264,82 @@ mod suite {
             .read_exact_at(&file, &mut past_the_end, 255)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A command in a group of its own is killed with what it started,
+    /// and a group with nothing left is no error.
+    pub fn process_groups_are_killed_whole(platform: &impl Processes) {
+        let mut shell = Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut started = String::new();
+        BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut started)
+            .unwrap();
+        platform.kill_group(shell.id()).unwrap();
+        assert_eq!(shell.wait().unwrap().signal(), Some(9));
+        // Once its new parent reaps it, the sleep is gone too.
+        let alive = || {
+            let mut probe = Command::new("kill");
+            probe.args(["-0", started.trim()]).stderr(Stdio::null());
+            probe.status().unwrap().success()
+        };
+        let mut tries = 0;
+        while alive() {
+            tries += 1;
+            assert!(tries < 100, "the sleep it started still runs");
+            thread::sleep(Duration::from_millis(10));
+        }
+        platform.kill_group(shell.id()).unwrap();
+        assert!(platform.kill_group(1).is_err(), "not every process");
+    }
+
+    /// A group is never said to hold a file none of its processes holds:
+    /// where unsure, a platform says no.
+    pub fn groups_never_hold_files_they_do_not_hold(platform: &impl Processes) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held");
+        fs::write(&path, "").unwrap();
+        let mut other = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(!platform.group_holds(other.id(), &path).unwrap());
+        other.kill().unwrap();
+        other.wait().unwrap();
+    }
+
+    /// A lock a command inherits stays held while it runs, after its
+    /// starter let go of it.
+    pub fn inherited_locks_are_held_by_what_holds_them(platform: &(impl Processes + FileLock)) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held");
+        let held = LockedFile::open(platform, &path, LockMode::Exclusive).unwrap();
+        platform.inherit(&held).unwrap();
+        let mut shell = Command::new("sh")
+            .args(["-c", "sleep 60 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        drop(held);
+        let free = || {
+            LockedFile::try_open(platform, &path, LockMode::Exclusive)
+                .unwrap()
+                .is_some()
+        };
+        assert!(!free(), "the command holds it");
+        platform.kill_group(shell.id()).unwrap();
+        shell.wait().unwrap();
+        let mut tries = 0;
+        while !free() {
+            tries += 1;
+            assert!(tries < 100, "the sleep it started still holds it");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
